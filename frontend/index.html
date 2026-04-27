@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Local Video Semantic Search</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <section class="panel upload-panel">
+        <h1>Local Video Semantic Search</h1>
+        <div class="upload-controls">
+          <input id="videoInput" type="file" multiple accept="video/*" />
+          <label for="intervalInput">Frame Interval (s)</label>
+          <input id="intervalInput" type="number" min="0.25" step="0.25" value="2" />
+          <button id="uploadBtn" type="button">Upload + Index</button>
+          <button id="refreshBtn" type="button" class="ghost">Refresh List</button>
+        </div>
+        <p id="uploadStatus" class="status"></p>
+        <div id="videoList" class="video-list"></div>
+      </section>
+
+      <section class="panel search-panel">
+        <div class="search-controls">
+          <input
+            id="queryInput"
+            type="text"
+            placeholder="Search with natural language..."
+            autocomplete="off"
+          />
+          <label for="topKInput">Top K</label>
+          <input id="topKInput" type="number" min="1" max="100" value="10" />
+          <button id="searchBtn" type="button">Search</button>
+        </div>
+      </section>
+
+      <section class="panel player-panel">
+        <video id="videoPlayer" controls preload="metadata"></video>
+        <p id="playerMeta" class="player-meta">Select a result to play.</p>
+      </section>
+
+      <section id="resultsGrid" class="results-grid"></section>
+    </main>
+    <script src="/static/script.js"></script>
+  </body>
+</html>

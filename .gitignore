@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+
+# Runtime app data
+videos/*
+thumbnails/*
+data/*
+
+# Keep folder structure
+!videos/.gitkeep
+!thumbnails/.gitkeep
+!data/.gitkeep
