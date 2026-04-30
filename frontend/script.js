@@ -198,6 +198,7 @@ async function uploadAndIndex() {
 
     const uploaded = uploadResult.uploaded || [];
     const errors = uploadResult.errors || [];
+    const transcoded = uploadResult.transcoded || [];
     const indexErrors = [];
     let indexedCount = 0;
     let skippedCount = 0;
@@ -228,7 +229,7 @@ async function uploadAndIndex() {
     }
 
     const allErrors = [...errors, ...indexErrors];
-    const successNote = `Uploaded: ${uploaded.length} file(s), indexed: ${indexedCount}, skipped: ${skippedCount}.`;
+    const successNote = `Uploaded: ${uploaded.length} file(s), indexed: ${indexedCount}, skipped: ${skippedCount}, transcoded: ${transcoded.length}.`;
     const errorNote = allErrors.length ? ` Errors: ${allErrors.join(" | ")}` : "";
     setStatus(`${successNote}${errorNote}`, allErrors.length ? "error" : "ok");
     videoInput.value = "";

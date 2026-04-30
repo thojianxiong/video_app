@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import os
+import shutil
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -12,6 +15,27 @@ import numpy as np
 class FrameSample:
     timestamp_seconds: float
     frame_rgb: np.ndarray
+
+
+def _resolve_ffmpeg_executable() -> str | None:
+    configured = os.getenv("FFMPEG_PATH")
+    if configured:
+        return configured
+
+    in_path = shutil.which("ffmpeg")
+    if in_path:
+        return in_path
+
+    try:
+        import imageio_ffmpeg  # type: ignore
+
+        bundled = imageio_ffmpeg.get_ffmpeg_exe()
+        if bundled and Path(bundled).exists():
+            return bundled
+    except Exception:
+        return None
+
+    return None
 
 
 def compute_video_signature(video_path: Path) -> str:
@@ -88,3 +112,60 @@ def save_thumbnail(
         [int(cv2.IMWRITE_JPEG_QUALITY), 86],
     )
     return thumbnail_path
+
+
+def convert_to_mp4(input_path: Path, output_path: Path) -> tuple[bool, str]:
+    """
+    Converts any video to MP4 using ffmpeg.
+    Returns (success, error_message).
+    """
+    resolved_ffmpeg = _resolve_ffmpeg_executable()
+    if not resolved_ffmpeg:
+        return (
+            False,
+            "ffmpeg executable not found. Install ffmpeg, set FFMPEG_PATH, "
+            "or install imageio-ffmpeg in the active environment.",
+        )
+
+    try:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        command = [
+            resolved_ffmpeg,
+            "-y",
+            "-err_detect",
+            "ignore_err",
+            "-fflags",
+            "+genpts",
+            "-i",
+            str(input_path),
+            "-an",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "fast",
+            "-crf",
+            "23",
+            "-pix_fmt",
+            "yuv420p",
+            str(output_path),
+        ]
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+            check=False,
+        )
+        stderr_output = (completed.stderr or "").strip()
+        if completed.returncode != 0 or not output_path.exists():
+            if output_path.exists():
+                output_path.unlink(missing_ok=True)
+            if stderr_output:
+                return False, stderr_output
+            return False, f"ffmpeg exited with code {completed.returncode}"
+        return True, ""
+    except Exception as exc:
+        if output_path.exists():
+            output_path.unlink(missing_ok=True)
+        return False, str(exc)

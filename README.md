@@ -35,6 +35,8 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
+This installs `imageio-ffmpeg` too, so AVI conversion works even if system `ffmpeg` is not installed.
+
 3. Start the app:
 
 ```powershell
@@ -55,6 +57,16 @@ python -m backend.main
 ```
 
 If the selected model weights are not already in that cache, download them once while online, then reuse the same cache offline.
+
+## AVI Playback
+
+When you upload an `.avi` file, the backend transcodes it locally to `.mp4` and stores the `.mp4` in `videos/`.
+This keeps search/indexing local and makes playback reliable in HTML5 browsers.
+
+ffmpeg resolution order:
+1. `FFMPEG_PATH` environment variable
+2. `ffmpeg` in system `PATH`
+3. Bundled binary from `imageio-ffmpeg` (installed via `requirements.txt`)
 
 ## API Endpoints
 

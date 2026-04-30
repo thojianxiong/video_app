@@ -7,6 +7,7 @@ import threading
 import webbrowser
 from pathlib import Path
 from urllib.parse import quote
+from uuid import uuid4
 
 import numpy as np
 from fastapi import FastAPI, File, HTTPException, UploadFile
@@ -18,6 +19,7 @@ from PIL import Image
 from backend.embeddings import OpenCLIPEmbedder
 from backend.vector_store import VectorStore
 from backend.video_processing import (
+    convert_to_mp4,
     compute_video_signature,
     iter_video_frames,
     save_thumbnail,
@@ -99,10 +101,15 @@ def _is_supported_video(filename: str) -> bool:
     return Path(filename).suffix.lower() in VIDEO_EXTENSIONS
 
 
-def _unique_video_path(filename: str) -> tuple[str, Path]:
+def _unique_video_path(
+    filename: str,
+    forced_suffix: str | None = None,
+) -> tuple[str, Path]:
     safe_name = _safe_upload_filename(filename)
     stem = Path(safe_name).stem
-    suffix = Path(safe_name).suffix or ".mp4"
+    suffix = forced_suffix or Path(safe_name).suffix or ".mp4"
+    if not suffix.startswith("."):
+        suffix = f".{suffix}"
     candidate_name = f"{stem}{suffix}"
     candidate_path = VIDEOS_DIR / candidate_name
     counter = 1
@@ -120,6 +127,33 @@ def _write_upload_file(upload: UploadFile, destination: Path) -> None:
         shutil.copyfileobj(upload.file, stream)
 
 
+def _truncate_error(message: str, limit: int = 300) -> str:
+    clean = " ".join(str(message or "").split())
+    if len(clean) <= limit:
+        return clean
+    return clean[: max(0, limit - 3)] + "..."
+
+
+def _resolve_video_path_for_processing(filename: str) -> tuple[str, Path]:
+    requested_name = Path(filename).name
+    requested_path = VIDEOS_DIR / requested_name
+    mp4_path = requested_path.with_suffix(".mp4")
+
+    if mp4_path.exists() and mp4_path.is_file():
+        return mp4_path.name, mp4_path
+
+    if requested_path.suffix.lower() == ".mp4" and not requested_path.exists():
+        stem = requested_path.stem
+        for ext in sorted(VIDEO_EXTENSIONS):
+            if ext == ".mp4":
+                continue
+            candidate = VIDEOS_DIR / f"{stem}{ext}"
+            if candidate.exists() and candidate.is_file():
+                return candidate.name, candidate
+
+    return requested_name, requested_path
+
+
 def _process_video_sync(
     *,
     filename: str,
@@ -127,7 +161,7 @@ def _process_video_sync(
     batch_size: int,
     force: bool,
 ) -> dict:
-    video_path = VIDEOS_DIR / filename
+    resolved_filename, video_path = _resolve_video_path_for_processing(filename)
     if not video_path.exists() or not video_path.is_file():
         raise FileNotFoundError(filename)
     if not _is_supported_video(video_path.name):
@@ -148,7 +182,7 @@ def _process_video_sync(
         return {
             "status": "skipped",
             "reason": "video already indexed for this interval",
-            "video_filename": filename,
+            "video_filename": resolved_filename,
             "indexed_frames": indexed_frames,
         }
 
@@ -199,7 +233,7 @@ def _process_video_sync(
     upsert_result = vector_store.upsert_video_embeddings(
         signature=signature,
         frame_interval_seconds=frame_interval_seconds,
-        video_filename=filename,
+        video_filename=resolved_filename,
         records=records,
         embeddings=video_embeddings,
         force=force,
@@ -207,7 +241,7 @@ def _process_video_sync(
 
     upsert_result.update(
         {
-            "video_filename": filename,
+            "video_filename": resolved_filename,
             "processed_frames": total_frames,
             "frame_interval_seconds": frame_interval_seconds,
         }
@@ -222,6 +256,7 @@ async def upload(files: list[UploadFile] = File(...)) -> dict:
 
     uploaded: list[str] = []
     errors: list[str] = []
+    transcoded: list[dict[str, str]] = []
 
     for upload_file in files:
         if not upload_file.filename:
@@ -236,16 +271,65 @@ async def upload(files: list[UploadFile] = File(...)) -> dict:
             await upload_file.close()
             continue
 
-        target_name, target_path = _unique_video_path(upload_file.filename)
+        source_extension = Path(upload_file.filename).suffix.lower() or ".mp4"
+        temp_upload_path = DATA_DIR / f"upload_{uuid4().hex}{source_extension}"
+        converted_name, converted_path = _unique_video_path(
+            upload_file.filename,
+            forced_suffix=".mp4",
+        )
         try:
-            await asyncio.to_thread(_write_upload_file, upload_file, target_path)
-            uploaded.append(target_name)
+            await asyncio.to_thread(
+                _write_upload_file,
+                upload_file,
+                temp_upload_path,
+            )
+
+            print(
+                f"[upload] convert input={upload_file.filename} output={converted_name}"
+            )
+            conversion_ok, conversion_error = await asyncio.to_thread(
+                convert_to_mp4,
+                temp_upload_path,
+                converted_path,
+            )
+
+            if conversion_ok:
+                temp_upload_path.unlink(missing_ok=True)
+                uploaded.append(converted_name)
+                transcoded.append(
+                    {
+                        "source_filename": upload_file.filename,
+                        "stored_filename": converted_name,
+                    }
+                )
+                print(
+                    f"[upload] convert success input={upload_file.filename} output={converted_name}"
+                )
+            else:
+                fallback_name, fallback_path = _unique_video_path(upload_file.filename)
+                await asyncio.to_thread(
+                    shutil.move,
+                    str(temp_upload_path),
+                    str(fallback_path),
+                )
+                uploaded.append(fallback_name)
+                short_error = _truncate_error(conversion_error)
+                errors.append(
+                    f"{upload_file.filename}: mp4 conversion failed ({short_error})"
+                )
+                print(
+                    f"[upload] convert failure input={upload_file.filename} output={converted_name}"
+                )
+                if conversion_error:
+                    print(f"[upload] ffmpeg error: {conversion_error}")
         except Exception as exc:
+            converted_path.unlink(missing_ok=True)
+            temp_upload_path.unlink(missing_ok=True)
             errors.append(f"{upload_file.filename}: {exc}")
         finally:
             await upload_file.close()
 
-    return {"uploaded": uploaded, "errors": errors}
+    return {"uploaded": uploaded, "errors": errors, "transcoded": transcoded}
 
 
 @app.get("/videos")
