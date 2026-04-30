@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import shutil
 import threading
 import webbrowser
+from dataclasses import dataclass
 from pathlib import Path
+from threading import Lock
 from urllib.parse import quote
 from uuid import uuid4
 
@@ -19,37 +22,47 @@ from PIL import Image
 from backend.embeddings import OpenCLIPEmbedder
 from backend.vector_store import VectorStore
 from backend.video_processing import (
-    convert_to_mp4,
     compute_video_signature,
+    convert_to_mp4,
     iter_video_frames,
     save_thumbnail,
 )
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 FRONTEND_DIR = BASE_DIR / "frontend"
-VIDEOS_DIR = BASE_DIR / "videos"
-THUMBNAILS_DIR = BASE_DIR / "thumbnails"
-DATA_DIR = BASE_DIR / "data"
-INDEX_PATH = DATA_DIR / "faiss.index"
-METADATA_PATH = DATA_DIR / "metadata.json"
-
-for path in (FRONTEND_DIR, VIDEOS_DIR, THUMBNAILS_DIR, DATA_DIR):
-    path.mkdir(parents=True, exist_ok=True)
+CASES_DIR = BASE_DIR / "cases"
+CASES_REGISTRY_PATH = CASES_DIR / "cases.json"
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
+CASE_REGISTRY_LOCK = Lock()
+
+for path in (FRONTEND_DIR, CASES_DIR):
+    path.mkdir(parents=True, exist_ok=True)
+
+
+@dataclass(frozen=True)
+class CasePaths:
+    case_id: str
+    case_dir: Path
+    videos_dir: Path
+    thumbnails_dir: Path
+    data_dir: Path
+    index_path: Path
+    metadata_path: Path
+
 
 app = FastAPI(title="Local Video Semantic Search", version="1.0.0")
 
-app.mount("/media/videos", StaticFiles(directory=str(VIDEOS_DIR)), name="media-videos")
-app.mount(
-    "/media/thumbnails",
-    StaticFiles(directory=str(THUMBNAILS_DIR)),
-    name="media-thumbnails",
-)
+app.mount("/media/cases", StaticFiles(directory=str(CASES_DIR)), name="media-cases")
 app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR)), name="static")
 
 
+class CaseCreateRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=200)
+
+
 class ProcessVideoRequest(BaseModel):
+    case_id: str | None = None
     filename: str
     frame_interval_seconds: float = Field(default=2.0, gt=0)
     batch_size: int = Field(default=32, ge=1, le=256)
@@ -57,6 +70,7 @@ class ProcessVideoRequest(BaseModel):
 
 
 class SearchRequest(BaseModel):
+    case_id: str | None = None
     query: str
     top_k: int = Field(default=10, ge=1, le=100)
 
@@ -69,13 +83,10 @@ async def on_startup() -> None:
         os.getenv("OPENCLIP_PRETRAINED", "laion2b_s34b_b79k"),
         os.getenv("OPENCLIP_CACHE_DIR"),
     )
-    vector_store = VectorStore(
-        index_path=INDEX_PATH,
-        metadata_path=METADATA_PATH,
-        expected_dimension=embedder.embedding_dim,
-    )
     app.state.embedder = embedder
-    app.state.vector_store = vector_store
+    app.state.vector_stores = {}
+    app.state.vector_stores_lock = Lock()
+    await asyncio.to_thread(_list_cases_sync)
 
 
 @app.get("/", include_in_schema=False)
@@ -101,22 +112,199 @@ def _is_supported_video(filename: str) -> bool:
     return Path(filename).suffix.lower() in VIDEO_EXTENSIONS
 
 
+def _normalize_case_id(case_id: str) -> str:
+    raw = str(case_id or "").strip()
+    if not raw:
+        raise ValueError("case_id is required")
+    safe = "".join(char if char.isalnum() or char in {"-", "_"} else "_" for char in raw)
+    if not safe:
+        raise ValueError("Invalid case_id")
+    return safe
+
+
+def _build_case_paths(case_id: str) -> CasePaths:
+    normalized = _normalize_case_id(case_id)
+    case_dir = CASES_DIR / normalized
+    videos_dir = case_dir / "videos"
+    thumbnails_dir = case_dir / "thumbnails"
+    data_dir = case_dir / "data"
+    return CasePaths(
+        case_id=normalized,
+        case_dir=case_dir,
+        videos_dir=videos_dir,
+        thumbnails_dir=thumbnails_dir,
+        data_dir=data_dir,
+        index_path=data_dir / "faiss.index",
+        metadata_path=data_dir / "metadata.json",
+    )
+
+
+def _ensure_case_directories(case_paths: CasePaths) -> None:
+    for path in (
+        case_paths.case_dir,
+        case_paths.videos_dir,
+        case_paths.thumbnails_dir,
+        case_paths.data_dir,
+    ):
+        path.mkdir(parents=True, exist_ok=True)
+
+
+def _empty_cases_registry() -> dict:
+    return {"next_numeric_id": 1, "cases": []}
+
+
+def _load_cases_registry_locked() -> dict:
+    if not CASES_REGISTRY_PATH.exists():
+        return _empty_cases_registry()
+
+    try:
+        payload = json.loads(CASES_REGISTRY_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return _empty_cases_registry()
+
+    if not isinstance(payload, dict):
+        return _empty_cases_registry()
+
+    raw_cases = payload.get("cases", [])
+    if not isinstance(raw_cases, list):
+        raw_cases = []
+
+    cleaned_cases: list[dict[str, str]] = []
+    for item in raw_cases:
+        if not isinstance(item, dict):
+            continue
+        case_id_raw = item.get("case_id")
+        name_raw = item.get("name")
+        if case_id_raw is None or name_raw is None:
+            continue
+        try:
+            cleaned_case_id = _normalize_case_id(str(case_id_raw))
+        except ValueError:
+            continue
+        cleaned_name = str(name_raw).strip() or cleaned_case_id
+        cleaned_cases.append({"case_id": cleaned_case_id, "name": cleaned_name})
+
+    next_numeric_id = payload.get("next_numeric_id", 1)
+    try:
+        next_numeric_id = int(next_numeric_id)
+    except Exception:
+        next_numeric_id = 1
+    next_numeric_id = max(1, next_numeric_id)
+
+    return {"next_numeric_id": next_numeric_id, "cases": cleaned_cases}
+
+
+def _save_cases_registry_locked(payload: dict) -> None:
+    CASES_DIR.mkdir(parents=True, exist_ok=True)
+    CASES_REGISTRY_PATH.write_text(
+        json.dumps(payload, indent=2),
+        encoding="utf-8",
+    )
+
+
+def _find_case_locked(payload: dict, case_id: str) -> dict | None:
+    for item in payload.get("cases", []):
+        if item.get("case_id") == case_id:
+            return item
+    return None
+
+
+def _list_cases_sync() -> list[dict[str, str]]:
+    with CASE_REGISTRY_LOCK:
+        payload = _load_cases_registry_locked()
+        cases = sorted(payload["cases"], key=lambda item: item["case_id"])
+
+    for item in cases:
+        _ensure_case_directories(_build_case_paths(item["case_id"]))
+
+    return [{"case_id": item["case_id"], "name": item["name"]} for item in cases]
+
+
+def _create_case_sync(name: str) -> dict[str, str]:
+    clean_name = str(name or "").strip()
+    if not clean_name:
+        raise ValueError("Case name cannot be empty")
+
+    with CASE_REGISTRY_LOCK:
+        payload = _load_cases_registry_locked()
+        existing_ids = {item.get("case_id") for item in payload.get("cases", [])}
+        next_numeric_id = int(payload.get("next_numeric_id", 1))
+        next_numeric_id = max(1, next_numeric_id)
+
+        case_id = f"case_{next_numeric_id:03d}"
+        while case_id in existing_ids:
+            next_numeric_id += 1
+            case_id = f"case_{next_numeric_id:03d}"
+
+        payload["cases"].append({"case_id": case_id, "name": clean_name})
+        payload["next_numeric_id"] = next_numeric_id + 1
+        _save_cases_registry_locked(payload)
+
+    _ensure_case_directories(_build_case_paths(case_id))
+    return {"case_id": case_id, "name": clean_name}
+
+
+def _get_case_paths_or_raise(case_id: str) -> CasePaths:
+    normalized = _normalize_case_id(case_id)
+    with CASE_REGISTRY_LOCK:
+        payload = _load_cases_registry_locked()
+        case = _find_case_locked(payload, normalized)
+    if case is None:
+        raise KeyError(normalized)
+
+    case_paths = _build_case_paths(normalized)
+    _ensure_case_directories(case_paths)
+    return case_paths
+
+
+def _resolve_case_id_or_default(case_id: str | None) -> str:
+    if case_id and str(case_id).strip():
+        return _normalize_case_id(case_id)
+
+    cases = _list_cases_sync()
+    if cases:
+        return _normalize_case_id(cases[0]["case_id"])
+
+    raise ValueError("No cases available. Create a case first.")
+
+
+def _get_vector_store_for_case(case_id: str) -> tuple[CasePaths, VectorStore]:
+    case_paths = _get_case_paths_or_raise(case_id)
+    embedder: OpenCLIPEmbedder = app.state.embedder
+    cache: dict[str, VectorStore] = app.state.vector_stores
+    cache_lock: Lock = app.state.vector_stores_lock
+
+    with cache_lock:
+        store = cache.get(case_paths.case_id)
+        if store is None:
+            store = VectorStore(
+                index_path=case_paths.index_path,
+                metadata_path=case_paths.metadata_path,
+                expected_dimension=embedder.embedding_dim,
+            )
+            cache[case_paths.case_id] = store
+
+    return case_paths, store
+
+
 def _unique_video_path(
+    target_dir: Path,
     filename: str,
     forced_suffix: str | None = None,
 ) -> tuple[str, Path]:
+    target_dir.mkdir(parents=True, exist_ok=True)
     safe_name = _safe_upload_filename(filename)
     stem = Path(safe_name).stem
     suffix = forced_suffix or Path(safe_name).suffix or ".mp4"
     if not suffix.startswith("."):
         suffix = f".{suffix}"
     candidate_name = f"{stem}{suffix}"
-    candidate_path = VIDEOS_DIR / candidate_name
+    candidate_path = target_dir / candidate_name
     counter = 1
 
     while candidate_path.exists():
         candidate_name = f"{stem}_{counter}{suffix}"
-        candidate_path = VIDEOS_DIR / candidate_name
+        candidate_path = target_dir / candidate_name
         counter += 1
 
     return candidate_name, candidate_path
@@ -134,9 +322,17 @@ def _truncate_error(message: str, limit: int = 300) -> str:
     return clean[: max(0, limit - 3)] + "..."
 
 
-def _resolve_video_path_for_processing(filename: str) -> tuple[str, Path]:
+def _media_url_for_case_path(path: Path) -> str:
+    relative = path.relative_to(CASES_DIR).as_posix()
+    return f"/media/cases/{quote(relative, safe='/')}"
+
+
+def _resolve_video_path_for_processing(
+    case_paths: CasePaths,
+    filename: str,
+) -> tuple[str, Path]:
     requested_name = Path(filename).name
-    requested_path = VIDEOS_DIR / requested_name
+    requested_path = case_paths.videos_dir / requested_name
     mp4_path = requested_path.with_suffix(".mp4")
 
     if mp4_path.exists() and mp4_path.is_file():
@@ -147,7 +343,7 @@ def _resolve_video_path_for_processing(filename: str) -> tuple[str, Path]:
         for ext in sorted(VIDEO_EXTENSIONS):
             if ext == ".mp4":
                 continue
-            candidate = VIDEOS_DIR / f"{stem}{ext}"
+            candidate = case_paths.videos_dir / f"{stem}{ext}"
             if candidate.exists() and candidate.is_file():
                 return candidate.name, candidate
 
@@ -156,12 +352,15 @@ def _resolve_video_path_for_processing(filename: str) -> tuple[str, Path]:
 
 def _process_video_sync(
     *,
+    case_id: str,
     filename: str,
     frame_interval_seconds: float,
     batch_size: int,
     force: bool,
 ) -> dict:
-    resolved_filename, video_path = _resolve_video_path_for_processing(filename)
+    case_paths, vector_store = _get_vector_store_for_case(case_id)
+    resolved_filename, video_path = _resolve_video_path_for_processing(case_paths, filename)
+
     if not video_path.exists() or not video_path.is_file():
         raise FileNotFoundError(filename)
     if not _is_supported_video(video_path.name):
@@ -169,9 +368,6 @@ def _process_video_sync(
             "Unsupported video format. Allowed extensions: "
             + ", ".join(sorted(VIDEO_EXTENSIONS))
         )
-
-    embedder: OpenCLIPEmbedder = app.state.embedder
-    vector_store: VectorStore = app.state.vector_store
 
     signature = compute_video_signature(video_path)
     if vector_store.is_video_indexed(signature, frame_interval_seconds) and not force:
@@ -182,11 +378,12 @@ def _process_video_sync(
         return {
             "status": "skipped",
             "reason": "video already indexed for this interval",
+            "case_id": case_paths.case_id,
             "video_filename": resolved_filename,
             "indexed_frames": indexed_frames,
         }
 
-    thumbnail_dir = THUMBNAILS_DIR / Path(filename).stem
+    thumbnail_dir = case_paths.thumbnails_dir / Path(resolved_filename).stem
     if force and thumbnail_dir.exists():
         shutil.rmtree(thumbnail_dir)
     thumbnail_dir.mkdir(parents=True, exist_ok=True)
@@ -200,11 +397,10 @@ def _process_video_sync(
         thumb_path = save_thumbnail(
             frame_rgb=frame.frame_rgb,
             output_dir=thumbnail_dir,
-            video_stem=Path(filename).stem,
+            video_stem=Path(resolved_filename).stem,
             timestamp_seconds=frame.timestamp_seconds,
         )
-        thumb_rel = thumb_path.relative_to(THUMBNAILS_DIR).as_posix()
-        thumb_url = f"/media/thumbnails/{quote(thumb_rel, safe='/')}"
+        thumb_url = _media_url_for_case_path(thumb_path)
         records.append(
             {
                 "timestamp_seconds": frame.timestamp_seconds,
@@ -216,19 +412,19 @@ def _process_video_sync(
 
         if len(pending_images) >= batch_size:
             embeddings_batches.append(
-                embedder.encode_images(pending_images, batch_size=batch_size)
+                app.state.embedder.encode_images(pending_images, batch_size=batch_size)
             )
             pending_images.clear()
 
     if pending_images:
         embeddings_batches.append(
-            embedder.encode_images(pending_images, batch_size=batch_size)
+            app.state.embedder.encode_images(pending_images, batch_size=batch_size)
         )
 
     if embeddings_batches:
         video_embeddings = np.vstack(embeddings_batches).astype(np.float32)
     else:
-        video_embeddings = np.empty((0, embedder.embedding_dim), dtype=np.float32)
+        video_embeddings = np.empty((0, app.state.embedder.embedding_dim), dtype=np.float32)
 
     upsert_result = vector_store.upsert_video_embeddings(
         signature=signature,
@@ -241,6 +437,7 @@ def _process_video_sync(
 
     upsert_result.update(
         {
+            "case_id": case_paths.case_id,
             "video_filename": resolved_filename,
             "processed_frames": total_frames,
             "frame_interval_seconds": frame_interval_seconds,
@@ -249,10 +446,56 @@ def _process_video_sync(
     return upsert_result
 
 
+@app.post("/cases")
+async def create_case(request: CaseCreateRequest) -> dict:
+    try:
+        created = await asyncio.to_thread(_create_case_sync, request.name)
+        try:
+            cases = await asyncio.to_thread(_list_cases_sync)
+        except Exception:
+            cases = []
+
+        if cases is None:
+            cases = []
+        if not isinstance(cases, list):
+            cases = []
+
+        return {
+            "case_id": created.get("case_id"),
+            "name": created.get("name"),
+            "cases": cases,
+        }
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.get("/cases")
+async def list_cases() -> dict:
+    try:
+        cases = await asyncio.to_thread(_list_cases_sync)
+    except Exception:
+        cases = []
+
+    if cases is None:
+        cases = []
+    if not isinstance(cases, list):
+        cases = []
+
+    return {"cases": cases}
+
+
 @app.post("/upload")
-async def upload(files: list[UploadFile] = File(...)) -> dict:
+async def upload(case_id: str | None = None, files: list[UploadFile] = File(...)) -> dict:
     if not files:
         raise HTTPException(status_code=400, detail="No files provided")
+
+    try:
+        resolved_case_id = await asyncio.to_thread(_resolve_case_id_or_default, case_id)
+        case_paths = await asyncio.to_thread(_get_case_paths_or_raise, resolved_case_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"Case not found: {case_id}")
 
     uploaded: list[str] = []
     errors: list[str] = []
@@ -272,20 +515,18 @@ async def upload(files: list[UploadFile] = File(...)) -> dict:
             continue
 
         source_extension = Path(upload_file.filename).suffix.lower() or ".mp4"
-        temp_upload_path = DATA_DIR / f"upload_{uuid4().hex}{source_extension}"
+        temp_upload_path = case_paths.data_dir / f"upload_{uuid4().hex}{source_extension}"
         converted_name, converted_path = _unique_video_path(
+            case_paths.videos_dir,
             upload_file.filename,
             forced_suffix=".mp4",
         )
         try:
-            await asyncio.to_thread(
-                _write_upload_file,
-                upload_file,
-                temp_upload_path,
-            )
+            await asyncio.to_thread(_write_upload_file, upload_file, temp_upload_path)
 
             print(
-                f"[upload] convert input={upload_file.filename} output={converted_name}"
+                f"[upload][{case_paths.case_id}] convert input={upload_file.filename} "
+                f"output={converted_name}"
             )
             conversion_ok, conversion_error = await asyncio.to_thread(
                 convert_to_mp4,
@@ -303,25 +544,26 @@ async def upload(files: list[UploadFile] = File(...)) -> dict:
                     }
                 )
                 print(
-                    f"[upload] convert success input={upload_file.filename} output={converted_name}"
+                    f"[upload][{case_paths.case_id}] convert success input={upload_file.filename} "
+                    f"output={converted_name}"
                 )
             else:
-                fallback_name, fallback_path = _unique_video_path(upload_file.filename)
-                await asyncio.to_thread(
-                    shutil.move,
-                    str(temp_upload_path),
-                    str(fallback_path),
+                fallback_name, fallback_path = _unique_video_path(
+                    case_paths.videos_dir,
+                    upload_file.filename,
                 )
+                await asyncio.to_thread(shutil.move, str(temp_upload_path), str(fallback_path))
                 uploaded.append(fallback_name)
                 short_error = _truncate_error(conversion_error)
                 errors.append(
                     f"{upload_file.filename}: mp4 conversion failed ({short_error})"
                 )
                 print(
-                    f"[upload] convert failure input={upload_file.filename} output={converted_name}"
+                    f"[upload][{case_paths.case_id}] convert failure input={upload_file.filename} "
+                    f"output={converted_name}"
                 )
                 if conversion_error:
-                    print(f"[upload] ffmpeg error: {conversion_error}")
+                    print(f"[upload][{case_paths.case_id}] ffmpeg error: {conversion_error}")
         except Exception as exc:
             converted_path.unlink(missing_ok=True)
             temp_upload_path.unlink(missing_ok=True)
@@ -329,16 +571,31 @@ async def upload(files: list[UploadFile] = File(...)) -> dict:
         finally:
             await upload_file.close()
 
-    return {"uploaded": uploaded, "errors": errors, "transcoded": transcoded}
+    return {
+        "case_id": case_paths.case_id,
+        "uploaded": uploaded,
+        "errors": errors,
+        "transcoded": transcoded,
+    }
 
 
 @app.get("/videos")
-async def list_videos() -> dict:
-    vector_store: VectorStore = app.state.vector_store
-    indexed_counts = vector_store.indexed_counts_by_filename()
+async def list_videos(case_id: str | None = None) -> dict:
+    try:
+        resolved_case_id = await asyncio.to_thread(_resolve_case_id_or_default, case_id)
+        case_paths, vector_store = await asyncio.to_thread(
+            _get_vector_store_for_case,
+            resolved_case_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"Case not found: {case_id}")
 
+    indexed_counts = vector_store.indexed_counts_by_filename()
     videos = []
-    for file_path in sorted(VIDEOS_DIR.iterdir()):
+
+    for file_path in sorted(case_paths.videos_dir.iterdir()):
         if not file_path.is_file():
             continue
         if file_path.suffix.lower() not in VIDEO_EXTENSIONS:
@@ -349,19 +606,24 @@ async def list_videos() -> dict:
             {
                 "filename": file_path.name,
                 "size_bytes": file_stat.st_size,
-                "video_url": f"/media/videos/{quote(file_path.name)}",
+                "video_url": _media_url_for_case_path(file_path),
                 "indexed_frames": indexed_counts.get(file_path.name, 0),
             }
         )
 
-    return {"videos": videos}
+    return {"case_id": case_paths.case_id, "videos": videos}
 
 
 @app.post("/process_video")
 async def process_video(request: ProcessVideoRequest) -> dict:
     try:
+        resolved_case_id = await asyncio.to_thread(
+            _resolve_case_id_or_default,
+            request.case_id,
+        )
         return await asyncio.to_thread(
             _process_video_sync,
+            case_id=resolved_case_id,
             filename=request.filename,
             frame_interval_seconds=request.frame_interval_seconds,
             batch_size=request.batch_size,
@@ -372,6 +634,8 @@ async def process_video(request: ProcessVideoRequest) -> dict:
             status_code=404,
             detail=f"Video not found: {request.filename}",
         )
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"Case not found: {request.case_id}")
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
@@ -384,10 +648,9 @@ async def search(request: SearchRequest) -> dict:
     if not query:
         raise HTTPException(status_code=400, detail="Query cannot be empty")
 
-    def _run_search() -> list[dict]:
-        embedder: OpenCLIPEmbedder = app.state.embedder
-        vector_store: VectorStore = app.state.vector_store
-        query_embedding = embedder.encode_text(query)
+    def _run_search(resolved_case_id: str) -> tuple[str, list[dict]]:
+        case_paths, vector_store = _get_vector_store_for_case(resolved_case_id)
+        query_embedding = app.state.embedder.encode_text(query)
         raw_results = vector_store.search(query_embedding, top_k=request.top_k)
 
         hydrated = []
@@ -398,13 +661,31 @@ async def search(request: SearchRequest) -> dict:
                     "timestamp_seconds": item["timestamp_seconds"],
                     "similarity_score": item["similarity_score"],
                     "thumbnail_url": item["thumbnail_path"],
-                    "video_url": f"/media/videos/{quote(item['video_filename'])}",
+                    "video_url": _media_url_for_case_path(
+                        case_paths.videos_dir / item["video_filename"]
+                    ),
                 }
             )
-        return hydrated
+        return case_paths.case_id, hydrated
 
-    results = await asyncio.to_thread(_run_search)
-    return {"query": query, "results": results, "count": len(results)}
+    try:
+        selected_case_id = await asyncio.to_thread(
+            _resolve_case_id_or_default,
+            request.case_id,
+        )
+        resolved_case_id, results = await asyncio.to_thread(_run_search, selected_case_id)
+        return {
+            "case_id": resolved_case_id,
+            "query": query,
+            "results": results,
+            "count": len(results),
+        }
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"Case not found: {request.case_id}")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 def _open_browser() -> None:

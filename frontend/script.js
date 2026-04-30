@@ -1,19 +1,68 @@
-const videoInput = document.getElementById("videoInput");
-const intervalInput = document.getElementById("intervalInput");
-const uploadBtn = document.getElementById("uploadBtn");
-const refreshBtn = document.getElementById("refreshBtn");
-const uploadStatus = document.getElementById("uploadStatus");
-const videoList = document.getElementById("videoList");
-const queryInput = document.getElementById("queryInput");
-const topKInput = document.getElementById("topKInput");
-const searchBtn = document.getElementById("searchBtn");
-const resultsGrid = document.getElementById("resultsGrid");
-const videoPlayer = document.getElementById("videoPlayer");
-const playerMeta = document.getElementById("playerMeta");
+let videoInput = null;
+let intervalInput = null;
+let uploadBtn = null;
+let refreshBtn = null;
+let uploadStatus = null;
+let videoList = null;
+let queryInput = null;
+let topKInput = null;
+let searchBtn = null;
+let resultsGrid = null;
+let videoPlayer = null;
+let playerMeta = null;
+let caseList = null;
+let workspace = null;
+
+const state = {
+  cases: [],
+  activeCaseId: null,
+};
+let caseSwitchVersion = 0;
+let caseStateVersion = 0;
+let listenersBound = false;
+let initStarted = false;
+
+function bindDomElements() {
+  videoInput = document.getElementById("videoInput");
+  intervalInput = document.getElementById("intervalInput");
+  uploadBtn = document.getElementById("uploadBtn");
+  refreshBtn = document.getElementById("refreshBtn");
+  uploadStatus = document.getElementById("uploadStatus");
+  videoList = document.getElementById("videoList");
+  queryInput = document.getElementById("queryInput");
+  topKInput = document.getElementById("topKInput");
+  searchBtn = document.getElementById("searchBtn");
+  resultsGrid = document.getElementById("resultsGrid");
+  videoPlayer = document.getElementById("videoPlayer");
+  playerMeta = document.getElementById("playerMeta");
+  caseList = document.getElementById("caseList");
+  workspace = document.querySelector(".workspace");
+}
 
 function setStatus(message, kind = "") {
+  if (!uploadStatus) {
+    return;
+  }
   uploadStatus.textContent = message;
   uploadStatus.className = `status ${kind}`.trim();
+}
+
+function formatError(error) {
+  if (!error) return "Unknown error";
+
+  if (error instanceof Error) {
+    return error.message;
+  }
+
+  if (typeof error === "string") {
+    return error;
+  }
+
+  try {
+    return JSON.stringify(error);
+  } catch {
+    return String(error);
+  }
 }
 
 function formatBytes(bytes) {
@@ -41,24 +90,279 @@ function formatTime(totalSeconds) {
   return `${minutes}:${String(seconds).padStart(2, "0")}`;
 }
 
+function ensureActiveCaseId() {
+  if (!state.activeCaseId) {
+    throw new Error("No active case available. Create a case first.");
+  }
+  return state.activeCaseId;
+}
+
+function withCaseQuery(path, caseId) {
+  return `${path}?case_id=${encodeURIComponent(caseId)}`;
+}
+
 function setPlaybackUrl(filename, timestampSeconds) {
   const url = new URL(window.location.href);
+  if (state.activeCaseId) {
+    url.searchParams.set("case", state.activeCaseId);
+  }
   url.searchParams.set("video", filename);
   url.searchParams.set("t", Number(timestampSeconds).toFixed(2));
   history.replaceState({}, "", url);
 }
 
-async function fetchJson(url, options = {}) {
-  const response = await fetch(url, options);
-  const payload = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    const detail = payload.detail || response.statusText || "Request failed";
-    throw new Error(detail);
+function setCaseUrl(caseId) {
+  const url = new URL(window.location.href);
+  if (caseId) {
+    url.searchParams.set("case", String(caseId));
+  } else {
+    url.searchParams.delete("case");
   }
+  url.searchParams.delete("video");
+  url.searchParams.delete("t");
+  history.replaceState({}, "", url);
+}
+
+async function fetchJson(url, options = {}) {
+  let response;
+  try {
+    response = await fetch(url, options);
+  } catch (error) {
+    throw new Error(`Network error: ${formatError(error)}`);
+  }
+
+  let rawBody = "";
+  try {
+    rawBody = await response.text();
+  } catch {
+    rawBody = "";
+  }
+
+  let payload = null;
+  if (rawBody) {
+    try {
+      payload = JSON.parse(rawBody);
+    } catch {
+      payload = null;
+    }
+  }
+
+  if (!response.ok) {
+    let detail = "";
+    if (payload && typeof payload === "object") {
+      if (typeof payload.detail === "string") {
+        detail = payload.detail;
+      } else if (payload.detail !== undefined && payload.detail !== null) {
+        detail = formatError(payload.detail);
+      } else {
+        detail = formatError(payload);
+      }
+    } else if (rawBody.trim()) {
+      detail = rawBody.trim();
+    } else {
+      detail = response.statusText || "Request failed";
+    }
+    throw new Error(`[${response.status}] ${detail}`);
+  }
+
+  if (!rawBody) {
+    return {};
+  }
+
+  if (payload === null) {
+    throw new Error(`[${response.status}] Invalid JSON response`);
+  }
+
   return payload;
 }
 
+function normalizeCases(rawCases) {
+  const list = Array.isArray(rawCases) ? rawCases : [];
+  const normalized = [];
+  for (const item of list) {
+    if (!item || typeof item !== "object") {
+      continue;
+    }
+    const caseId = typeof item.case_id === "string" ? item.case_id.trim() : "";
+    if (!caseId) {
+      continue;
+    }
+    const name =
+      typeof item.name === "string" && item.name.trim()
+        ? item.name.trim()
+        : caseId;
+    normalized.push({ case_id: caseId, name });
+  }
+  return normalized;
+}
+
+function clearResults() {
+  renderResults([]);
+}
+
+function syncWorkspaceVisibility() {
+  if (!workspace) {
+    return;
+  }
+  workspace.style.display = state.activeCaseId ? "flex" : "none";
+}
+
+function defaultCaseName() {
+  return `Case ${String(state.cases.length + 1).padStart(3, "0")}`;
+}
+
+function resetPlayerForCase(caseId = null) {
+  if (!videoPlayer || !playerMeta) {
+    return;
+  }
+  const normalizedCaseId = caseId ? String(caseId) : "";
+  videoPlayer.pause();
+  videoPlayer.removeAttribute("src");
+  videoPlayer.load();
+  videoPlayer.dataset.filename = "";
+  videoPlayer.dataset.videoUrl = "";
+  videoPlayer.dataset.caseId = normalizedCaseId;
+  playerMeta.textContent = normalizedCaseId
+    ? `Case ${normalizedCaseId}: select a result to play.`
+    : "Select a result to play.";
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+function markCaseStateChanged() {
+  caseStateVersion += 1;
+}
+
+function upsertCase(caseId, name) {
+  const normalizedId = String(caseId || "").trim();
+  if (!normalizedId) {
+    return;
+  }
+  const normalizedName = String(name || normalizedId).trim() || normalizedId;
+  const existingIndex = state.cases.findIndex((item) => item.case_id === normalizedId);
+  if (existingIndex >= 0) {
+    state.cases[existingIndex] = {
+      ...state.cases[existingIndex],
+      name: normalizedName,
+    };
+  } else {
+    state.cases = [...state.cases, { case_id: normalizedId, name: normalizedName }];
+  }
+}
+
+function renderCaseList() {
+  if (!caseList) {
+    return;
+  }
+  caseList.innerHTML = "";
+
+  if (!state.cases.length) {
+    const empty = document.createElement("div");
+    empty.className = "empty";
+    empty.textContent = "No cases yet. Click + New Case to begin.";
+    caseList.appendChild(empty);
+    return;
+  }
+
+  state.cases.forEach((item) => {
+    const caseButton = document.createElement("button");
+    caseButton.type = "button";
+    caseButton.className = "case-item";
+    if (item.case_id === state.activeCaseId) {
+      caseButton.classList.add("active");
+    }
+
+    const caseName = document.createElement("span");
+    caseName.className = "case-item-name";
+    caseName.textContent = item.name;
+
+    const caseId = document.createElement("span");
+    caseId.className = "case-item-id";
+    caseId.textContent = item.case_id;
+
+    caseButton.appendChild(caseName);
+    caseButton.appendChild(caseId);
+    caseButton.addEventListener("click", () => {
+      selectCase(item.case_id);
+    });
+    caseList.appendChild(caseButton);
+  });
+}
+
+async function loadCases() {
+  const requestVersion = caseStateVersion;
+  const payload = await fetchJson("/cases");
+  const rawCases = Array.isArray(payload)
+    ? payload
+    : Array.isArray(payload?.cases)
+      ? payload.cases
+      : [];
+  const backendCases = normalizeCases(rawCases);
+  const stateChangedDuringRequest = requestVersion !== caseStateVersion;
+  console.log("RAW /cases response:", payload);
+  console.log("NORMALIZED cases:", backendCases);
+
+  if (backendCases.length > 0) {
+    if (!stateChangedDuringRequest) {
+      state.cases = backendCases;
+    } else {
+      const merged = [...state.cases];
+      backendCases.forEach((item) => {
+        const existingIndex = merged.findIndex((entry) => entry.case_id === item.case_id);
+        if (existingIndex >= 0) {
+          merged[existingIndex] = item;
+        } else {
+          merged.push(item);
+        }
+      });
+      state.cases = merged;
+    }
+  } else if (!state.cases.length) {
+    state.cases = [];
+  }
+
+  if (state.cases.length > 0) {
+    if (
+      !stateChangedDuringRequest
+      && (
+        !state.activeCaseId
+        || !state.cases.some((item) => item.case_id === state.activeCaseId)
+      )
+    ) {
+      state.activeCaseId = state.cases[0].case_id;
+    }
+  } else if (!stateChangedDuringRequest) {
+    state.activeCaseId = null;
+  }
+
+  console.log("Active case:", state.activeCaseId);
+  syncWorkspaceVisibility();
+  return state.cases;
+}
+
+async function loadCasesWithRetry(maxAttempts = 3) {
+  let lastError = null;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      return await loadCases();
+    } catch (error) {
+      lastError = error;
+      if (attempt < maxAttempts) {
+        await sleep(300 * attempt);
+      }
+    }
+  }
+  throw lastError || new Error("Unable to load cases");
+}
+
 function renderVideoList(videos) {
+  if (!videoList) {
+    return;
+  }
   videoList.innerHTML = "";
   if (!videos.length) {
     const empty = document.createElement("div");
@@ -100,14 +404,37 @@ function renderVideoList(videos) {
   });
 }
 
-async function refreshVideos() {
-  const payload = await fetchJson("/videos");
-  renderVideoList(payload.videos || []);
+async function refreshVideos(caseId = null, expectedSwitchVersion = null) {
+  const resolvedCaseId = caseId || ensureActiveCaseId();
+  if (!resolvedCaseId) {
+    renderVideoList([]);
+    return;
+  }
+
+  const switchVersionAtRequest = expectedSwitchVersion;
+  const payload = await fetchJson(withCaseQuery("/videos", resolvedCaseId));
+  if (
+    switchVersionAtRequest !== null
+    && (
+      switchVersionAtRequest !== caseSwitchVersion
+      || resolvedCaseId !== state.activeCaseId
+    )
+  ) {
+    return;
+  }
+  renderVideoList(Array.isArray(payload.videos) ? payload.videos : []);
 }
 
 function playVideoAt(filename, videoUrl, timestampSeconds) {
+  if (!videoPlayer || !playerMeta) {
+    return;
+  }
   const targetTime = Math.max(0, Number(timestampSeconds) || 0);
-  const changedVideo = videoPlayer.dataset.filename !== filename;
+  const activeCaseId = String(state.activeCaseId || "");
+  const changedVideo =
+    videoPlayer.dataset.filename !== filename
+    || videoPlayer.dataset.videoUrl !== videoUrl
+    || videoPlayer.dataset.caseId !== activeCaseId;
 
   const seek = () => {
     const duration = Number.isFinite(videoPlayer.duration) ? videoPlayer.duration : null;
@@ -118,6 +445,8 @@ function playVideoAt(filename, videoUrl, timestampSeconds) {
 
   if (changedVideo) {
     videoPlayer.dataset.filename = filename;
+    videoPlayer.dataset.videoUrl = videoUrl;
+    videoPlayer.dataset.caseId = activeCaseId;
     videoPlayer.src = videoUrl;
     videoPlayer.load();
     videoPlayer.addEventListener("loadedmetadata", seek, { once: true });
@@ -132,6 +461,9 @@ function playVideoAt(filename, videoUrl, timestampSeconds) {
 }
 
 function renderResults(results) {
+  if (!resultsGrid) {
+    return;
+  }
   resultsGrid.innerHTML = "";
   if (!results.length) {
     const empty = document.createElement("div");
@@ -173,6 +505,39 @@ function renderResults(results) {
   });
 }
 
+async function selectCase(caseId) {
+  if (!caseId) {
+    return;
+  }
+  const nextCaseId = String(caseId);
+  if (!state.cases.some((item) => item.case_id === nextCaseId)) {
+    return;
+  }
+
+  state.activeCaseId = nextCaseId;
+  markCaseStateChanged();
+  clearResults();
+  resetPlayerForCase(nextCaseId);
+  setCaseUrl(nextCaseId);
+  renderCaseList();
+  syncWorkspaceVisibility();
+  const switchVersion = ++caseSwitchVersion;
+
+  try {
+    setStatus(`Loading videos for ${nextCaseId}...`, "working");
+    await refreshVideos(nextCaseId, switchVersion);
+    if (switchVersion !== caseSwitchVersion || state.activeCaseId !== nextCaseId) {
+      return;
+    }
+    setStatus(`Case ${nextCaseId} ready.`, "ok");
+  } catch (error) {
+    if (switchVersion !== caseSwitchVersion || state.activeCaseId !== nextCaseId) {
+      return;
+    }
+    setStatus(`Case switch failed: ${formatError(error)}`, "error");
+  }
+}
+
 async function uploadAndIndex() {
   const files = Array.from(videoInput.files || []);
   if (!files.length) {
@@ -187,11 +552,12 @@ async function uploadAndIndex() {
   }
 
   try {
-    setStatus("Uploading videos...", "working");
+    const caseId = ensureActiveCaseId();
+    setStatus(`Uploading videos to ${caseId}...`, "working");
     const formData = new FormData();
     files.forEach((file) => formData.append("files", file));
 
-    const uploadResult = await fetchJson("/upload", {
+    const uploadResult = await fetchJson(withCaseQuery("/upload", caseId), {
       method: "POST",
       body: formData,
     });
@@ -205,12 +571,13 @@ async function uploadAndIndex() {
 
     for (let i = 0; i < uploaded.length; i += 1) {
       const filename = uploaded[i];
-      setStatus(`Indexing ${filename} (${i + 1}/${uploaded.length})...`, "working");
+      setStatus(`Indexing ${filename} (${i + 1}/${uploaded.length}) in ${caseId}...`, "working");
       try {
         const processResult = await fetchJson("/process_video", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
+            case_id: caseId,
             filename,
             frame_interval_seconds: frameInterval,
             batch_size: 32,
@@ -224,18 +591,18 @@ async function uploadAndIndex() {
           indexedCount += 1;
         }
       } catch (error) {
-        indexErrors.push(`${filename}: ${error.message}`);
+        indexErrors.push(`${filename}: ${formatError(error)}`);
       }
     }
 
     const allErrors = [...errors, ...indexErrors];
-    const successNote = `Uploaded: ${uploaded.length} file(s), indexed: ${indexedCount}, skipped: ${skippedCount}, transcoded: ${transcoded.length}.`;
+    const successNote = `Case ${caseId}: uploaded ${uploaded.length}, indexed ${indexedCount}, skipped ${skippedCount}, transcoded ${transcoded.length}.`;
     const errorNote = allErrors.length ? ` Errors: ${allErrors.join(" | ")}` : "";
     setStatus(`${successNote}${errorNote}`, allErrors.length ? "error" : "ok");
     videoInput.value = "";
-    await refreshVideos();
+    await refreshVideos(caseId);
   } catch (error) {
-    setStatus(`Upload/index failed: ${error.message}`, "error");
+    setStatus(`Upload/index failed: ${formatError(error)}`, "error");
   }
 }
 
@@ -250,54 +617,155 @@ async function runSearch() {
   topKInput.value = String(topK);
 
   try {
-    setStatus("Searching...", "working");
+    const caseId = ensureActiveCaseId();
+    setStatus(`Searching in ${caseId}...`, "working");
     const payload = await fetchJson("/search", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ query, top_k: topK }),
+      body: JSON.stringify({ case_id: caseId, query, top_k: topK }),
     });
-    renderResults(payload.results || []);
-    setStatus(`Found ${payload.count || 0} result(s).`, "ok");
+    renderResults(Array.isArray(payload.results) ? payload.results : []);
+    setStatus(`Case ${caseId}: found ${payload.count || 0} result(s).`, "ok");
   } catch (error) {
-    setStatus(`Search failed: ${error.message}`, "error");
+    setStatus(`Search failed: ${formatError(error)}`, "error");
   }
 }
 
-function restorePlaybackFromUrl() {
-  const params = new URLSearchParams(window.location.search);
-  const filename = params.get("video");
-  const t = Number.parseFloat(params.get("t") || "0");
-  if (!filename) {
+async function createCase() {
+  const suggestedName = defaultCaseName();
+  const name = window.prompt("Enter a case name:", suggestedName);
+  if (name === null) {
     return;
   }
-  const videoUrl = `/media/videos/${encodeURIComponent(filename)}`;
+  const trimmed = name.trim();
+  const caseNameToCreate = trimmed || suggestedName;
+
+  try {
+    console.log("Creating case...");
+    setStatus("Creating case...", "working");
+    const payload = await fetchJson("/cases", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: caseNameToCreate }),
+    });
+    console.log("Create case response:", payload);
+
+    const newCaseId =
+      payload.case_id ||
+      payload.id ||
+      (payload.case && payload.case.case_id);
+
+    if (!newCaseId) {
+      throw new Error("Invalid /cases response: missing case_id");
+    }
+
+    const caseName =
+      typeof payload.name === "string" && payload.name.trim()
+        ? payload.name.trim()
+        : caseNameToCreate;
+    upsertCase(newCaseId, caseName);
+    state.activeCaseId = newCaseId;
+    markCaseStateChanged();
+    clearResults();
+    resetPlayerForCase(newCaseId);
+    setCaseUrl(newCaseId);
+    renderCaseList();
+    syncWorkspaceVisibility();
+    await refreshVideos(newCaseId);
+    setStatus(`Created case ${newCaseId}.`, "ok");
+  } catch (error) {
+    setStatus(`Create case failed: ${formatError(error)}`, "error");
+  }
+}
+
+async function restorePlaybackFromUrl() {
+  const params = new URLSearchParams(window.location.search);
+  const caseIdFromUrl = params.get("case");
+  if (caseIdFromUrl && state.cases.some((item) => item.case_id === caseIdFromUrl)) {
+    await selectCase(caseIdFromUrl);
+  }
+
+  const filename = params.get("video");
+  const t = Number.parseFloat(params.get("t") || "0");
+  if (!filename || !state.activeCaseId) {
+    return;
+  }
+
+  const videoUrl = `/media/cases/${encodeURIComponent(state.activeCaseId)}/videos/${encodeURIComponent(filename)}`;
   playVideoAt(filename, videoUrl, Number.isFinite(t) ? t : 0);
 }
 
-uploadBtn.addEventListener("click", uploadAndIndex);
-refreshBtn.addEventListener("click", async () => {
+function setupListeners() {
+  if (listenersBound) {
+    return;
+  }
+
+  const createCaseButton = document.getElementById("createCaseBtn");
+  console.log("createCaseButton:", createCaseButton);
+
+  createCaseButton?.addEventListener("click", () => {
+    console.log("New Case clicked");
+    createCase();
+  });
+
+  uploadBtn?.addEventListener("click", uploadAndIndex);
+
+  refreshBtn?.addEventListener("click", async () => {
+    try {
+      await refreshVideos(ensureActiveCaseId());
+      setStatus("Video list refreshed.", "ok");
+    } catch (error) {
+      setStatus(`Refresh failed: ${formatError(error)}`, "error");
+    }
+  });
+
+  searchBtn?.addEventListener("click", runSearch);
+
+  queryInput?.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      runSearch();
+    }
+  });
+
+  listenersBound = true;
+}
+
+async function init() {
+  if (initStarted) {
+    return;
+  }
+  initStarted = true;
+  bindDomElements();
+  syncWorkspaceVisibility();
+  setupListeners();
+
+  clearResults();
   try {
-    await refreshVideos();
-    setStatus("Video list refreshed.", "ok");
+    setStatus("Loading cases...", "working");
+    await loadCasesWithRetry(3);
+    renderCaseList();
+
+    if (!state.cases.length) {
+      state.activeCaseId = null;
+      resetPlayerForCase(null);
+      setCaseUrl(null);
+      syncWorkspaceVisibility();
+      setStatus("No cases yet. Click + New Case to begin.", "ok");
+      return;
+    }
+
+    await selectCase(state.activeCaseId);
+    await restorePlaybackFromUrl();
+    setStatus("Ready.", "ok");
   } catch (error) {
-    setStatus(`Refresh failed: ${error.message}`, "error");
+    setStatus(`Startup failed: ${formatError(error)}. Check backend at http://127.0.0.1:8000/.`, "error");
   }
-});
-searchBtn.addEventListener("click", runSearch);
-queryInput.addEventListener("keydown", (event) => {
-  if (event.key === "Enter") {
-    runSearch();
-  }
+}
+
+window.addEventListener("load", () => {
+  void init();
 });
 
-window.addEventListener("DOMContentLoaded", async () => {
-  renderResults([]);
-  try {
-    setStatus("Loading videos...", "working");
-    await refreshVideos();
-    setStatus("Ready.", "ok");
-    restorePlaybackFromUrl();
-  } catch (error) {
-    setStatus(`Startup failed: ${error.message}`, "error");
-  }
-});
+if (document.readyState === "complete") {
+  void init();
+}

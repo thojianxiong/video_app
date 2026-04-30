@@ -15,9 +15,14 @@ project/
     index.html
     script.js
     styles.css
-  videos/
-  thumbnails/
-  data/
+  cases/
+    cases.json
+    case_001/
+      videos/
+      thumbnails/
+      data/
+        faiss.index
+        metadata.json
 ```
 
 ## Run Locally
@@ -60,7 +65,7 @@ If the selected model weights are not already in that cache, download them once 
 
 ## AVI Playback
 
-When you upload an `.avi` file, the backend transcodes it locally to `.mp4` and stores the `.mp4` in `videos/`.
+When you upload a video, the backend attempts conversion to browser-compatible `.mp4` (H.264) and stores it in the selected case's `videos/` folder.
 This keeps search/indexing local and makes playback reliable in HTML5 browsers.
 
 ffmpeg resolution order:
@@ -70,16 +75,16 @@ ffmpeg resolution order:
 
 ## API Endpoints
 
-- `POST /upload`
-- `POST /process_video`
-- `POST /search`
-- `GET /videos`
+- `POST /cases`
+- `GET /cases`
+- `POST /upload?case_id=...`
+- `POST /process_video` (body includes `case_id`)
+- `POST /search` (body includes `case_id`)
+- `GET /videos?case_id=...`
 
 ## Notes
 
-- Videos are stored in `videos/`
-- Thumbnails are stored in `thumbnails/`
-- FAISS index and metadata are stored in `data/`
+- Each case has isolated storage in `cases/{case_id}/videos`, `cases/{case_id}/thumbnails`, and `cases/{case_id}/data`
 - Optional model overrides:
   - `OPENCLIP_MODEL` (default: `ViT-B-32`)
   - `OPENCLIP_PRETRAINED` (default: `laion2b_s34b_b79k`)
