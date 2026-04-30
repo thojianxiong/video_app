@@ -93,10 +93,14 @@ main.app-shell > .case-sidebar {
 #createCaseBtn {
   flex: 0 0 auto;
   margin-bottom: 10px;
+  position: sticky;
+  top: 0;
+  z-index: 2;
 }
 
 .case-list {
-  display: grid;
+  display: flex;
+  flex-direction: column;
   gap: 6px;
   flex: 1;
   min-height: 0;
@@ -106,14 +110,17 @@ main.app-shell > .case-sidebar {
 }
 
 .case-item {
-  display: block;
+  display: flex;
+  align-items: center;
+  gap: 8px;
   width: 100%;
   text-align: left;
   border-radius: 8px;
   border: 1px solid #cfdae5;
   background: #f8fbfd;
   color: var(--ink);
-  padding: 9px 10px;
+  padding: 10px 12px;
+  min-height: 42px;
   font-weight: 600;
   cursor: pointer;
 }
@@ -129,6 +136,8 @@ main.app-shell > .case-sidebar {
 
 .case-item-name {
   display: block;
+  flex: 1 1 auto;
+  min-width: 0;
   font-size: 0.92rem;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -137,9 +146,11 @@ main.app-shell > .case-sidebar {
 
 .case-item-id {
   display: block;
-  margin-top: 2px;
+  flex: 0 0 auto;
+  margin-top: 0;
   color: var(--muted);
   font-size: 0.78rem;
+  white-space: nowrap;
 }
 
 h1 {

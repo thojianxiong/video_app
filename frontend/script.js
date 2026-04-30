@@ -21,6 +21,8 @@ let caseSwitchVersion = 0;
 let caseStateVersion = 0;
 let listenersBound = false;
 let initStarted = false;
+const playbackCache = new Map();
+const searchCache = new Map();
 
 function bindDomElements() {
   videoInput = document.getElementById("videoInput");
@@ -123,6 +125,40 @@ function setCaseUrl(caseId) {
   history.replaceState({}, "", url);
 }
 
+function setPlaybackCache(caseId, filename, timestampSeconds) {
+  const normalizedCaseId = String(caseId || "").trim();
+  const normalizedFilename = String(filename || "").trim();
+  if (!normalizedCaseId || !normalizedFilename) {
+    return;
+  }
+  const parsedTimestamp = Number(timestampSeconds);
+  const safeTimestamp = Number.isFinite(parsedTimestamp) && parsedTimestamp >= 0
+    ? parsedTimestamp
+    : 0;
+  playbackCache.set(normalizedCaseId, {
+    filename: normalizedFilename,
+    timestampSeconds: safeTimestamp,
+  });
+}
+
+function clearPlaybackCache(caseId) {
+  if (!caseId) {
+    return;
+  }
+  playbackCache.delete(String(caseId));
+}
+
+function saveActiveCasePlaybackSnapshot() {
+  if (!videoPlayer || !state.activeCaseId) {
+    return;
+  }
+  const filename = String(videoPlayer.dataset.filename || "").trim();
+  if (!filename) {
+    return;
+  }
+  setPlaybackCache(state.activeCaseId, filename, videoPlayer.currentTime || 0);
+}
+
 async function fetchJson(url, options = {}) {
   let response;
   try {
@@ -211,6 +247,105 @@ function defaultCaseName() {
   return `Case ${String(state.cases.length + 1).padStart(3, "0")}`;
 }
 
+function normalizeTopK(value, fallback = 10) {
+  const parsed = Number.parseInt(String(value ?? ""), 10);
+  if (!Number.isFinite(parsed)) {
+    return fallback;
+  }
+  return Math.max(1, Math.min(100, parsed));
+}
+
+function defaultTopK() {
+  if (!topKInput) {
+    return 10;
+  }
+  const fromDefault = normalizeTopK(topKInput.defaultValue, NaN);
+  if (Number.isFinite(fromDefault)) {
+    return fromDefault;
+  }
+  const fromAttr = normalizeTopK(topKInput.getAttribute("value"), NaN);
+  if (Number.isFinite(fromAttr)) {
+    return fromAttr;
+  }
+  return 10;
+}
+
+function searchKey(query, topK) {
+  return `${query}\u0000${topK}`;
+}
+
+function ensureCaseSearchCache(caseId) {
+  const normalizedCaseId = String(caseId || "").trim();
+  if (!normalizedCaseId) {
+    return null;
+  }
+  let caseCache = searchCache.get(normalizedCaseId);
+  if (!caseCache) {
+    caseCache = {
+      activeKey: null,
+      entries: new Map(),
+    };
+    searchCache.set(normalizedCaseId, caseCache);
+  }
+  return caseCache;
+}
+
+function cacheSearchResults(caseId, query, topK, results, count) {
+  const caseCache = ensureCaseSearchCache(caseId);
+  if (!caseCache) {
+    return;
+  }
+  const normalizedQuery = String(query || "").trim();
+  const normalizedTopK = normalizeTopK(topK, defaultTopK());
+  const key = searchKey(normalizedQuery, normalizedTopK);
+  const normalizedResults = Array.isArray(results) ? results : [];
+  caseCache.entries.set(key, {
+    query: normalizedQuery,
+    topK: normalizedTopK,
+    results: normalizedResults,
+    count: Number.isFinite(Number(count)) ? Number(count) : normalizedResults.length,
+  });
+  caseCache.activeKey = key;
+}
+
+function getActiveSearchCache(caseId) {
+  const normalizedCaseId = String(caseId || "").trim();
+  if (!normalizedCaseId) {
+    return null;
+  }
+  const caseCache = searchCache.get(normalizedCaseId);
+  if (!caseCache || !caseCache.activeKey) {
+    return null;
+  }
+  return caseCache.entries.get(caseCache.activeKey) || null;
+}
+
+function clearSearchUiForCase() {
+  if (queryInput) {
+    queryInput.value = "";
+  }
+  if (topKInput) {
+    topKInput.value = String(defaultTopK());
+  }
+  clearResults();
+}
+
+function restoreSearchForCase(caseId) {
+  const cached = getActiveSearchCache(caseId);
+  if (!cached) {
+    clearSearchUiForCase();
+    return false;
+  }
+  if (queryInput) {
+    queryInput.value = cached.query;
+  }
+  if (topKInput) {
+    topKInput.value = String(cached.topK);
+  }
+  renderResults(cached.results);
+  return true;
+}
+
 function resetPlayerForCase(caseId = null) {
   if (!videoPlayer || !playerMeta) {
     return;
@@ -225,6 +360,36 @@ function resetPlayerForCase(caseId = null) {
   playerMeta.textContent = normalizedCaseId
     ? `Case ${normalizedCaseId}: select a result to play.`
     : "Select a result to play.";
+}
+
+function restorePlaybackForCase(caseId, videos) {
+  const normalizedCaseId = String(caseId || "").trim();
+  if (!normalizedCaseId) {
+    resetPlayerForCase(null);
+    return;
+  }
+
+  const cached = playbackCache.get(normalizedCaseId);
+  if (!cached) {
+    resetPlayerForCase(normalizedCaseId);
+    return;
+  }
+
+  const list = Array.isArray(videos) ? videos : [];
+  const match = list.find((item) => item && item.filename === cached.filename);
+  if (!match) {
+    clearPlaybackCache(normalizedCaseId);
+    resetPlayerForCase(normalizedCaseId);
+    return;
+  }
+
+  const fallbackVideoUrl = `/media/cases/${encodeURIComponent(normalizedCaseId)}/videos/${encodeURIComponent(cached.filename)}`;
+  playVideoAt(
+    cached.filename,
+    match.video_url || fallbackVideoUrl,
+    cached.timestampSeconds || 0,
+    { autoPlay: false },
+  );
 }
 
 function sleep(ms) {
@@ -339,6 +504,18 @@ async function loadCases() {
     state.activeCaseId = null;
   }
 
+  const validCaseIds = new Set(state.cases.map((item) => item.case_id));
+  for (const cachedCaseId of playbackCache.keys()) {
+    if (!validCaseIds.has(cachedCaseId)) {
+      playbackCache.delete(cachedCaseId);
+    }
+  }
+  for (const cachedCaseId of searchCache.keys()) {
+    if (!validCaseIds.has(cachedCaseId)) {
+      searchCache.delete(cachedCaseId);
+    }
+  }
+
   console.log("Active case:", state.activeCaseId);
   syncWorkspaceVisibility();
   return state.cases;
@@ -420,15 +597,18 @@ async function refreshVideos(caseId = null, expectedSwitchVersion = null) {
       || resolvedCaseId !== state.activeCaseId
     )
   ) {
-    return;
+    return null;
   }
-  renderVideoList(Array.isArray(payload.videos) ? payload.videos : []);
+  const videos = Array.isArray(payload.videos) ? payload.videos : [];
+  renderVideoList(videos);
+  return videos;
 }
 
-function playVideoAt(filename, videoUrl, timestampSeconds) {
+function playVideoAt(filename, videoUrl, timestampSeconds, options = {}) {
   if (!videoPlayer || !playerMeta) {
     return;
   }
+  const autoPlay = options.autoPlay !== false;
   const targetTime = Math.max(0, Number(timestampSeconds) || 0);
   const activeCaseId = String(state.activeCaseId || "");
   const changedVideo =
@@ -440,7 +620,11 @@ function playVideoAt(filename, videoUrl, timestampSeconds) {
     const duration = Number.isFinite(videoPlayer.duration) ? videoPlayer.duration : null;
     const safeTime = duration && duration > 0 ? Math.min(targetTime, Math.max(0, duration - 0.05)) : targetTime;
     videoPlayer.currentTime = safeTime;
-    videoPlayer.play().catch(() => {});
+    if (autoPlay) {
+      videoPlayer.play().catch(() => {});
+    } else {
+      videoPlayer.pause();
+    }
   };
 
   if (changedVideo) {
@@ -457,6 +641,9 @@ function playVideoAt(filename, videoUrl, timestampSeconds) {
   }
 
   playerMeta.textContent = `${filename} @ ${formatTime(targetTime)}`;
+  if (activeCaseId) {
+    setPlaybackCache(activeCaseId, filename, targetTime);
+  }
   setPlaybackUrl(filename, targetTime);
 }
 
@@ -513,10 +700,14 @@ async function selectCase(caseId) {
   if (!state.cases.some((item) => item.case_id === nextCaseId)) {
     return;
   }
+  if (nextCaseId === state.activeCaseId) {
+    return;
+  }
 
+  saveActiveCasePlaybackSnapshot();
   state.activeCaseId = nextCaseId;
   markCaseStateChanged();
-  clearResults();
+  restoreSearchForCase(nextCaseId);
   resetPlayerForCase(nextCaseId);
   setCaseUrl(nextCaseId);
   renderCaseList();
@@ -525,10 +716,11 @@ async function selectCase(caseId) {
 
   try {
     setStatus(`Loading videos for ${nextCaseId}...`, "working");
-    await refreshVideos(nextCaseId, switchVersion);
+    const videos = await refreshVideos(nextCaseId, switchVersion);
     if (switchVersion !== caseSwitchVersion || state.activeCaseId !== nextCaseId) {
       return;
     }
+    restorePlaybackForCase(nextCaseId, videos);
     setStatus(`Case ${nextCaseId} ready.`, "ok");
   } catch (error) {
     if (switchVersion !== caseSwitchVersion || state.activeCaseId !== nextCaseId) {
@@ -613,7 +805,7 @@ async function runSearch() {
     return;
   }
 
-  const topK = Math.max(1, Math.min(100, Number.parseInt(topKInput.value || "10", 10)));
+  const topK = normalizeTopK(topKInput?.value || "10", 10);
   topKInput.value = String(topK);
 
   try {
@@ -624,8 +816,10 @@ async function runSearch() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ case_id: caseId, query, top_k: topK }),
     });
-    renderResults(Array.isArray(payload.results) ? payload.results : []);
-    setStatus(`Case ${caseId}: found ${payload.count || 0} result(s).`, "ok");
+    const results = Array.isArray(payload.results) ? payload.results : [];
+    renderResults(results);
+    cacheSearchResults(caseId, query, topK, results, payload.count);
+    setStatus(`Case ${caseId}: found ${payload.count || results.length} result(s).`, "ok");
   } catch (error) {
     setStatus(`Search failed: ${formatError(error)}`, "error");
   }
@@ -664,9 +858,10 @@ async function createCase() {
         ? payload.name.trim()
         : caseNameToCreate;
     upsertCase(newCaseId, caseName);
+    saveActiveCasePlaybackSnapshot();
     state.activeCaseId = newCaseId;
     markCaseStateChanged();
-    clearResults();
+    restoreSearchForCase(newCaseId);
     resetPlayerForCase(newCaseId);
     setCaseUrl(newCaseId);
     renderCaseList();
