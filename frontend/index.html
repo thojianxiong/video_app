@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Local Video Semantic Search</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260501c" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260501g" />
   </head>
   <body>
     <main class="app-shell">
@@ -13,10 +13,18 @@
         <button id="createCaseBtn" type="button">+ New Case</button>
         <div id="caseList" class="case-list"></div>
       </aside>
+      <div
+        id="sidebarResizeHandle"
+        class="sidebar-resize-handle"
+        role="separator"
+        aria-orientation="vertical"
+        aria-label="Resize case sidebar"
+      ></div>
 
       <section class="workspace">
         <section class="panel upload-panel">
           <h1>Local Video Semantic Search</h1>
+          <p id="activeCaseMeta" class="active-case-meta"></p>
           <div class="upload-controls">
             <input id="videoInput" type="file" multiple accept="video/*" />
             <label for="intervalInput">Frame Interval (s)</label>
@@ -50,6 +58,6 @@
         <section id="resultsGrid" class="results-grid"></section>
       </section>
     </main>
-    <script src="/static/script.js?v=20260501b"></script>
+    <script src="/static/script.js?v=20260501g"></script>
   </body>
 </html>

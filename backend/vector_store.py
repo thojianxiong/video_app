@@ -203,6 +203,37 @@ class VectorStore:
 
             return {"status": "processed", "indexed_frames": len(created_ids)}
 
+    def delete_video_embeddings(self, video_filename: str) -> dict[str, int]:
+        target_filename = str(video_filename or "").strip()
+        if not target_filename:
+            return {"removed_vectors": 0, "removed_records": 0}
+
+        with self._lock:
+            matching_keys = [
+                key
+                for key, value in self.processed_videos.items()
+                if str(value.get("video_filename", "")) == target_filename
+            ]
+            if not matching_keys:
+                return {"removed_vectors": 0, "removed_records": 0}
+
+            vector_ids: list[int] = []
+            for key in matching_keys:
+                item = self.processed_videos.get(key, {})
+                vector_ids.extend(item.get("vector_ids", []))
+
+            removed_vectors = len(vector_ids)
+            removed_records = len(matching_keys)
+            self._remove_ids_locked(vector_ids)
+            for key in matching_keys:
+                self.processed_videos.pop(key, None)
+
+            self._save_locked()
+            return {
+                "removed_vectors": removed_vectors,
+                "removed_records": removed_records,
+            }
+
     def search(self, query_embedding: np.ndarray, top_k: int = 10) -> list[dict[str, Any]]:
         if top_k <= 0:
             return []

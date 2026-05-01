@@ -10,6 +10,10 @@
   --accent-soft: #dcefee;
   --warning: #b55f2f;
   --shadow: 0 12px 30px rgba(16, 36, 54, 0.12);
+  --sidebar-width: 320px;
+  --sidebar-min-width: 220px;
+  --sidebar-max-width: 560px;
+  --sidebar-handle-width: 8px;
 }
 
 * {
@@ -36,7 +40,7 @@ body {
 
 main.app-shell {
   display: grid !important;
-  grid-template-columns: 260px minmax(0, 1fr);
+  grid-template-columns: var(--sidebar-width) var(--sidebar-handle-width) minmax(0, 1fr);
   height: 100vh;
   min-height: 100vh;
   width: 100vw;
@@ -69,9 +73,9 @@ main.app-shell > .workspace {
 }
 
 main.app-shell > .case-sidebar {
-  width: auto;
-  min-width: 260px;
-  max-width: 260px;
+  width: 100%;
+  min-width: 0;
+  max-width: none;
   flex-shrink: 0;
   border-right: 1px solid #ddd;
   display: flex;
@@ -81,6 +85,35 @@ main.app-shell > .case-sidebar {
   min-height: 0;
   overflow: hidden;
   border-radius: 8px 0 0 8px;
+}
+
+.sidebar-resize-handle {
+  width: var(--sidebar-handle-width);
+  cursor: col-resize;
+  border-radius: 6px;
+  background:
+    linear-gradient(
+      to right,
+      transparent 0,
+      transparent 2px,
+      rgba(120, 140, 160, 0.45) 2px,
+      rgba(120, 140, 160, 0.45) 4px,
+      transparent 4px
+    );
+  user-select: none;
+  touch-action: none;
+}
+
+.sidebar-resize-handle:hover {
+  background:
+    linear-gradient(
+      to right,
+      transparent 0,
+      transparent 2px,
+      rgba(11, 138, 132, 0.7) 2px,
+      rgba(11, 138, 132, 0.7) 4px,
+      transparent 4px
+    );
 }
 
 .case-sidebar h2 {
@@ -109,11 +142,20 @@ main.app-shell > .case-sidebar {
   padding-right: 4px;
 }
 
+.case-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: stretch;
+  gap: 6px;
+  min-width: 0;
+}
+
 .case-item {
   display: flex;
   align-items: center;
   gap: 8px;
   width: 100%;
+  min-width: 0;
   text-align: left;
   border-radius: 8px;
   border: 1px solid #cfdae5;
@@ -123,6 +165,25 @@ main.app-shell > .case-sidebar {
   min-height: 42px;
   font-weight: 600;
   cursor: pointer;
+}
+
+.case-delete-btn {
+  flex: 0 0 auto;
+  min-width: 64px;
+  padding: 10px 10px;
+  background: #fbe9e9;
+  border-color: #d6a2a2;
+  color: #8b1f1f;
+}
+
+.case-rename-btn {
+  flex: 0 0 auto;
+  min-width: 74px;
+  padding: 10px 10px;
+  background: #fff3d9;
+  border-color: #d8b678;
+  color: #6f4f00;
+  font-weight: 700;
 }
 
 .case-item:hover {
@@ -151,6 +212,16 @@ main.app-shell > .case-sidebar {
   color: var(--muted);
   font-size: 0.78rem;
   white-space: nowrap;
+  max-width: 96px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.active-case-meta {
+  margin: 0 0 10px;
+  color: var(--muted);
+  font-size: 0.88rem;
+  word-break: break-word;
 }
 
 h1 {
@@ -221,6 +292,24 @@ button.ghost:hover {
   background: #f3f7fb;
 }
 
+.case-rename-btn:hover {
+  background: #ffe9ba;
+}
+
+.case-delete-btn:hover {
+  background: #f5dada;
+}
+
+button.danger {
+  background: #fbe9e9;
+  border-color: #d6a2a2;
+  color: #8b1f1f;
+}
+
+button.danger:hover {
+  background: #f5dada;
+}
+
 label {
   color: var(--muted);
   font-size: 0.9rem;
@@ -268,6 +357,12 @@ label {
   padding: 7px 10px;
   font-size: 0.9rem;
   min-width: 58px;
+}
+
+.video-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
 }
 
 .video-meta {
@@ -371,6 +466,10 @@ label {
 }
 
 @media (max-width: 900px) {
+  :root {
+    --sidebar-width: 260px;
+  }
+
   .upload-controls {
     grid-template-columns: 1fr 1fr;
   }

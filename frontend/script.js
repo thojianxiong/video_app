@@ -10,8 +10,11 @@ let searchBtn = null;
 let resultsGrid = null;
 let videoPlayer = null;
 let playerMeta = null;
+let activeCaseMeta = null;
 let caseList = null;
 let workspace = null;
+let caseSidebar = null;
+let sidebarResizeHandle = null;
 
 const state = {
   cases: [],
@@ -23,6 +26,8 @@ let listenersBound = false;
 let initStarted = false;
 const playbackCache = new Map();
 const searchCache = new Map();
+const SIDEBAR_MIN_WIDTH = 220;
+const SIDEBAR_MAX_WIDTH = 560;
 
 function bindDomElements() {
   videoInput = document.getElementById("videoInput");
@@ -37,8 +42,11 @@ function bindDomElements() {
   resultsGrid = document.getElementById("resultsGrid");
   videoPlayer = document.getElementById("videoPlayer");
   playerMeta = document.getElementById("playerMeta");
+  activeCaseMeta = document.getElementById("activeCaseMeta");
   caseList = document.getElementById("caseList");
   workspace = document.querySelector(".workspace");
+  caseSidebar = document.querySelector(".case-sidebar");
+  sidebarResizeHandle = document.getElementById("sidebarResizeHandle");
 }
 
 function setStatus(message, kind = "") {
@@ -90,6 +98,18 @@ function formatTime(totalSeconds) {
     return `${hours}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
   }
   return `${minutes}:${String(seconds).padStart(2, "0")}`;
+}
+
+function formatCaseCreatedAt(createdAt) {
+  const raw = String(createdAt || "").trim();
+  if (!raw) {
+    return "Unknown";
+  }
+  const parsed = new Date(raw);
+  if (Number.isNaN(parsed.getTime())) {
+    return raw;
+  }
+  return parsed.toLocaleString();
 }
 
 function ensureActiveCaseId() {
@@ -227,7 +247,8 @@ function normalizeCases(rawCases) {
       typeof item.name === "string" && item.name.trim()
         ? item.name.trim()
         : caseId;
-    normalized.push({ case_id: caseId, name });
+    const createdAt = typeof item.created_at === "string" ? item.created_at.trim() : "";
+    normalized.push({ case_id: caseId, name, created_at: createdAt });
   }
   return normalized;
 }
@@ -241,10 +262,71 @@ function syncWorkspaceVisibility() {
     return;
   }
   workspace.style.display = state.activeCaseId ? "flex" : "none";
+  if (activeCaseMeta) {
+    if (!state.activeCaseId) {
+      activeCaseMeta.textContent = "";
+    } else {
+      const activeCase = state.cases.find((item) => item.case_id === state.activeCaseId);
+      const activeName = activeCase?.name || state.activeCaseId;
+      const createdAtLabel = formatCaseCreatedAt(activeCase?.created_at);
+      activeCaseMeta.textContent = `Active Case: ${activeName} (${state.activeCaseId}) | Created: ${createdAtLabel}`;
+    }
+  }
 }
 
 function defaultCaseName() {
   return `Case ${String(state.cases.length + 1).padStart(3, "0")}`;
+}
+
+function clampSidebarWidth(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return SIDEBAR_MIN_WIDTH;
+  }
+  return Math.max(SIDEBAR_MIN_WIDTH, Math.min(SIDEBAR_MAX_WIDTH, Math.round(numeric)));
+}
+
+function setSidebarWidth(widthPx) {
+  const clamped = clampSidebarWidth(widthPx);
+  document.documentElement.style.setProperty("--sidebar-width", `${clamped}px`);
+}
+
+function setupSidebarResize() {
+  if (!caseSidebar || !sidebarResizeHandle) {
+    return;
+  }
+
+  let resizing = false;
+  let startX = 0;
+  let startWidth = 0;
+
+  const onPointerMove = (event) => {
+    if (!resizing) {
+      return;
+    }
+    const deltaX = event.clientX - startX;
+    setSidebarWidth(startWidth + deltaX);
+  };
+
+  const stopResize = () => {
+    if (!resizing) {
+      return;
+    }
+    resizing = false;
+    window.removeEventListener("pointermove", onPointerMove);
+    window.removeEventListener("pointerup", stopResize);
+    window.removeEventListener("pointercancel", stopResize);
+  };
+
+  sidebarResizeHandle.addEventListener("pointerdown", (event) => {
+    event.preventDefault();
+    resizing = true;
+    startX = event.clientX;
+    startWidth = caseSidebar.getBoundingClientRect().width;
+    window.addEventListener("pointermove", onPointerMove);
+    window.addEventListener("pointerup", stopResize);
+    window.addEventListener("pointercancel", stopResize);
+  });
 }
 
 function normalizeTopK(value, fallback = 10) {
@@ -346,6 +428,33 @@ function restoreSearchForCase(caseId) {
   return true;
 }
 
+function removeVideoFromSearchCache(caseId, filename) {
+  const normalizedCaseId = String(caseId || "").trim();
+  const normalizedFilename = String(filename || "").trim();
+  if (!normalizedCaseId || !normalizedFilename) {
+    return;
+  }
+
+  const caseCache = searchCache.get(normalizedCaseId);
+  if (!caseCache) {
+    return;
+  }
+
+  for (const [key, entry] of caseCache.entries.entries()) {
+    if (!entry || !Array.isArray(entry.results)) {
+      continue;
+    }
+    const filteredResults = entry.results.filter(
+      (item) => item && item.video_filename !== normalizedFilename,
+    );
+    caseCache.entries.set(key, {
+      ...entry,
+      results: filteredResults,
+      count: filteredResults.length,
+    });
+  }
+}
+
 function resetPlayerForCase(caseId = null) {
   if (!videoPlayer || !playerMeta) {
     return;
@@ -402,20 +511,25 @@ function markCaseStateChanged() {
   caseStateVersion += 1;
 }
 
-function upsertCase(caseId, name) {
+function upsertCase(caseId, name, createdAt = "") {
   const normalizedId = String(caseId || "").trim();
   if (!normalizedId) {
     return;
   }
   const normalizedName = String(name || normalizedId).trim() || normalizedId;
+  const normalizedCreatedAt = String(createdAt || "").trim();
   const existingIndex = state.cases.findIndex((item) => item.case_id === normalizedId);
   if (existingIndex >= 0) {
     state.cases[existingIndex] = {
       ...state.cases[existingIndex],
       name: normalizedName,
+      created_at: normalizedCreatedAt || state.cases[existingIndex].created_at || "",
     };
   } else {
-    state.cases = [...state.cases, { case_id: normalizedId, name: normalizedName }];
+    state.cases = [
+      ...state.cases,
+      { case_id: normalizedId, name: normalizedName, created_at: normalizedCreatedAt },
+    ];
   }
 }
 
@@ -434,6 +548,9 @@ function renderCaseList() {
   }
 
   state.cases.forEach((item) => {
+    const row = document.createElement("div");
+    row.className = "case-row";
+
     const caseButton = document.createElement("button");
     caseButton.type = "button";
     caseButton.className = "case-item";
@@ -444,17 +561,37 @@ function renderCaseList() {
     const caseName = document.createElement("span");
     caseName.className = "case-item-name";
     caseName.textContent = item.name;
-
-    const caseId = document.createElement("span");
-    caseId.className = "case-item-id";
-    caseId.textContent = item.case_id;
+    caseButton.title = item.case_id;
 
     caseButton.appendChild(caseName);
-    caseButton.appendChild(caseId);
     caseButton.addEventListener("click", () => {
       selectCase(item.case_id);
     });
-    caseList.appendChild(caseButton);
+
+    const renameButton = document.createElement("button");
+    renameButton.type = "button";
+    renameButton.className = "case-rename-btn";
+    renameButton.textContent = "Rename";
+    renameButton.title = `Rename ${item.case_id}`;
+    renameButton.addEventListener("click", (event) => {
+      event.stopPropagation();
+      renameCase(item.case_id);
+    });
+
+    const deleteButton = document.createElement("button");
+    deleteButton.type = "button";
+    deleteButton.className = "case-delete-btn";
+    deleteButton.textContent = "Delete";
+    deleteButton.title = `Delete ${item.case_id}`;
+    deleteButton.addEventListener("click", (event) => {
+      event.stopPropagation();
+      deleteCase(item.case_id);
+    });
+
+    row.appendChild(caseButton);
+    row.appendChild(renameButton);
+    row.appendChild(deleteButton);
+    caseList.appendChild(row);
   });
 }
 
@@ -575,8 +712,21 @@ function renderVideoList(videos) {
       playVideoAt(video.filename, video.video_url, 0);
     });
 
+    const deleteBtn = document.createElement("button");
+    deleteBtn.type = "button";
+    deleteBtn.className = "danger";
+    deleteBtn.textContent = "Delete";
+    deleteBtn.addEventListener("click", () => {
+      deleteVideo(video.filename);
+    });
+
+    const actions = document.createElement("div");
+    actions.className = "video-actions";
+    actions.appendChild(openBtn);
+    actions.appendChild(deleteBtn);
+
     row.appendChild(meta);
-    row.appendChild(openBtn);
+    row.appendChild(actions);
     videoList.appendChild(row);
   });
 }
@@ -730,6 +880,156 @@ async function selectCase(caseId) {
   }
 }
 
+async function deleteVideo(filename) {
+  const caseId = ensureActiveCaseId();
+  const safeFilename = String(filename || "").trim();
+  if (!safeFilename) {
+    return;
+  }
+
+  const confirmed = window.confirm(
+    `Delete "${safeFilename}" from ${caseId}? This removes the video, embeddings, and thumbnails for that video.`,
+  );
+  if (!confirmed) {
+    return;
+  }
+
+  try {
+    setStatus(`Deleting ${safeFilename} from ${caseId}...`, "working");
+    const url = `${withCaseQuery("/videos", caseId)}&filename=${encodeURIComponent(safeFilename)}`;
+    await fetchJson(url, { method: "DELETE" });
+
+    const playback = playbackCache.get(caseId);
+    if (playback && playback.filename === safeFilename) {
+      clearPlaybackCache(caseId);
+    }
+    if (
+      videoPlayer
+      && videoPlayer.dataset.caseId === caseId
+      && videoPlayer.dataset.filename === safeFilename
+    ) {
+      resetPlayerForCase(caseId);
+      setCaseUrl(caseId);
+    }
+
+    removeVideoFromSearchCache(caseId, safeFilename);
+    restoreSearchForCase(caseId);
+    await refreshVideos(caseId);
+    setStatus(`Deleted ${safeFilename} from ${caseId}.`, "ok");
+  } catch (error) {
+    setStatus(`Delete video failed: ${formatError(error)}`, "error");
+  }
+}
+
+async function renameCase(caseId) {
+  const targetCaseId = String(caseId || "").trim();
+  if (!targetCaseId) {
+    return;
+  }
+
+  const caseEntry = state.cases.find((item) => item.case_id === targetCaseId);
+  const currentName = String(caseEntry?.name || targetCaseId);
+  const prompted = window.prompt("Enter a new case name:", currentName);
+  if (prompted === null) {
+    return;
+  }
+
+  const newName = prompted.trim();
+  if (!newName) {
+    setStatus("Case name cannot be empty.", "error");
+    return;
+  }
+
+  if (newName === currentName) {
+    return;
+  }
+
+  try {
+    setStatus(`Renaming case ${targetCaseId}...`, "working");
+    const payload = await fetchJson(`/cases/${encodeURIComponent(targetCaseId)}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: newName }),
+    });
+
+    const payloadCases = normalizeCases(Array.isArray(payload?.cases) ? payload.cases : []);
+    if (payloadCases.length > 0) {
+      state.cases = payloadCases;
+    } else {
+      state.cases = state.cases.map((item) => (
+        item.case_id === targetCaseId
+          ? { ...item, name: newName }
+          : item
+      ));
+    }
+
+    if (state.activeCaseId && !state.cases.some((item) => item.case_id === state.activeCaseId)) {
+      state.activeCaseId = state.cases.length ? state.cases[0].case_id : null;
+    }
+
+    markCaseStateChanged();
+    renderCaseList();
+    const finalName = String(payload?.name || newName);
+    setStatus(`Renamed ${targetCaseId} to "${finalName}".`, "ok");
+  } catch (error) {
+    setStatus(`Rename case failed: ${formatError(error)}`, "error");
+  }
+}
+
+async function deleteCase(caseId) {
+  const targetCaseId = String(caseId || "").trim();
+  if (!targetCaseId) {
+    return;
+  }
+
+  const caseEntry = state.cases.find((item) => item.case_id === targetCaseId);
+  const caseName = caseEntry?.name || targetCaseId;
+  const confirmed = window.confirm(
+    `Delete case "${caseName}" (${targetCaseId})? This permanently removes all videos, thumbnails, and embeddings in this case.`,
+  );
+  if (!confirmed) {
+    return;
+  }
+
+  try {
+    setStatus(`Deleting case ${targetCaseId}...`, "working");
+    saveActiveCasePlaybackSnapshot();
+    const payload = await fetchJson(`/cases/${encodeURIComponent(targetCaseId)}`, {
+      method: "DELETE",
+    });
+
+    const payloadCases = normalizeCases(Array.isArray(payload?.cases) ? payload.cases : []);
+    if (Array.isArray(payload?.cases)) {
+      state.cases = payloadCases;
+    } else {
+      state.cases = state.cases.filter((item) => item.case_id !== targetCaseId);
+    }
+
+    playbackCache.delete(targetCaseId);
+    searchCache.delete(targetCaseId);
+    markCaseStateChanged();
+    renderCaseList();
+
+    if (!state.cases.length) {
+      state.activeCaseId = null;
+      clearResults();
+      renderVideoList([]);
+      resetPlayerForCase(null);
+      setCaseUrl(null);
+      syncWorkspaceVisibility();
+      setStatus(`Deleted case ${targetCaseId}. No cases remaining.`, "ok");
+      return;
+    }
+
+    const fallbackCaseId = state.cases[state.cases.length - 1].case_id;
+    state.activeCaseId = null;
+    await selectCase(fallbackCaseId);
+    setStatus(`Deleted case ${targetCaseId}. Switched to ${fallbackCaseId}.`, "ok");
+  } catch (error) {
+    setStatus(`Delete case failed: ${formatError(error)}`, "error");
+  }
+}
+
 async function uploadAndIndex() {
   const files = Array.from(videoInput.files || []);
   if (!files.length) {
@@ -857,7 +1157,8 @@ async function createCase() {
       typeof payload.name === "string" && payload.name.trim()
         ? payload.name.trim()
         : caseNameToCreate;
-    upsertCase(newCaseId, caseName);
+    const createdAt = typeof payload.created_at === "string" ? payload.created_at.trim() : "";
+    upsertCase(newCaseId, caseName, createdAt);
     saveActiveCasePlaybackSnapshot();
     state.activeCaseId = newCaseId;
     markCaseStateChanged();
@@ -894,6 +1195,8 @@ function setupListeners() {
   if (listenersBound) {
     return;
   }
+
+  setupSidebarResize();
 
   const createCaseButton = document.getElementById("createCaseBtn");
   console.log("createCaseButton:", createCaseButton);

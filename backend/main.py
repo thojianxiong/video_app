@@ -6,6 +6,7 @@ import os
 import shutil
 import threading
 import webbrowser
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
@@ -58,6 +59,10 @@ app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR)), name="static")
 
 
 class CaseCreateRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=200)
+
+
+class CaseRenameRequest(BaseModel):
     name: str = Field(..., min_length=1, max_length=200)
 
 
@@ -153,6 +158,21 @@ def _empty_cases_registry() -> dict:
     return {"next_numeric_id": 1, "cases": []}
 
 
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _infer_case_created_at(case_id: str) -> str:
+    case_dir = CASES_DIR / case_id
+    if case_dir.exists() and case_dir.is_dir():
+        try:
+            created_at_ts = case_dir.stat().st_ctime
+            return datetime.fromtimestamp(created_at_ts, timezone.utc).isoformat()
+        except Exception:
+            return _utc_now_iso()
+    return _utc_now_iso()
+
+
 def _load_cases_registry_locked() -> dict:
     if not CASES_REGISTRY_PATH.exists():
         return _empty_cases_registry()
@@ -170,6 +190,7 @@ def _load_cases_registry_locked() -> dict:
         raw_cases = []
 
     cleaned_cases: list[dict[str, str]] = []
+    changed = False
     for item in raw_cases:
         if not isinstance(item, dict):
             continue
@@ -182,7 +203,22 @@ def _load_cases_registry_locked() -> dict:
         except ValueError:
             continue
         cleaned_name = str(name_raw).strip() or cleaned_case_id
-        cleaned_cases.append({"case_id": cleaned_case_id, "name": cleaned_name})
+        created_at_raw = item.get("created_at")
+        cleaned_created_at = (
+            str(created_at_raw).strip()
+            if isinstance(created_at_raw, str) and str(created_at_raw).strip()
+            else ""
+        )
+        if not cleaned_created_at:
+            cleaned_created_at = _infer_case_created_at(cleaned_case_id)
+            changed = True
+        cleaned_cases.append(
+            {
+                "case_id": cleaned_case_id,
+                "name": cleaned_name,
+                "created_at": cleaned_created_at,
+            }
+        )
 
     next_numeric_id = payload.get("next_numeric_id", 1)
     try:
@@ -190,6 +226,11 @@ def _load_cases_registry_locked() -> dict:
     except Exception:
         next_numeric_id = 1
     next_numeric_id = max(1, next_numeric_id)
+
+    if changed:
+        payload["next_numeric_id"] = next_numeric_id
+        payload["cases"] = cleaned_cases
+        _save_cases_registry_locked(payload)
 
     return {"next_numeric_id": next_numeric_id, "cases": cleaned_cases}
 
@@ -212,12 +253,25 @@ def _find_case_locked(payload: dict, case_id: str) -> dict | None:
 def _list_cases_sync() -> list[dict[str, str]]:
     with CASE_REGISTRY_LOCK:
         payload = _load_cases_registry_locked()
-        cases = sorted(payload["cases"], key=lambda item: item["case_id"])
+        cases = sorted(
+            payload["cases"],
+            key=lambda item: (
+                str(item.get("created_at", "")),
+                str(item.get("case_id", "")),
+            ),
+        )
 
     for item in cases:
         _ensure_case_directories(_build_case_paths(item["case_id"]))
 
-    return [{"case_id": item["case_id"], "name": item["name"]} for item in cases]
+    return [
+        {
+            "case_id": item["case_id"],
+            "name": item["name"],
+            "created_at": str(item.get("created_at", "")),
+        }
+        for item in cases
+    ]
 
 
 def _create_case_sync(name: str) -> dict[str, str]:
@@ -227,21 +281,83 @@ def _create_case_sync(name: str) -> dict[str, str]:
 
     with CASE_REGISTRY_LOCK:
         payload = _load_cases_registry_locked()
-        existing_ids = {item.get("case_id") for item in payload.get("cases", [])}
-        next_numeric_id = int(payload.get("next_numeric_id", 1))
-        next_numeric_id = max(1, next_numeric_id)
+        existing_ids = {
+            str(item.get("case_id"))
+            for item in payload.get("cases", [])
+            if item.get("case_id")
+        }
 
-        case_id = f"case_{next_numeric_id:03d}"
+        case_id = str(uuid4())
         while case_id in existing_ids:
-            next_numeric_id += 1
-            case_id = f"case_{next_numeric_id:03d}"
+            case_id = str(uuid4())
 
-        payload["cases"].append({"case_id": case_id, "name": clean_name})
-        payload["next_numeric_id"] = next_numeric_id + 1
+        created_at = _utc_now_iso()
+        payload["cases"].append(
+            {
+                "case_id": case_id,
+                "name": clean_name,
+                "created_at": created_at,
+            }
+        )
         _save_cases_registry_locked(payload)
 
     _ensure_case_directories(_build_case_paths(case_id))
-    return {"case_id": case_id, "name": clean_name}
+    return {"case_id": case_id, "name": clean_name, "created_at": created_at}
+
+
+def _delete_case_sync(case_id: str) -> dict[str, str]:
+    normalized = _normalize_case_id(case_id)
+
+    with CASE_REGISTRY_LOCK:
+        payload = _load_cases_registry_locked()
+        existing_cases = payload.get("cases", [])
+        remaining_cases: list[dict[str, str]] = []
+        deleted_case: dict | None = None
+
+        for item in existing_cases:
+            if item.get("case_id") == normalized and deleted_case is None:
+                deleted_case = item
+            else:
+                remaining_cases.append(item)
+
+        if deleted_case is None:
+            raise KeyError(normalized)
+
+        payload["cases"] = remaining_cases
+        _save_cases_registry_locked(payload)
+
+    case_paths = _build_case_paths(normalized)
+    if case_paths.case_dir.exists():
+        shutil.rmtree(case_paths.case_dir)
+
+    deleted_name = str(deleted_case.get("name") or normalized)
+    deleted_created_at = str(deleted_case.get("created_at") or "")
+    return {
+        "case_id": normalized,
+        "name": deleted_name,
+        "created_at": deleted_created_at,
+    }
+
+
+def _rename_case_sync(case_id: str, name: str) -> dict[str, str]:
+    normalized = _normalize_case_id(case_id)
+    clean_name = str(name or "").strip()
+    if not clean_name:
+        raise ValueError("Case name cannot be empty")
+
+    with CASE_REGISTRY_LOCK:
+        payload = _load_cases_registry_locked()
+        case = _find_case_locked(payload, normalized)
+        if case is None:
+            raise KeyError(normalized)
+        case["name"] = clean_name
+        _save_cases_registry_locked(payload)
+
+    return {
+        "case_id": normalized,
+        "name": clean_name,
+        "created_at": str(case.get("created_at") or ""),
+    }
 
 
 def _get_case_paths_or_raise(case_id: str) -> CasePaths:
@@ -446,6 +562,32 @@ def _process_video_sync(
     return upsert_result
 
 
+def _delete_video_sync(case_id: str, filename: str) -> dict:
+    case_paths, vector_store = _get_vector_store_for_case(case_id)
+    safe_filename = Path(str(filename or "")).name.strip()
+    if not safe_filename:
+        raise ValueError("filename is required")
+
+    video_path = case_paths.videos_dir / safe_filename
+    if not video_path.exists() or not video_path.is_file():
+        raise FileNotFoundError(safe_filename)
+
+    vector_result = vector_store.delete_video_embeddings(safe_filename)
+    video_path.unlink(missing_ok=True)
+
+    thumbnail_dir = case_paths.thumbnails_dir / Path(safe_filename).stem
+    if thumbnail_dir.exists():
+        shutil.rmtree(thumbnail_dir, ignore_errors=True)
+
+    return {
+        "case_id": case_paths.case_id,
+        "filename": safe_filename,
+        "deleted": True,
+        "removed_vectors": int(vector_result.get("removed_vectors", 0)),
+        "removed_records": int(vector_result.get("removed_records", 0)),
+    }
+
+
 @app.post("/cases")
 async def create_case(request: CaseCreateRequest) -> dict:
     try:
@@ -463,6 +605,7 @@ async def create_case(request: CaseCreateRequest) -> dict:
         return {
             "case_id": created.get("case_id"),
             "name": created.get("name"),
+            "created_at": created.get("created_at"),
             "cases": cases,
         }
     except ValueError as exc:
@@ -482,6 +625,67 @@ async def list_cases() -> dict:
         cases = []
 
     return {"cases": cases}
+
+
+@app.patch("/cases/{case_id}")
+async def rename_case(case_id: str, request: CaseRenameRequest) -> dict:
+    try:
+        renamed = await asyncio.to_thread(_rename_case_sync, case_id, request.name)
+        try:
+            cases = await asyncio.to_thread(_list_cases_sync)
+        except Exception:
+            cases = []
+
+        if cases is None:
+            cases = []
+        if not isinstance(cases, list):
+            cases = []
+
+        return {
+            "case_id": renamed["case_id"],
+            "name": renamed["name"],
+            "created_at": renamed.get("created_at"),
+            "cases": cases,
+        }
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"Case not found: {case_id}")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.delete("/cases/{case_id}")
+async def delete_case(case_id: str) -> dict:
+    try:
+        deleted = await asyncio.to_thread(_delete_case_sync, case_id)
+        cache: dict[str, VectorStore] = app.state.vector_stores
+        cache_lock: Lock = app.state.vector_stores_lock
+        with cache_lock:
+            cache.pop(deleted["case_id"], None)
+
+        try:
+            cases = await asyncio.to_thread(_list_cases_sync)
+        except Exception:
+            cases = []
+
+        if cases is None:
+            cases = []
+        if not isinstance(cases, list):
+            cases = []
+
+        return {
+            "deleted_case_id": deleted["case_id"],
+            "deleted_name": deleted.get("name"),
+            "deleted_created_at": deleted.get("created_at"),
+            "cases": cases,
+        }
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"Case not found: {case_id}")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 @app.post("/upload")
@@ -612,6 +816,24 @@ async def list_videos(case_id: str | None = None) -> dict:
         )
 
     return {"case_id": case_paths.case_id, "videos": videos}
+
+
+@app.delete("/videos")
+async def delete_video(case_id: str | None = None, filename: str | None = None) -> dict:
+    if not filename or not str(filename).strip():
+        raise HTTPException(status_code=400, detail="filename is required")
+
+    try:
+        resolved_case_id = await asyncio.to_thread(_resolve_case_id_or_default, case_id)
+        return await asyncio.to_thread(_delete_video_sync, resolved_case_id, filename)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail=f"Video not found: {filename}")
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"Case not found: {case_id}")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 @app.post("/process_video")
