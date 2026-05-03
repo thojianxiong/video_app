@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Local Video Semantic Search</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260501g" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260502a" />
   </head>
   <body>
     <main class="app-shell">
@@ -22,42 +22,166 @@
       ></div>
 
       <section class="workspace">
-        <section class="panel upload-panel">
-          <h1>Local Video Semantic Search</h1>
+        <section class="panel app-tabs-panel">
           <p id="activeCaseMeta" class="active-case-meta"></p>
-          <div class="upload-controls">
-            <input id="videoInput" type="file" multiple accept="video/*" />
-            <label for="intervalInput">Frame Interval (s)</label>
-            <input id="intervalInput" type="number" min="0.25" step="0.25" value="2" />
-            <button id="uploadBtn" type="button">Upload + Index</button>
-            <button id="refreshBtn" type="button" class="ghost">Refresh List</button>
-          </div>
-          <p id="uploadStatus" class="status"></p>
-          <div id="videoList" class="video-list"></div>
-        </section>
-
-        <section class="panel search-panel">
-          <div class="search-controls">
-            <input
-              id="queryInput"
-              type="text"
-              placeholder="Search with natural language..."
-              autocomplete="off"
-            />
-            <label for="topKInput">Top K</label>
-            <input id="topKInput" type="number" min="1" max="100" value="10" />
-            <button id="searchBtn" type="button">Search</button>
+          <div class="app-tabs">
+            <button id="mainTabSemanticBtn" type="button" class="ghost active">Semantic Search</button>
+            <button id="mainTabFacePeopleBtn" type="button" class="ghost">Face &amp; People</button>
+            <button id="mainTabVehiclesBtn" type="button" class="ghost">Vehicle</button>
           </div>
         </section>
 
-        <section class="panel player-panel">
-          <video id="videoPlayer" controls preload="metadata"></video>
-          <p id="playerMeta" class="player-meta">Select a result to play.</p>
+        <section id="tabSemantic" class="tab-pane active">
+          <section class="panel upload-panel">
+            <h1>Video Ingestion &amp; Indexing</h1>
+            <div class="upload-controls">
+              <input id="videoInput" type="file" multiple accept="video/*" />
+              <label for="intervalInput">Frame Interval (s)</label>
+              <input id="intervalInput" type="number" min="0.25" step="0.25" value="2" />
+              <button id="uploadBtn" type="button">Upload + Base Index</button>
+              <button id="refreshBtn" type="button" class="ghost">Refresh List</button>
+            </div>
+            <section class="embedding-settings-panel">
+              <h2>Embedding Engine</h2>
+              <div class="embedding-controls">
+                <label for="embeddingProfileSelect">Model Type</label>
+                <select id="embeddingProfileSelect"></select>
+                <label for="embeddingDeviceSelect">Compute Device</label>
+                <select id="embeddingDeviceSelect">
+                  <option value="auto">Auto (GPU if available)</option>
+                  <option value="cuda">GPU (CUDA)</option>
+                  <option value="cpu">CPU</option>
+                </select>
+                <button id="saveEmbeddingSettingsBtn" type="button" class="ghost">
+                  Save Embedding Settings
+                </button>
+              </div>
+              <p id="embeddingSettingsMeta" class="status"></p>
+            </section>
+            <p id="uploadStatus" class="status"></p>
+            <section id="taskProgress" class="task-progress" hidden>
+              <div class="task-progress-head">
+                <span id="taskProgressLabel">Working...</span>
+                <span id="taskProgressPercent">0%</span>
+              </div>
+              <div class="task-progress-track">
+                <div id="taskProgressBar" class="task-progress-bar"></div>
+              </div>
+              <p id="taskProgressMeta" class="task-progress-meta">Preparing...</p>
+            </section>
+            <div id="videoList" class="video-list"></div>
+          </section>
+
+          <section class="panel search-panel">
+            <h2>Semantic Search</h2>
+            <div class="search-controls">
+              <input
+                id="queryInput"
+                type="text"
+                placeholder="Search with natural language..."
+                autocomplete="off"
+              />
+              <label for="topKInput">Top K</label>
+              <input id="topKInput" type="number" min="1" max="100" value="10" />
+              <button id="searchBtn" type="button">Search</button>
+            </div>
+          </section>
+
+          <section class="panel player-panel">
+            <video id="videoPlayer" controls preload="metadata"></video>
+            <p id="playerMeta" class="player-meta">Select a result to play.</p>
+          </section>
+
+          <section id="resultsGrid" class="results-grid"></section>
         </section>
 
-        <section id="resultsGrid" class="results-grid"></section>
+        <section id="tabFacePeople" class="tab-pane">
+          <section class="panel analysis-select-panel">
+            <h2>Run Face &amp; People Analysis</h2>
+            <p class="analysis-note">Select ingested videos, then run analysis.</p>
+            <div id="facePeopleVideoSelectList" class="analysis-video-list"></div>
+            <div class="analysis-select-actions">
+              <button id="runFacePeopleSelectedBtn" type="button" class="ghost">Run Face &amp; People For Selected</button>
+            </div>
+            <p id="analysisStatus" class="status"></p>
+          </section>
+
+          <section class="panel search-panel">
+            <h2>Face &amp; People Search</h2>
+            <div class="search-controls analysis-search-controls">
+              <input
+                id="facePeopleQueryInput"
+                type="text"
+                placeholder="Search over detected face and people crops..."
+                autocomplete="off"
+              />
+              <button id="facePeopleSearchBtn" type="button">Search</button>
+            </div>
+          </section>
+
+          <section class="panel player-panel">
+            <video id="facePeoplePlayer" controls preload="metadata"></video>
+            <p id="facePeoplePlayerMeta" class="player-meta">Select a face or person result to preview.</p>
+          </section>
+
+          <section class="panel wall-panel">
+            <h2>Face Wall</h2>
+            <section id="faceWall" class="wall-grid"></section>
+          </section>
+
+          <section class="panel wall-panel">
+            <h2>People Wall</h2>
+            <section id="peopleWall" class="wall-grid"></section>
+          </section>
+        </section>
+
+        <section id="tabVehicles" class="tab-pane">
+          <section class="panel analysis-select-panel">
+            <h2>Run Vehicle Analysis</h2>
+            <p class="analysis-note">Select ingested videos, then run analysis.</p>
+            <div id="vehicleVideoSelectList" class="analysis-video-list"></div>
+            <div class="analysis-select-actions">
+              <button id="runVehiclesSelectedBtn" type="button" class="ghost">Run Vehicle Analysis For Selected</button>
+            </div>
+            <p id="vehicleStatus" class="status"></p>
+          </section>
+
+          <section class="panel search-panel">
+            <h2>Vehicle Search</h2>
+            <div class="search-controls analysis-search-controls">
+              <input
+                id="vehicleQueryInput"
+                type="text"
+                placeholder="Search over detected vehicle crops..."
+                autocomplete="off"
+              />
+              <button id="vehicleSearchBtn" type="button">Search</button>
+            </div>
+          </section>
+
+          <section class="panel player-panel">
+            <video id="vehiclePlayer" controls preload="metadata"></video>
+            <p id="vehiclePlayerMeta" class="player-meta">Select a vehicle result to preview.</p>
+          </section>
+
+          <section class="panel wall-panel">
+            <h2>Vehicle Wall</h2>
+            <section id="vehicleWall" class="wall-grid"></section>
+          </section>
+        </section>
       </section>
     </main>
-    <script src="/static/script.js?v=20260501g"></script>
+    <div id="semanticPopup" class="video-popup" hidden>
+      <div id="semanticPopupBackdrop" class="video-popup-backdrop"></div>
+      <div class="video-popup-dialog panel" role="dialog" aria-modal="true" aria-label="Video result player">
+        <div class="video-popup-header">
+          <h2>Video Preview</h2>
+          <button id="semanticPopupCloseBtn" type="button" class="ghost">Close</button>
+        </div>
+        <video id="semanticPopupVideo" controls preload="metadata"></video>
+        <p id="semanticPopupMeta" class="player-meta">Jump to a result to preview here.</p>
+      </div>
+    </div>
+    <script src="/static/script.js?v=20260503c"></script>
   </body>
 </html>

@@ -12,19 +12,23 @@ from PIL import Image
 class OpenCLIPEmbedder:
     def __init__(
         self,
-        model_name: str = "ViT-B-32",
-        pretrained: str = "laion2b_s34b_b79k",
+        model_name: str = "ViT-L-14",
+        pretrained: str = "openai",
         cache_dir: str | None = None,
         text_cache_size: int = 512,
+        device_preference: str = "auto",
     ) -> None:
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.model_name = str(model_name)
+        self.pretrained = str(pretrained)
+        self.device_preference = str(device_preference or "auto").strip().lower()
+        self.device = self._resolve_device(self.device_preference)
         self.model, _, self.preprocess = open_clip.create_model_and_transforms(
-            model_name=model_name,
-            pretrained=pretrained,
+            model_name=self.model_name,
+            pretrained=self.pretrained,
             device=self.device,
             cache_dir=cache_dir,
         )
-        self.tokenizer = open_clip.get_tokenizer(model_name)
+        self.tokenizer = open_clip.get_tokenizer(self.model_name)
         self.model.eval()
         self.text_cache_size = max(1, text_cache_size)
         self._text_cache: OrderedDict[str, np.ndarray] = OrderedDict()
@@ -33,6 +37,24 @@ class OpenCLIPEmbedder:
             probe = self.tokenizer(["dimension probe"]).to(self.device)
             encoded = self.model.encode_text(probe)
         self.embedding_dim = int(encoded.shape[-1])
+
+    @staticmethod
+    def _resolve_device(device_preference: str) -> str:
+        normalized = str(device_preference or "auto").strip().lower()
+        if normalized in {"", "auto", "default"}:
+            return "cuda" if torch.cuda.is_available() else "cpu"
+        if normalized in {"cpu"}:
+            return "cpu"
+        if normalized in {"cuda", "gpu"}:
+            if not torch.cuda.is_available():
+                raise ValueError(
+                    "OPENCLIP_DEVICE is set to 'cuda' but CUDA is not available. "
+                    "Set OPENCLIP_DEVICE=auto or OPENCLIP_DEVICE=cpu."
+                )
+            return "cuda"
+        raise ValueError(
+            "Invalid OPENCLIP_DEVICE value. Allowed values: auto, cuda, cpu."
+        )
 
     def _normalize(self, features: torch.Tensor) -> torch.Tensor:
         return features / features.norm(dim=-1, keepdim=True).clamp_min(1e-12)
