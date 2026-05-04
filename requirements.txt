@@ -5,7 +5,10 @@ numpy==2.2.6
 pillow==11.3.0
 opencv-python==4.12.0.88
 faiss-cpu==1.12.0
-torch==2.9.0
+# Matched CUDA 11.8 builds to avoid torchvision NMS backend mismatch.
+--extra-index-url https://download.pytorch.org/whl/cu118
+torch==2.7.1+cu118
+torchvision==0.22.1+cu118
 open-clip-torch==3.2.0
 imageio-ffmpeg>=0.5.1,<1
 ultralytics>=8.3.0,<9

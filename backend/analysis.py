@@ -44,6 +44,8 @@ class VideoAnalyzer:
         self.model_source = ""
         self.error_message = ""
         self._yolo_import_error = ""
+        self._yolo_force_cpu = False
+        self._yolo_fallback_logged = False
 
         face_cascade_path = Path(cv2.data.haarcascades) / "haarcascade_frontalface_default.xml"
         self.face_detector = cv2.CascadeClassifier(str(face_cascade_path))
@@ -84,12 +86,39 @@ class VideoAnalyzer:
 
     def detector_label(self) -> str:
         if self.available:
-            return f"yolo({self.model_source})+haar(face)"
+            label = f"yolo({self.model_source})+haar(face)"
+            if self._yolo_force_cpu:
+                label += "+cpu_fallback(nms)"
+            return label
         if self._yolo_import_error:
             return self._yolo_import_error
         if self.error_message:
             return f"analysis unavailable: {self.error_message}"
         return "analysis unavailable"
+
+    @staticmethod
+    def _is_cuda_nms_backend_error(error: Exception) -> bool:
+        message = str(error or "").lower()
+        return "torchvision::nms" in message and "cuda" in message
+
+    def _run_yolo_predict(
+        self,
+        frame_bgr: np.ndarray,
+        *,
+        force_cpu: bool,
+    ):
+        if self.model is None:
+            raise RuntimeError(self.detector_label())
+
+        predict_kwargs = {
+            "source": frame_bgr,
+            "conf": self.confidence,
+            "iou": self.iou,
+            "verbose": False,
+        }
+        if force_cpu:
+            predict_kwargs["device"] = "cpu"
+        return self.model.predict(**predict_kwargs)
 
     def _count_faces(self, frame_rgb: np.ndarray) -> int:
         return len(self.detect_faces(frame_rgb))
@@ -121,12 +150,23 @@ class VideoAnalyzer:
             raise RuntimeError(self.detector_label())
 
         frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-        results = self.model.predict(
-            source=frame_bgr,
-            conf=self.confidence,
-            iou=self.iou,
-            verbose=False,
-        )
+        try:
+            results = self._run_yolo_predict(
+                frame_bgr,
+                force_cpu=self._yolo_force_cpu,
+            )
+        except Exception as exc:
+            if self._is_cuda_nms_backend_error(exc) and not self._yolo_force_cpu:
+                self._yolo_force_cpu = True
+                if not self._yolo_fallback_logged:
+                    print(
+                        "[analysis] torchvision::nms unavailable on CUDA; "
+                        "retrying YOLO on CPU."
+                    )
+                    self._yolo_fallback_logged = True
+                results = self._run_yolo_predict(frame_bgr, force_cpu=True)
+            else:
+                raise
         if not results:
             return [], []
 
