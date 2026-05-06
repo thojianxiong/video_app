@@ -71,8 +71,14 @@ If the selected model weights are not already in that cache, download them once 
 
 ## AVI Playback
 
-When you upload a video, the backend attempts conversion to browser-compatible `.mp4` (H.264) and stores it in the selected case's `videos/` folder.
+When you upload a video, the backend converts/remuxes to browser-compatible `.mp4` and stores it in the selected case's `videos/` folder.
 This keeps search/indexing local and makes playback reliable in HTML5 browsers.
+
+Current conversion strategy:
+- Try **remux** first (`-c copy`) with video + audio preserved (fastest, no recompression)
+- If remux is not possible, fallback to high-quality transcode:
+  - video: `libx264`, `crf=18`, `preset=fast`, `yuv420p`
+  - audio: `aac`, `192k`
 
 ffmpeg resolution order:
 1. `FFMPEG_PATH` environment variable

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
+import signal
 import shutil
 import threading
+import time
 import webbrowser
 from datetime import datetime, timezone
 from dataclasses import dataclass
@@ -26,10 +29,12 @@ from backend.analysis import AnalysisSelection, VideoAnalyzer
 from backend.analysis_store import AnalysisCropStore
 from backend.embeddings import OpenCLIPEmbedder
 from backend.temporal_store import TemporalWindowStore
+from backend.triage import build_video_triage_payload
 from backend.vector_store import VectorStore
 from backend.video_processing import (
     compute_video_signature,
     convert_to_mp4,
+    generate_preview_thumbnail,
     iter_video_frames,
     save_thumbnail,
 )
@@ -64,6 +69,7 @@ SEMANTIC_OBJECT = "object"
 SEMANTIC_ACTION = "action"
 SEMANTIC_SCENE = "scene"
 SEMANTIC_INTENT_OPTIONS = [SEMANTIC_OBJECT, SEMANTIC_ACTION, SEMANTIC_SCENE]
+TRIAGE_CACHE_VERSION = 2
 
 INTENT_PROMPTS = {
     SEMANTIC_OBJECT: [
@@ -142,12 +148,20 @@ class CaseRenameRequest(BaseModel):
 class ProcessVideoRequest(BaseModel):
     case_id: str | None = None
     filename: str
-    frame_interval_seconds: float = Field(default=2.0, gt=0)
+    frame_interval_seconds: float = Field(default=1.0, gt=0)
     batch_size: int = Field(default=32, ge=1, le=256)
     force: bool = False
     analysis_face_people: bool = False
     analysis_vehicles: bool = False
     analysis_only: bool = False
+
+
+class IndexStartRequest(BaseModel):
+    case_id: str | None = None
+    filenames: list[str] | None = None
+    frame_interval_seconds: float = Field(default=1.0, gt=0)
+    batch_size: int = Field(default=32, ge=1, le=256)
+    force: bool = False
 
 
 class SearchRequest(BaseModel):
@@ -165,12 +179,23 @@ class EmbeddingSettingsUpdateRequest(BaseModel):
     device_preference: str | None = Field(default=None, min_length=1, max_length=16)
 
 
+class ShutdownRequest(BaseModel):
+    confirm: bool = False
+
+
 class CropGalleryRequest(BaseModel):
     case_id: str | None = None
     category: str = Field(..., pattern="^(face_people|vehicles)$")
     query: str = ""
     top_k: int = Field(default=120, ge=1, le=500)
     limit: int = Field(default=300, ge=1, le=2000)
+
+
+class TriageTimelineRequest(BaseModel):
+    case_id: str | None = None
+    filename: str
+    bucket_seconds: float = Field(default=1.0, ge=0.5, le=5.0)
+    force: bool = False
 
 
 def _non_empty_env(name: str) -> str | None:
@@ -471,6 +496,11 @@ async def on_startup() -> None:
     app.state.temporal_stores_lock = Lock()
     app.state.analysis_stores = {}
     app.state.analysis_stores_lock = Lock()
+    app.state.index_jobs = {}
+    app.state.index_jobs_lock = Lock()
+    app.state.index_tasks = {}
+    app.state.shutdown_requested = False
+    app.state.shutdown_requested_at = ""
     app.state.embedding_settings = embedding_settings
     app.state.intent_prompt_embeddings = _build_intent_prompt_embeddings(embedder)
     print(
@@ -820,6 +850,348 @@ def _resolve_case_id_or_default(case_id: str | None) -> str:
     raise ValueError("No cases available. Create a case first.")
 
 
+def _list_case_video_filenames(case_paths: CasePaths) -> list[str]:
+    output: list[str] = []
+    for file_path in sorted(case_paths.videos_dir.iterdir()):
+        if not file_path.is_file():
+            continue
+        if file_path.suffix.lower() not in VIDEO_EXTENSIONS:
+            continue
+        output.append(file_path.name)
+    return output
+
+
+def _resolve_index_filenames(
+    case_paths: CasePaths,
+    requested_filenames: list[str] | None,
+) -> list[str]:
+    available = set(_list_case_video_filenames(case_paths))
+    if requested_filenames is None:
+        resolved = sorted(available)
+        if not resolved:
+            raise ValueError("No videos available for indexing in this case.")
+        return resolved
+
+    resolved: list[str] = []
+    seen: set[str] = set()
+    for raw_name in requested_filenames:
+        safe_name = Path(str(raw_name or "")).name.strip()
+        if not safe_name or safe_name in seen:
+            continue
+        seen.add(safe_name)
+        if safe_name not in available:
+            raise FileNotFoundError(safe_name)
+        resolved.append(safe_name)
+
+    if not resolved:
+        raise ValueError("No valid filenames provided for indexing.")
+    return resolved
+
+
+def _new_index_job_record(
+    *,
+    case_id: str,
+    filenames: list[str],
+    frame_interval_seconds: float,
+    batch_size: int,
+    force: bool,
+) -> dict:
+    now = _utc_now_iso()
+    return {
+        "case_id": case_id,
+        "status": "queued",
+        "running": True,
+        "total": int(len(filenames)),
+        "completed": 0,
+        "processed": 0,
+        "skipped": 0,
+        "failed": 0,
+        "indexed_frames": 0,
+        "indexed_windows": 0,
+        "current_filename": "",
+        "current_video_processed_frames": 0,
+        "current_video_total_frames": 0,
+        "current_video_progress_percent": 0.0,
+        "current_video_eta_seconds": None,
+        "current_video_started_ts": 0.0,
+        "filenames": list(filenames),
+        "errors": [],
+        "results": [],
+        "cancel_requested": False,
+        "frame_interval_seconds": float(frame_interval_seconds),
+        "batch_size": int(batch_size),
+        "force": bool(force),
+        "embedding_engine": _embedding_engine_info(),
+        "started_at": now,
+        "updated_at": now,
+        "finished_at": "",
+    }
+
+
+def _index_job_snapshot(job: dict | None, *, case_id: str) -> dict:
+    if not isinstance(job, dict):
+        return {
+            "case_id": case_id,
+            "status": "idle",
+            "running": False,
+            "total": 0,
+            "completed": 0,
+            "processed": 0,
+            "skipped": 0,
+            "failed": 0,
+            "indexed_frames": 0,
+            "indexed_windows": 0,
+            "current_filename": "",
+            "current_video_processed_frames": 0,
+            "current_video_total_frames": 0,
+            "current_video_progress_percent": 0.0,
+            "current_video_eta_seconds": None,
+            "frame_interval_seconds": 0.0,
+            "batch_size": 0,
+            "force": False,
+            "embedding_engine": _embedding_engine_info(),
+            "errors": [],
+            "results": [],
+            "cancel_requested": False,
+            "started_at": "",
+            "updated_at": "",
+            "finished_at": "",
+            "progress_percent": 0.0,
+        }
+
+    total = max(0, int(job.get("total", 0)))
+    completed = max(0, int(job.get("completed", 0)))
+    progress_percent = (
+        min(100.0, max(0.0, (float(completed) / float(total)) * 100.0))
+        if total > 0
+        else 0.0
+    )
+    current_video_processed_frames = max(0, int(job.get("current_video_processed_frames", 0)))
+    current_video_total_frames = max(0, int(job.get("current_video_total_frames", 0)))
+    current_video_progress_percent = float(job.get("current_video_progress_percent", 0.0))
+    current_video_progress_percent = min(100.0, max(0.0, current_video_progress_percent))
+    raw_eta = job.get("current_video_eta_seconds")
+    current_video_eta_seconds = None
+    if raw_eta is not None:
+        try:
+            current_video_eta_seconds = max(0.0, float(raw_eta))
+        except (TypeError, ValueError):
+            current_video_eta_seconds = None
+
+    return {
+        "case_id": case_id,
+        "status": str(job.get("status", "idle")),
+        "running": bool(job.get("running", False)),
+        "total": total,
+        "completed": completed,
+        "processed": max(0, int(job.get("processed", 0))),
+        "skipped": max(0, int(job.get("skipped", 0))),
+        "failed": max(0, int(job.get("failed", 0))),
+        "indexed_frames": max(0, int(job.get("indexed_frames", 0))),
+        "indexed_windows": max(0, int(job.get("indexed_windows", 0))),
+        "current_filename": str(job.get("current_filename") or ""),
+        "current_video_processed_frames": current_video_processed_frames,
+        "current_video_total_frames": current_video_total_frames,
+        "current_video_progress_percent": current_video_progress_percent,
+        "current_video_eta_seconds": current_video_eta_seconds,
+        "frame_interval_seconds": float(job.get("frame_interval_seconds", 0.0)),
+        "batch_size": max(0, int(job.get("batch_size", 0))),
+        "force": bool(job.get("force", False)),
+        "embedding_engine": dict(job.get("embedding_engine") or _embedding_engine_info()),
+        "errors": [str(item) for item in (job.get("errors") or [])],
+        "results": [item for item in (job.get("results") or []) if isinstance(item, dict)],
+        "cancel_requested": bool(job.get("cancel_requested", False)),
+        "started_at": str(job.get("started_at") or ""),
+        "updated_at": str(job.get("updated_at") or ""),
+        "finished_at": str(job.get("finished_at") or ""),
+        "progress_percent": float(progress_percent),
+    }
+
+
+def _find_running_index_case_id_locked(jobs: dict[str, dict]) -> str | None:
+    for candidate_case_id, candidate_job in jobs.items():
+        status = str(candidate_job.get("status") or "")
+        if bool(candidate_job.get("running")) or status in {"queued", "running"}:
+            return str(candidate_case_id)
+    return None
+
+
+async def _run_index_job_async(case_id: str) -> None:
+    jobs: dict[str, dict] = app.state.index_jobs
+    lock: Lock = app.state.index_jobs_lock
+    tasks: dict[str, asyncio.Task] = app.state.index_tasks
+    normalized_case_id = _normalize_case_id(case_id)
+
+    with lock:
+        initial = jobs.get(normalized_case_id)
+        if not isinstance(initial, dict):
+            tasks.pop(normalized_case_id, None)
+            return
+        filenames = [str(item) for item in (initial.get("filenames") or [])]
+        frame_interval_seconds = float(initial.get("frame_interval_seconds", 2.0))
+        batch_size = int(initial.get("batch_size", 32))
+        force = bool(initial.get("force", False))
+        initial["status"] = "running"
+        initial["running"] = True
+        initial["updated_at"] = _utc_now_iso()
+
+    try:
+        for filename in filenames:
+            with lock:
+                current = jobs.get(normalized_case_id)
+                if not isinstance(current, dict):
+                    return
+                if bool(current.get("cancel_requested", False)):
+                    raise asyncio.CancelledError()
+                current["current_filename"] = str(filename)
+                current["current_video_processed_frames"] = 0
+                current["current_video_total_frames"] = 0
+                current["current_video_progress_percent"] = 0.0
+                current["current_video_eta_seconds"] = None
+                current["current_video_started_ts"] = float(time.time())
+                current["updated_at"] = _utc_now_iso()
+
+            try:
+                def _on_video_progress(processed_frames: int, estimated_total_frames: int | None) -> None:
+                    with lock:
+                        running_job = jobs.get(normalized_case_id)
+                        if not isinstance(running_job, dict):
+                            return
+                        if str(running_job.get("current_filename") or "") != str(filename):
+                            return
+                        processed = max(0, int(processed_frames))
+                        estimated = max(0, int(estimated_total_frames or 0))
+                        if estimated < processed:
+                            estimated = processed
+
+                        running_job["current_video_processed_frames"] = processed
+                        running_job["current_video_total_frames"] = estimated
+                        if estimated > 0:
+                            running_job["current_video_progress_percent"] = min(
+                                100.0,
+                                max(0.0, (float(processed) / float(estimated)) * 100.0),
+                            )
+                        else:
+                            running_job["current_video_progress_percent"] = 0.0
+
+                        started_ts = float(running_job.get("current_video_started_ts") or 0.0)
+                        eta_seconds = None
+                        if started_ts > 0 and processed > 0 and estimated > processed:
+                            elapsed = max(0.001, float(time.time()) - started_ts)
+                            rate = float(processed) / elapsed
+                            if rate > 0:
+                                eta_seconds = max(0.0, (float(estimated) - float(processed)) / rate)
+                        elif estimated > 0 and processed >= estimated and processed > 0:
+                            eta_seconds = 0.0
+                        running_job["current_video_eta_seconds"] = eta_seconds
+                        running_job["updated_at"] = _utc_now_iso()
+
+                result = await asyncio.to_thread(
+                    _process_video_sync,
+                    case_id=normalized_case_id,
+                    filename=filename,
+                    frame_interval_seconds=frame_interval_seconds,
+                    batch_size=batch_size,
+                    force=force,
+                    analysis_face_people=False,
+                    analysis_vehicles=False,
+                    analysis_only=False,
+                    progress_callback=_on_video_progress,
+                )
+                status = str(result.get("status", "processed"))
+                indexed_frames = max(0, int(result.get("indexed_frames", 0)))
+                indexed_windows = max(0, int(result.get("indexed_windows", 0)))
+                processed_frames = max(0, int(result.get("processed_frames", 0)))
+                estimated_total_frames = max(0, int(result.get("estimated_total_frames", 0)))
+                if estimated_total_frames < processed_frames:
+                    estimated_total_frames = processed_frames
+
+                with lock:
+                    current = jobs.get(normalized_case_id)
+                    if not isinstance(current, dict):
+                        return
+                    current["completed"] = int(current.get("completed", 0)) + 1
+                    if status == "skipped":
+                        current["skipped"] = int(current.get("skipped", 0)) + 1
+                    else:
+                        current["processed"] = int(current.get("processed", 0)) + 1
+                    current["indexed_frames"] = int(current.get("indexed_frames", 0)) + indexed_frames
+                    current["indexed_windows"] = int(current.get("indexed_windows", 0)) + indexed_windows
+                    current["current_video_processed_frames"] = processed_frames
+                    current["current_video_total_frames"] = estimated_total_frames
+                    if estimated_total_frames > 0:
+                        current["current_video_progress_percent"] = 100.0
+                        current["current_video_eta_seconds"] = 0.0
+                    else:
+                        current["current_video_progress_percent"] = 0.0
+                        current["current_video_eta_seconds"] = None
+                    results = current.setdefault("results", [])
+                    if isinstance(results, list):
+                        results.append(
+                            {
+                                "video_filename": str(result.get("video_filename") or filename),
+                                "status": status,
+                                "indexed_frames": indexed_frames,
+                                "indexed_windows": indexed_windows,
+                            }
+                        )
+                    current["updated_at"] = _utc_now_iso()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                with lock:
+                    current = jobs.get(normalized_case_id)
+                    if not isinstance(current, dict):
+                        return
+                    current["completed"] = int(current.get("completed", 0)) + 1
+                    current["failed"] = int(current.get("failed", 0)) + 1
+                    errors = current.setdefault("errors", [])
+                    if isinstance(errors, list):
+                        errors.append(f"{filename}: {exc}")
+                    current["current_video_eta_seconds"] = None
+                    current["updated_at"] = _utc_now_iso()
+    except asyncio.CancelledError:
+        with lock:
+            current = jobs.get(normalized_case_id)
+            if isinstance(current, dict):
+                current["cancel_requested"] = True
+                current["updated_at"] = _utc_now_iso()
+    except Exception as exc:
+        with lock:
+            current = jobs.get(normalized_case_id)
+            if isinstance(current, dict):
+                current["failed"] = int(current.get("failed", 0)) + 1
+                errors = current.setdefault("errors", [])
+                if isinstance(errors, list):
+                    errors.append(f"Background indexing error: {exc}")
+                current["updated_at"] = _utc_now_iso()
+    finally:
+        with lock:
+            current = jobs.get(normalized_case_id)
+            if isinstance(current, dict):
+                cancelled = bool(current.get("cancel_requested", False))
+                failed = int(current.get("failed", 0))
+                processed = int(current.get("processed", 0))
+                skipped = int(current.get("skipped", 0))
+                if cancelled:
+                    final_status = "cancelled"
+                elif failed > 0 and processed == 0 and skipped == 0:
+                    final_status = "failed"
+                elif failed > 0:
+                    final_status = "completed_with_errors"
+                else:
+                    final_status = "completed"
+                now = _utc_now_iso()
+                current["status"] = final_status
+                current["running"] = False
+                current["current_filename"] = ""
+                current["current_video_eta_seconds"] = None
+                current["current_video_started_ts"] = 0.0
+                current["updated_at"] = now
+                current["finished_at"] = now
+            tasks.pop(normalized_case_id, None)
+
+
 def _reset_store_files(paths: list[Path], label: str, reason: str) -> None:
     for path in paths:
         try:
@@ -971,6 +1343,21 @@ def _truncate_error(message: str, limit: int = 300) -> str:
     return clean[: max(0, limit - 3)] + "..."
 
 
+def _unlink_with_retry(path: Path, attempts: int = 8, delay_seconds: float = 0.2) -> None:
+    last_error: PermissionError | None = None
+    for attempt_index in range(max(1, attempts)):
+        try:
+            path.unlink(missing_ok=True)
+            return
+        except PermissionError as exc:
+            last_error = exc
+            if attempt_index < attempts - 1:
+                time.sleep(max(0.0, float(delay_seconds)))
+
+    if last_error is not None:
+        raise last_error
+
+
 def _float_from_env(name: str, default_value: float) -> float:
     raw_value = os.getenv(name)
     if raw_value is None:
@@ -994,6 +1381,131 @@ def _int_from_env(name: str, default_value: int) -> int:
 def _media_url_for_case_path(path: Path) -> str:
     relative = path.relative_to(CASES_DIR).as_posix()
     return f"/media/cases/{quote(relative, safe='/')}"
+
+
+def _safe_preview_stem(filename: str) -> str:
+    raw_stem = Path(str(filename or "")).stem
+    cleaned = re.sub(r"[^A-Za-z0-9_-]+", "_", raw_stem).strip("_")
+    return cleaned or "video"
+
+
+def _preview_thumbnail_path(case_paths: CasePaths, filename: str) -> Path:
+    safe_stem = _safe_preview_stem(filename)
+    digest = hashlib.sha1(str(filename).encode("utf-8")).hexdigest()[:8]
+    return case_paths.thumbnails_dir / "_previews" / f"{safe_stem}_{digest}.jpg"
+
+
+def _triage_cache_video_dir(case_paths: CasePaths, filename: str) -> Path:
+    safe_stem = _safe_preview_stem(filename)
+    digest = hashlib.sha1(str(filename).encode("utf-8")).hexdigest()[:16]
+    return case_paths.data_dir / "triage_cache" / f"{safe_stem}_{digest}"
+
+
+def _triage_bucket_key(bucket_seconds: float) -> str:
+    return f"{float(bucket_seconds):.3f}".replace(".", "_")
+
+
+def _triage_cache_path(case_paths: CasePaths, filename: str, bucket_seconds: float) -> Path:
+    return _triage_cache_video_dir(case_paths, filename) / f"bucket_{_triage_bucket_key(bucket_seconds)}.json"
+
+
+def _triage_analysis_signature(face_people: dict, vehicles: dict) -> str:
+    payload = {
+        "face_people": face_people if isinstance(face_people, dict) else {},
+        "vehicles": vehicles if isinstance(vehicles, dict) else {},
+    }
+    serialized = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        default=str,
+    )
+    return hashlib.sha1(serialized.encode("utf-8")).hexdigest()
+
+
+def _metadata_mtime_ns(path: Path) -> int:
+    try:
+        if path.exists():
+            return int(path.stat().st_mtime_ns)
+    except Exception:
+        return 0
+    return 0
+
+
+def _load_triage_cache_sync(
+    *,
+    cache_path: Path,
+    bucket_seconds: float,
+    video_signature: str,
+    analysis_signature: str,
+    face_people_metadata_mtime_ns: int,
+    vehicles_metadata_mtime_ns: int,
+) -> dict | None:
+    if not cache_path.exists() or not cache_path.is_file():
+        return None
+
+    try:
+        cached = json.loads(cache_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(cached, dict):
+        return None
+
+    if int(cached.get("cache_version", 0)) != TRIAGE_CACHE_VERSION:
+        return None
+    if str(cached.get("video_signature", "")) != str(video_signature):
+        return None
+    if str(cached.get("analysis_signature", "")) != str(analysis_signature):
+        return None
+    if int(cached.get("face_people_metadata_mtime_ns", 0)) != int(face_people_metadata_mtime_ns):
+        return None
+    if int(cached.get("vehicles_metadata_mtime_ns", 0)) != int(vehicles_metadata_mtime_ns):
+        return None
+    try:
+        cached_bucket_seconds = float(cached.get("bucket_seconds", -1.0))
+    except Exception:
+        return None
+    if abs(cached_bucket_seconds - float(bucket_seconds)) > 1e-6:
+        return None
+
+    payload = cached.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    return dict(payload)
+
+
+def _save_triage_cache_sync(
+    *,
+    cache_path: Path,
+    bucket_seconds: float,
+    video_signature: str,
+    analysis_signature: str,
+    face_people_metadata_mtime_ns: int,
+    vehicles_metadata_mtime_ns: int,
+    payload: dict,
+) -> None:
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    wrapped = {
+        "cache_version": TRIAGE_CACHE_VERSION,
+        "bucket_seconds": float(bucket_seconds),
+        "video_signature": str(video_signature),
+        "analysis_signature": str(analysis_signature),
+        "face_people_metadata_mtime_ns": int(face_people_metadata_mtime_ns),
+        "vehicles_metadata_mtime_ns": int(vehicles_metadata_mtime_ns),
+        "payload": payload,
+        "updated_at": _utc_now_iso(),
+    }
+    cache_path.write_text(
+        json.dumps(wrapped, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
+def _clear_triage_cache_for_video(case_paths: CasePaths, filename: str) -> None:
+    video_cache_dir = _triage_cache_video_dir(case_paths, filename)
+    if video_cache_dir.exists() and video_cache_dir.is_dir():
+        shutil.rmtree(video_cache_dir, ignore_errors=True)
 
 
 def _semantic_result_unique_key(item: dict) -> tuple[str, float, str]:
@@ -1512,6 +2024,28 @@ def _run_optional_analysis_sync(
     }
 
 
+def _estimate_sampled_frame_count(video_path: Path, interval_seconds: float) -> int:
+    safe_interval = max(0.001, float(interval_seconds))
+    capture = cv2.VideoCapture(str(video_path))
+    if not capture.isOpened():
+        return 0
+
+    try:
+        fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
+        frame_count = float(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0.0)
+        if fps <= 0 or frame_count <= 0:
+            return 0
+        duration_seconds = frame_count / fps
+        if duration_seconds <= 0:
+            return 0
+        estimated = int(duration_seconds / safe_interval) + 1
+        return max(1, estimated)
+    except Exception:
+        return 0
+    finally:
+        capture.release()
+
+
 def _process_video_sync(
     *,
     case_id: str,
@@ -1522,6 +2056,7 @@ def _process_video_sync(
     analysis_face_people: bool,
     analysis_vehicles: bool,
     analysis_only: bool,
+    progress_callback=None,
 ) -> dict:
     case_paths, vector_store = _get_vector_store_for_case(case_id)
     _, temporal_store = _get_temporal_store_for_case(case_id)
@@ -1561,6 +2096,7 @@ def _process_video_sync(
         temporal_stride_seconds,
     )
     processed_frames = 0
+    estimated_total_frames = 0
     temporal_status = "not_requested" if analysis_only else "skipped"
     temporal_reason = "analysis_only mode" if analysis_only else "already indexed for this interval"
 
@@ -1578,6 +2114,12 @@ def _process_video_sync(
             base_reason = "video already indexed for frame and temporal indexes"
             temporal_status = "skipped"
             temporal_reason = "video already indexed for temporal windows"
+            estimated_total_frames = max(0, int(indexed_frames))
+            if progress_callback is not None and estimated_total_frames > 0:
+                try:
+                    progress_callback(estimated_total_frames, estimated_total_frames)
+                except Exception:
+                    pass
         else:
             thumbnail_dir = case_paths.thumbnails_dir / Path(resolved_filename).stem
             if force and thumbnail_dir.exists():
@@ -1588,6 +2130,12 @@ def _process_video_sync(
             embeddings_batches: list[np.ndarray] = []
             pending_images: list[Image.Image] = []
             total_frames = 0
+            estimated_total_frames = _estimate_sampled_frame_count(video_path, frame_interval_seconds)
+            if progress_callback is not None:
+                try:
+                    progress_callback(0, estimated_total_frames)
+                except Exception:
+                    pass
 
             for frame in iter_video_frames(video_path, interval_seconds=frame_interval_seconds):
                 thumb_path = save_thumbnail(
@@ -1605,6 +2153,11 @@ def _process_video_sync(
                 )
                 pending_images.append(Image.fromarray(frame.frame_rgb))
                 total_frames += 1
+                if progress_callback is not None:
+                    try:
+                        progress_callback(total_frames, estimated_total_frames)
+                    except Exception:
+                        pass
 
                 if len(pending_images) >= batch_size:
                     embeddings_batches.append(
@@ -1621,6 +2174,14 @@ def _process_video_sync(
                 video_embeddings = np.vstack(embeddings_batches).astype(np.float32)
             else:
                 video_embeddings = np.empty((0, app.state.embedder.embedding_dim), dtype=np.float32)
+
+            if estimated_total_frames < total_frames:
+                estimated_total_frames = total_frames
+            if progress_callback is not None:
+                try:
+                    progress_callback(total_frames, estimated_total_frames)
+                except Exception:
+                    pass
 
             frame_upsert_result = vector_store.upsert_video_embeddings(
                 signature=signature,
@@ -1679,6 +2240,7 @@ def _process_video_sync(
         "indexed_frames": indexed_frames,
         "indexed_windows": indexed_windows,
         "processed_frames": processed_frames,
+        "estimated_total_frames": estimated_total_frames,
         "frame_interval_seconds": frame_interval_seconds,
         "temporal_window_seconds": temporal_window_seconds,
         "temporal_stride_seconds": temporal_stride_seconds,
@@ -1709,10 +2271,17 @@ def _delete_video_sync(case_id: str, filename: str) -> dict:
     if not video_path.exists() or not video_path.is_file():
         raise FileNotFoundError(safe_filename)
 
+    try:
+        _unlink_with_retry(video_path)
+    except PermissionError as exc:
+        raise PermissionError(
+            "Video file is currently in use. Stop playback and wait for background "
+            f"indexing to finish, then try deleting again: {video_path}"
+        ) from exc
+
     vector_result = vector_store.delete_video_embeddings(safe_filename)
     temporal_result = temporal_store.delete_video_windows(safe_filename)
     crop_result = analysis_store.delete_video(safe_filename)
-    video_path.unlink(missing_ok=True)
 
     thumbnail_dir = case_paths.thumbnails_dir / Path(safe_filename).stem
     if thumbnail_dir.exists():
@@ -1720,6 +2289,9 @@ def _delete_video_sync(case_id: str, filename: str) -> dict:
     detections_dir = case_paths.thumbnails_dir / "detections" / Path(safe_filename).stem
     if detections_dir.exists():
         shutil.rmtree(detections_dir, ignore_errors=True)
+    preview_path = _preview_thumbnail_path(case_paths, safe_filename)
+    preview_path.unlink(missing_ok=True)
+    _clear_triage_cache_for_video(case_paths, safe_filename)
 
     return {
         "case_id": case_paths.case_id,
@@ -1805,6 +2377,23 @@ async def rename_case(case_id: str, request: CaseRenameRequest) -> dict:
 @app.delete("/cases/{case_id}")
 async def delete_case(case_id: str) -> dict:
     try:
+        normalized_case_id = _normalize_case_id(case_id)
+        index_jobs: dict[str, dict] = app.state.index_jobs
+        index_tasks: dict[str, asyncio.Task] = app.state.index_tasks
+        index_lock: Lock = app.state.index_jobs_lock
+        with index_lock:
+            existing_job = index_jobs.get(normalized_case_id)
+            if isinstance(existing_job, dict):
+                existing_status = str(existing_job.get("status") or "")
+                if bool(existing_job.get("running")) or existing_status in {"queued", "running"}:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            f"Background indexing is still running for case {normalized_case_id}. "
+                            "Wait for completion before deleting the case."
+                        ),
+                    )
+
         deleted = await asyncio.to_thread(_delete_case_sync, case_id)
         cache: dict[str, VectorStore] = app.state.vector_stores
         cache_lock: Lock = app.state.vector_stores_lock
@@ -1818,6 +2407,11 @@ async def delete_case(case_id: str) -> dict:
         analysis_cache_lock: Lock = app.state.analysis_stores_lock
         with analysis_cache_lock:
             analysis_cache.pop(deleted["case_id"], None)
+        with index_lock:
+            index_jobs.pop(deleted["case_id"], None)
+            dangling_task = index_tasks.pop(deleted["case_id"], None)
+            if dangling_task and not dangling_task.done():
+                dangling_task.cancel()
 
         try:
             cases = await asyncio.to_thread(_list_cases_sync)
@@ -1835,6 +2429,8 @@ async def delete_case(case_id: str) -> dict:
             "deleted_created_at": deleted.get("created_at"),
             "cases": cases,
         }
+    except HTTPException:
+        raise
     except KeyError:
         raise HTTPException(status_code=404, detail=f"Case not found: {case_id}")
     except ValueError as exc:
@@ -1859,8 +2455,9 @@ async def upload(case_id: str | None = None, files: list[UploadFile] = File(...)
     uploaded: list[str] = []
     errors: list[str] = []
     transcoded: list[dict[str, str]] = []
+    uploaded_items: list[dict[str, str | int | bool]] = []
 
-    for upload_file in files:
+    for source_index, upload_file in enumerate(files):
         if not upload_file.filename:
             errors.append("Encountered a file without a name")
             continue
@@ -1875,6 +2472,7 @@ async def upload(case_id: str | None = None, files: list[UploadFile] = File(...)
 
         source_extension = Path(upload_file.filename).suffix.lower() or ".mp4"
         temp_upload_path = case_paths.data_dir / f"upload_{uuid4().hex}{source_extension}"
+        temp_converted_path = case_paths.data_dir / f"converted_{uuid4().hex}.mp4"
         converted_name, converted_path = _unique_video_path(
             case_paths.videos_dir,
             upload_file.filename,
@@ -1890,11 +2488,16 @@ async def upload(case_id: str | None = None, files: list[UploadFile] = File(...)
             conversion_ok, conversion_error = await asyncio.to_thread(
                 convert_to_mp4,
                 temp_upload_path,
-                converted_path,
+                temp_converted_path,
             )
 
             if conversion_ok:
                 temp_upload_path.unlink(missing_ok=True)
+                await asyncio.to_thread(
+                    shutil.move,
+                    str(temp_converted_path),
+                    str(converted_path),
+                )
                 uploaded.append(converted_name)
                 transcoded.append(
                     {
@@ -1902,17 +2505,56 @@ async def upload(case_id: str | None = None, files: list[UploadFile] = File(...)
                         "stored_filename": converted_name,
                     }
                 )
+                uploaded_items.append(
+                    {
+                        "source_index": int(source_index),
+                        "source_filename": str(upload_file.filename),
+                        "stored_filename": str(converted_name),
+                        "converted": True,
+                    }
+                )
+                preview_path = _preview_thumbnail_path(case_paths, converted_name)
+                preview_ok = await asyncio.to_thread(
+                    generate_preview_thumbnail,
+                    converted_path,
+                    preview_path,
+                )
+                if not preview_ok:
+                    print(
+                        f"[upload][{case_paths.case_id}] preview generation failed "
+                        f"file={converted_name}"
+                    )
                 print(
                     f"[upload][{case_paths.case_id}] convert success input={upload_file.filename} "
                     f"output={converted_name}"
                 )
             else:
+                temp_converted_path.unlink(missing_ok=True)
                 fallback_name, fallback_path = _unique_video_path(
                     case_paths.videos_dir,
                     upload_file.filename,
                 )
                 await asyncio.to_thread(shutil.move, str(temp_upload_path), str(fallback_path))
                 uploaded.append(fallback_name)
+                uploaded_items.append(
+                    {
+                        "source_index": int(source_index),
+                        "source_filename": str(upload_file.filename),
+                        "stored_filename": str(fallback_name),
+                        "converted": False,
+                    }
+                )
+                preview_path = _preview_thumbnail_path(case_paths, fallback_name)
+                preview_ok = await asyncio.to_thread(
+                    generate_preview_thumbnail,
+                    fallback_path,
+                    preview_path,
+                )
+                if not preview_ok:
+                    print(
+                        f"[upload][{case_paths.case_id}] preview generation failed "
+                        f"file={fallback_name}"
+                    )
                 short_error = _truncate_error(conversion_error)
                 errors.append(
                     f"{upload_file.filename}: mp4 conversion failed ({short_error})"
@@ -1925,6 +2567,7 @@ async def upload(case_id: str | None = None, files: list[UploadFile] = File(...)
                     print(f"[upload][{case_paths.case_id}] ffmpeg error: {conversion_error}")
         except Exception as exc:
             converted_path.unlink(missing_ok=True)
+            temp_converted_path.unlink(missing_ok=True)
             temp_upload_path.unlink(missing_ok=True)
             errors.append(f"{upload_file.filename}: {exc}")
         finally:
@@ -1933,6 +2576,7 @@ async def upload(case_id: str | None = None, files: list[UploadFile] = File(...)
     return {
         "case_id": case_paths.case_id,
         "uploaded": uploaded,
+        "uploaded_items": uploaded_items,
         "errors": errors,
         "transcoded": transcoded,
     }
@@ -1957,6 +2601,7 @@ async def list_videos(case_id: str | None = None) -> dict:
 
     indexed_counts = vector_store.indexed_counts_by_filename()
     indexed_window_counts = temporal_store.indexed_counts_by_filename()
+    preview_thumbnails = vector_store.preview_thumbnails_by_filename()
     analysis_summary = vector_store.analysis_summary_by_filename()
     videos = []
 
@@ -1967,11 +2612,27 @@ async def list_videos(case_id: str | None = None) -> dict:
             continue
 
         file_stat = file_path.stat()
+        preview_url = str(preview_thumbnails.get(file_path.name, "")).strip()
+        if not preview_url:
+            preview_path = _preview_thumbnail_path(case_paths, file_path.name)
+            if not preview_path.exists():
+                try:
+                    await asyncio.to_thread(
+                        generate_preview_thumbnail,
+                        file_path,
+                        preview_path,
+                    )
+                except Exception:
+                    pass
+            if preview_path.exists():
+                preview_url = _media_url_for_case_path(preview_path)
+
         videos.append(
             {
                 "filename": file_path.name,
                 "size_bytes": file_stat.st_size,
                 "video_url": _media_url_for_case_path(file_path),
+                "preview_thumbnail_url": preview_url,
                 "indexed_frames": indexed_counts.get(file_path.name, 0),
                 "indexed_windows": indexed_window_counts.get(file_path.name, 0),
                 "analysis": analysis_summary.get(
@@ -2006,9 +2667,34 @@ async def delete_video(case_id: str | None = None, filename: str | None = None) 
 
     try:
         resolved_case_id = await asyncio.to_thread(_resolve_case_id_or_default, case_id)
-        return await asyncio.to_thread(_delete_video_sync, resolved_case_id, filename)
+        safe_filename = Path(str(filename or "")).name.strip()
+        if not safe_filename:
+            raise HTTPException(status_code=400, detail="filename is required")
+
+        index_jobs: dict[str, dict] = app.state.index_jobs
+        index_lock: Lock = app.state.index_jobs_lock
+        with index_lock:
+            existing_job = index_jobs.get(resolved_case_id)
+            if isinstance(existing_job, dict):
+                existing_status = str(existing_job.get("status") or "")
+                if bool(existing_job.get("running")) or existing_status in {"queued", "running"}:
+                    current_filename = str(existing_job.get("current_filename") or "").strip()
+                    detail = (
+                        "Cannot delete videos while background semantic indexing is running "
+                        f"for case {resolved_case_id}."
+                    )
+                    if current_filename:
+                        detail += f" Currently processing: {current_filename}."
+                    detail += " Wait for indexing to complete, then retry."
+                    raise HTTPException(status_code=409, detail=detail)
+
+        return await asyncio.to_thread(_delete_video_sync, resolved_case_id, safe_filename)
+    except HTTPException:
+        raise
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail=f"Video not found: {filename}")
+    except PermissionError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
     except KeyError:
         raise HTTPException(status_code=404, detail=f"Case not found: {case_id}")
     except ValueError as exc:
@@ -2048,6 +2734,234 @@ async def process_video(request: ProcessVideoRequest) -> dict:
         raise HTTPException(status_code=500, detail=str(exc))
 
 
+@app.post("/index/start")
+async def start_background_index(request: IndexStartRequest) -> dict:
+    try:
+        resolved_case_id = await asyncio.to_thread(
+            _resolve_case_id_or_default,
+            request.case_id,
+        )
+        case_paths = await asyncio.to_thread(_get_case_paths_or_raise, resolved_case_id)
+        filenames = await asyncio.to_thread(
+            _resolve_index_filenames,
+            case_paths,
+            request.filenames,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"Video not found: {exc}")
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"Case not found: {request.case_id}")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    jobs: dict[str, dict] = app.state.index_jobs
+    lock: Lock = app.state.index_jobs_lock
+
+    with lock:
+        running_case_id = _find_running_index_case_id_locked(jobs)
+        if running_case_id and running_case_id != resolved_case_id:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Background indexing already running for case "
+                    f"{running_case_id}. Wait for it to finish first."
+                ),
+            )
+
+        existing = jobs.get(resolved_case_id)
+        if isinstance(existing, dict):
+            existing_status = str(existing.get("status") or "")
+            if bool(existing.get("running")) or existing_status in {"queued", "running"}:
+                snapshot = _index_job_snapshot(existing, case_id=resolved_case_id)
+                return {
+                    "started": False,
+                    "case_id": resolved_case_id,
+                    "job": snapshot,
+                    "message": "Background indexing already running for this case.",
+                }
+
+        job = _new_index_job_record(
+            case_id=resolved_case_id,
+            filenames=filenames,
+            frame_interval_seconds=request.frame_interval_seconds,
+            batch_size=request.batch_size,
+            force=request.force,
+        )
+        jobs[resolved_case_id] = job
+
+    task = asyncio.create_task(_run_index_job_async(resolved_case_id))
+    task.add_done_callback(lambda _task: None)
+
+    with lock:
+        tasks: dict[str, asyncio.Task] = app.state.index_tasks
+        tasks[resolved_case_id] = task
+        snapshot = _index_job_snapshot(jobs.get(resolved_case_id), case_id=resolved_case_id)
+
+    print(
+        f"[index-start][{resolved_case_id}] files={len(filenames)} "
+        f"frame_interval={request.frame_interval_seconds} batch_size={request.batch_size} force={request.force}"
+    )
+
+    return {
+        "started": True,
+        "case_id": resolved_case_id,
+        "job": snapshot,
+    }
+
+
+@app.get("/index/status")
+async def get_background_index_status(case_id: str | None = None) -> dict:
+    selected_case_id = ""
+    try:
+        selected_case_id = await asyncio.to_thread(_resolve_case_id_or_default, case_id)
+        await asyncio.to_thread(_get_case_paths_or_raise, selected_case_id)
+    except ValueError as exc:
+        if case_id and str(case_id).strip():
+            raise HTTPException(status_code=400, detail=str(exc))
+        return _index_job_snapshot(None, case_id="")
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"Case not found: {case_id}")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    jobs: dict[str, dict] = app.state.index_jobs
+    lock: Lock = app.state.index_jobs_lock
+    with lock:
+        job = jobs.get(selected_case_id)
+        return _index_job_snapshot(job, case_id=selected_case_id)
+
+
+def _list_active_processes_sync() -> dict:
+    jobs: dict[str, dict] = app.state.index_jobs
+    lock: Lock = app.state.index_jobs_lock
+    processes: list[dict] = []
+
+    with lock:
+        for raw_case_id, job in jobs.items():
+            if not isinstance(job, dict):
+                continue
+            case_id = str(raw_case_id or "").strip()
+            if not case_id:
+                continue
+            status = str(job.get("status") or "")
+            running = bool(job.get("running")) or status in {"queued", "running", "cancelling"}
+            if not running:
+                continue
+            snapshot = _index_job_snapshot(job, case_id=case_id)
+            processes.append(
+                {
+                    "type": "background_index",
+                    "case_id": case_id,
+                    "status": snapshot.get("status", status),
+                    "current_filename": snapshot.get("current_filename", ""),
+                    "completed": int(snapshot.get("completed", 0)),
+                    "total": int(snapshot.get("total", 0)),
+                    "progress_percent": float(snapshot.get("progress_percent", 0.0)),
+                    "started_at": snapshot.get("started_at", ""),
+                    "updated_at": snapshot.get("updated_at", ""),
+                }
+            )
+
+    return {
+        "shutdown_requested": bool(getattr(app.state, "shutdown_requested", False)),
+        "shutdown_requested_at": str(getattr(app.state, "shutdown_requested_at", "") or ""),
+        "count": len(processes),
+        "processes": processes,
+    }
+
+
+def _cancel_running_index_jobs_sync() -> dict:
+    jobs: dict[str, dict] = app.state.index_jobs
+    tasks: dict[str, asyncio.Task] = app.state.index_tasks
+    lock: Lock = app.state.index_jobs_lock
+    cancelled_case_ids: set[str] = set()
+    now = _utc_now_iso()
+
+    with lock:
+        for raw_case_id, job in jobs.items():
+            if not isinstance(job, dict):
+                continue
+            case_id = str(raw_case_id or "").strip()
+            if not case_id:
+                continue
+            status = str(job.get("status") or "")
+            running = bool(job.get("running")) or status in {"queued", "running", "cancelling"}
+            if not running:
+                continue
+            job["cancel_requested"] = True
+            job["status"] = "cancelling"
+            job["running"] = False
+            job["updated_at"] = now
+            cancelled_case_ids.add(case_id)
+
+        for raw_case_id, task in list(tasks.items()):
+            case_id = str(raw_case_id or "").strip()
+            if not case_id or not isinstance(task, asyncio.Task):
+                continue
+            if task.done():
+                continue
+            task.cancel()
+            cancelled_case_ids.add(case_id)
+            job = jobs.get(case_id)
+            if isinstance(job, dict):
+                job["cancel_requested"] = True
+                job["status"] = "cancelling"
+                job["running"] = False
+                job["updated_at"] = now
+
+    return {
+        "cancelled_count": len(cancelled_case_ids),
+        "cancelled_case_ids": sorted(cancelled_case_ids),
+    }
+
+
+def _schedule_process_exit(delay_seconds: float = 1.0) -> None:
+    loop = asyncio.get_running_loop()
+
+    def _trigger_exit() -> None:
+        try:
+            signal.raise_signal(signal.SIGINT)
+        except Exception:
+            os._exit(0)
+
+    loop.call_later(max(0.2, float(delay_seconds)), _trigger_exit)
+
+
+@app.get("/processes")
+async def list_processes() -> dict:
+    try:
+        return await asyncio.to_thread(_list_active_processes_sync)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/shutdown")
+async def graceful_shutdown(request: ShutdownRequest) -> dict:
+    if not request.confirm:
+        raise HTTPException(status_code=400, detail="confirm=true is required for shutdown.")
+
+    try:
+        process_snapshot = await asyncio.to_thread(_list_active_processes_sync)
+        cancel_payload = await asyncio.to_thread(_cancel_running_index_jobs_sync)
+        app.state.shutdown_requested = True
+        app.state.shutdown_requested_at = _utc_now_iso()
+        _schedule_process_exit(1.0)
+
+        return {
+            "accepted": True,
+            "message": "Graceful shutdown scheduled.",
+            "active_process_count": int(process_snapshot.get("count", 0)),
+            "active_processes": process_snapshot.get("processes", []),
+            "cancelled_count": int(cancel_payload.get("cancelled_count", 0)),
+            "cancelled_case_ids": cancel_payload.get("cancelled_case_ids", []),
+            "shutdown_requested_at": str(app.state.shutdown_requested_at),
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
 def _hydrate_crop_item(case_paths: CasePaths, item: dict) -> dict:
     video_filename = str(item.get("video_filename") or "")
     output = {
@@ -2060,6 +2974,101 @@ def _hydrate_crop_item(case_paths: CasePaths, item: dict) -> dict:
     if "similarity_score" in item:
         output["similarity_score"] = float(item.get("similarity_score", 0.0))
     return output
+
+
+def _build_video_triage_sync(
+    *,
+    case_id: str,
+    filename: str,
+    bucket_seconds: float,
+    force: bool = False,
+) -> dict:
+    case_paths, vector_store = _get_vector_store_for_case(case_id)
+    resolved_filename, video_path = _resolve_video_path_for_processing(
+        case_paths,
+        filename,
+    )
+    if not video_path.exists() or not video_path.is_file():
+        raise FileNotFoundError(resolved_filename)
+    if not _is_supported_video(video_path.name):
+        raise ValueError(
+            "Unsupported video format. Allowed extensions: "
+            + ", ".join(sorted(VIDEO_EXTENSIONS))
+        )
+
+    analysis_summary = vector_store.analysis_summary_by_filename().get(
+        resolved_filename,
+        {
+            "face_people": {"processed": False},
+            "vehicles": {"processed": False},
+        },
+    )
+    face_people = (
+        analysis_summary.get("face_people")
+        if isinstance(analysis_summary.get("face_people"), dict)
+        else {}
+    )
+    vehicles = (
+        analysis_summary.get("vehicles")
+        if isinstance(analysis_summary.get("vehicles"), dict)
+        else {}
+    )
+
+    safe_bucket_seconds = max(0.5, float(bucket_seconds))
+    video_signature = compute_video_signature(video_path)
+    face_people_mtime_ns = _metadata_mtime_ns(case_paths.face_people_metadata_path)
+    vehicles_mtime_ns = _metadata_mtime_ns(case_paths.vehicles_metadata_path)
+    analysis_signature = _triage_analysis_signature(face_people, vehicles)
+    cache_path = _triage_cache_path(
+        case_paths,
+        resolved_filename,
+        safe_bucket_seconds,
+    )
+
+    if not force:
+        cached_payload = _load_triage_cache_sync(
+            cache_path=cache_path,
+            bucket_seconds=safe_bucket_seconds,
+            video_signature=video_signature,
+            analysis_signature=analysis_signature,
+            face_people_metadata_mtime_ns=face_people_mtime_ns,
+            vehicles_metadata_mtime_ns=vehicles_mtime_ns,
+        )
+        if isinstance(cached_payload, dict):
+            cached_payload["case_id"] = case_paths.case_id
+            cached_payload["video_url"] = _media_url_for_case_path(
+                case_paths.videos_dir / resolved_filename
+            )
+            cached_payload["cache_status"] = "hit"
+            return cached_payload
+
+    payload = build_video_triage_payload(
+        video_path=video_path,
+        video_filename=resolved_filename,
+        bucket_seconds=safe_bucket_seconds,
+        face_people_metadata_path=case_paths.face_people_metadata_path,
+        vehicles_metadata_path=case_paths.vehicles_metadata_path,
+        face_people_processed=bool(face_people.get("processed")),
+        vehicles_processed=bool(vehicles.get("processed")),
+    )
+    try:
+        _save_triage_cache_sync(
+            cache_path=cache_path,
+            bucket_seconds=safe_bucket_seconds,
+            video_signature=video_signature,
+            analysis_signature=analysis_signature,
+            face_people_metadata_mtime_ns=face_people_mtime_ns,
+            vehicles_metadata_mtime_ns=vehicles_mtime_ns,
+            payload=payload,
+        )
+    except Exception as exc:
+        print(
+            f"[triage-cache][{case_paths.case_id}] failed_save file={resolved_filename} error={exc}"
+        )
+    payload["case_id"] = case_paths.case_id
+    payload["video_url"] = _media_url_for_case_path(case_paths.videos_dir / resolved_filename)
+    payload["cache_status"] = "miss"
+    return payload
 
 
 @app.post("/analysis_gallery")
@@ -2124,6 +3133,30 @@ async def analysis_gallery(request: CropGalleryRequest) -> dict:
         "vehicles": vehicles,
         "count": len(raw_items),
     }
+
+
+@app.post("/triage_timeline")
+async def triage_timeline(request: TriageTimelineRequest) -> dict:
+    try:
+        selected_case_id = await asyncio.to_thread(
+            _resolve_case_id_or_default,
+            request.case_id,
+        )
+        return await asyncio.to_thread(
+            _build_video_triage_sync,
+            case_id=selected_case_id,
+            filename=request.filename,
+            bucket_seconds=request.bucket_seconds,
+            force=request.force,
+        )
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail=f"Video not found: {request.filename}")
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"Case not found: {request.case_id}")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 @app.post("/search")

@@ -38,6 +38,10 @@ def _resolve_ffmpeg_executable() -> str | None:
     return None
 
 
+def resolve_ffmpeg_executable() -> str | None:
+    return _resolve_ffmpeg_executable()
+
+
 def compute_video_signature(video_path: Path) -> str:
     file_stat = video_path.stat()
     fingerprint = f"{video_path.name}:{file_stat.st_size}:{file_stat.st_mtime_ns}"
@@ -114,9 +118,48 @@ def save_thumbnail(
     return thumbnail_path
 
 
+def generate_preview_thumbnail(
+    video_path: Path,
+    output_path: Path,
+    max_width: int = 320,
+) -> bool:
+    capture = cv2.VideoCapture(str(video_path))
+    if not capture.isOpened():
+        return False
+
+    try:
+        has_frame, frame_bgr = capture.read()
+        if not has_frame or frame_bgr is None:
+            return False
+
+        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        height, width = frame_rgb.shape[:2]
+        if width > max_width:
+            resized_height = int(height * (max_width / width))
+            frame_rgb = cv2.resize(
+                frame_rgb,
+                (max_width, max(1, resized_height)),
+                interpolation=cv2.INTER_AREA,
+            )
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+        success = cv2.imwrite(
+            str(output_path),
+            frame_bgr,
+            [int(cv2.IMWRITE_JPEG_QUALITY), 84],
+        )
+        return bool(success)
+    finally:
+        capture.release()
+
+
 def convert_to_mp4(input_path: Path, output_path: Path) -> tuple[bool, str]:
     """
-    Converts any video to MP4 using ffmpeg.
+    Converts any video to MP4 using ffmpeg while preserving audio.
+    Strategy:
+      1) Try stream-copy remux first (fast, no quality loss)
+      2) Fallback to high-quality H.264 + AAC transcode
     Returns (success, error_message).
     """
     resolved_ffmpeg = _resolve_ffmpeg_executable()
@@ -129,7 +172,8 @@ def convert_to_mp4(input_path: Path, output_path: Path) -> tuple[bool, str]:
 
     try:
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        command = [
+
+        remux_command = [
             resolved_ffmpeg,
             "-y",
             "-err_detect",
@@ -138,32 +182,90 @@ def convert_to_mp4(input_path: Path, output_path: Path) -> tuple[bool, str]:
             "+genpts",
             "-i",
             str(input_path),
-            "-an",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "fast",
-            "-crf",
-            "23",
-            "-pix_fmt",
-            "yuv420p",
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a?",
+            "-dn",
+            "-sn",
+            "-c",
+            "copy",
+            "-movflags",
+            "+faststart",
             str(output_path),
         ]
-        completed = subprocess.run(
-            command,
+        remux_completed = subprocess.run(
+            remux_command,
             capture_output=True,
             text=True,
             encoding="utf-8",
             errors="ignore",
             check=False,
         )
-        stderr_output = (completed.stderr or "").strip()
-        if completed.returncode != 0 or not output_path.exists():
+        remux_error = (remux_completed.stderr or "").strip()
+        if remux_completed.returncode == 0 and output_path.exists():
+            print(
+                f"[convert] mode=remux input={input_path.name} output={output_path.name}"
+            )
+            return True, ""
+
+        output_path.unlink(missing_ok=True)
+
+        transcode_command = [
+            resolved_ffmpeg,
+            "-y",
+            "-err_detect",
+            "ignore_err",
+            "-fflags",
+            "+genpts",
+            "-i",
+            str(input_path),
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a?",
+            "-dn",
+            "-sn",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "fast",
+            "-crf",
+            "18",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-movflags",
+            "+faststart",
+            str(output_path),
+        ]
+        transcode_completed = subprocess.run(
+            transcode_command,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+            check=False,
+        )
+        transcode_error = (transcode_completed.stderr or "").strip()
+        if transcode_completed.returncode != 0 or not output_path.exists():
             if output_path.exists():
                 output_path.unlink(missing_ok=True)
-            if stderr_output:
-                return False, stderr_output
-            return False, f"ffmpeg exited with code {completed.returncode}"
+            combined_error = transcode_error or remux_error
+            if combined_error:
+                return False, combined_error
+            return (
+                False,
+                "ffmpeg failed remux and transcode without stderr output",
+            )
+
+        print(
+            f"[convert] mode=transcode input={input_path.name} output={output_path.name} "
+            "video=libx264(crf=18,preset=fast) audio=aac(192k)"
+        )
         return True, ""
     except Exception as exc:
         if output_path.exists():

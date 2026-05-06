@@ -139,6 +139,26 @@ class VectorStore:
             counts[filename] = counts.get(filename, 0) + len(item.get("vector_ids", []))
         return counts
 
+    def preview_thumbnails_by_filename(self) -> dict[str, str]:
+        with self._lock:
+            candidates: dict[str, tuple[float, str]] = {}
+            for item in self.entries.values():
+                if not isinstance(item, dict):
+                    continue
+                filename = str(item.get("video_filename") or "").strip()
+                thumbnail = str(item.get("thumbnail_path") or "").strip()
+                if not filename or not thumbnail:
+                    continue
+                try:
+                    timestamp = float(item.get("timestamp_seconds", 0.0))
+                except Exception:
+                    timestamp = 0.0
+                existing = candidates.get(filename)
+                if existing is None or timestamp < existing[0]:
+                    candidates[filename] = (timestamp, thumbnail)
+
+            return {key: value[1] for key, value in candidates.items()}
+
     def get_video_analysis(
         self,
         signature: str,

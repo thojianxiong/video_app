@@ -2,12 +2,23 @@ let videoInput = null;
 let intervalInput = null;
 let uploadBtn = null;
 let refreshBtn = null;
+let refreshTriageBtn = null;
 let uploadStatus = null;
+let preUploadIndexPanel = null;
+let preUploadSelectAll = null;
+let preUploadIndexList = null;
+let existingIndexPanel = null;
+let existingIndexSelectAll = null;
+let existingIndexList = null;
+let runExistingIndexBtn = null;
 let taskProgress = null;
 let taskProgressLabel = null;
 let taskProgressPercent = null;
 let taskProgressBar = null;
 let taskProgressMeta = null;
+let triageStatus = null;
+let triageList = null;
+let triageDetail = null;
 let videoList = null;
 let embeddingProfileSelect = null;
 let embeddingDeviceSelect = null;
@@ -16,9 +27,16 @@ let embeddingSettingsMeta = null;
 let analysisStatus = null;
 let runFacePeopleSelectedBtn = null;
 let runVehiclesSelectedBtn = null;
+let mainTabTriageBtn = null;
 let mainTabSemanticBtn = null;
 let mainTabFacePeopleBtn = null;
 let mainTabVehiclesBtn = null;
+let workspaceBackBtn = null;
+let workspaceAnalysisBtn = null;
+let workspaceReportBtn = null;
+let workspaceSettingsBtn = null;
+let workspaceExitBtn = null;
+let tabTriage = null;
 let tabSemantic = null;
 let tabFacePeople = null;
 let tabVehicles = null;
@@ -44,12 +62,18 @@ let semanticPopupBackdrop = null;
 let queryInput = null;
 let topKInput = null;
 let searchBtn = null;
+let semanticSearchMeta = null;
 let resultsGrid = null;
+let triagePlayer = null;
+let triagePlayerMeta = null;
 let videoPlayer = null;
 let playerMeta = null;
 let activeCaseMeta = null;
 let caseList = null;
+let appShell = null;
 let workspace = null;
+let workspaceSettingsPage = null;
+let workspaceReportPage = null;
 let caseSidebar = null;
 let sidebarResizeHandle = null;
 
@@ -57,7 +81,8 @@ const state = {
   cases: [],
   activeCaseId: null,
   caseVideos: new Map(),
-  activeMainTab: "semantic",
+  activeMainTab: "triage",
+  workspaceView: "analysis",
   embeddingProfiles: [],
   embeddingSettings: null,
 };
@@ -68,6 +93,16 @@ let initStarted = false;
 let taskProgressHideTimerId = null;
 const playbackCache = new Map();
 const searchCache = new Map();
+const triageCache = new Map();
+const triageLoading = new Set();
+const triageErrors = new Map();
+const triageSelection = new Map();
+let pendingUploadItems = [];
+let triageRefreshToken = 0;
+let indexStatusPollToken = 0;
+let indexStatusPollCaseId = "";
+let uploadFlowActive = false;
+const backgroundIndexTerminalSeen = new Map();
 const SIDEBAR_MIN_WIDTH = 220;
 const SIDEBAR_MAX_WIDTH = 560;
 
@@ -76,12 +111,23 @@ function bindDomElements() {
   intervalInput = document.getElementById("intervalInput");
   uploadBtn = document.getElementById("uploadBtn");
   refreshBtn = document.getElementById("refreshBtn");
+  refreshTriageBtn = document.getElementById("refreshTriageBtn");
   uploadStatus = document.getElementById("uploadStatus");
+  preUploadIndexPanel = document.getElementById("preUploadIndexPanel");
+  preUploadSelectAll = document.getElementById("preUploadSelectAll");
+  preUploadIndexList = document.getElementById("preUploadIndexList");
+  existingIndexPanel = document.getElementById("existingIndexPanel");
+  existingIndexSelectAll = document.getElementById("existingIndexSelectAll");
+  existingIndexList = document.getElementById("existingIndexList");
+  runExistingIndexBtn = document.getElementById("runExistingIndexBtn");
   taskProgress = document.getElementById("taskProgress");
   taskProgressLabel = document.getElementById("taskProgressLabel");
   taskProgressPercent = document.getElementById("taskProgressPercent");
   taskProgressBar = document.getElementById("taskProgressBar");
   taskProgressMeta = document.getElementById("taskProgressMeta");
+  triageStatus = document.getElementById("triageStatus");
+  triageList = document.getElementById("triageList");
+  triageDetail = document.getElementById("triageDetail");
   videoList = document.getElementById("videoList");
   embeddingProfileSelect = document.getElementById("embeddingProfileSelect");
   embeddingDeviceSelect = document.getElementById("embeddingDeviceSelect");
@@ -90,9 +136,16 @@ function bindDomElements() {
   analysisStatus = document.getElementById("analysisStatus");
   runFacePeopleSelectedBtn = document.getElementById("runFacePeopleSelectedBtn");
   runVehiclesSelectedBtn = document.getElementById("runVehiclesSelectedBtn");
+  mainTabTriageBtn = document.getElementById("mainTabTriageBtn");
   mainTabSemanticBtn = document.getElementById("mainTabSemanticBtn");
   mainTabFacePeopleBtn = document.getElementById("mainTabFacePeopleBtn");
   mainTabVehiclesBtn = document.getElementById("mainTabVehiclesBtn");
+  workspaceBackBtn = document.getElementById("workspaceBackBtn");
+  workspaceAnalysisBtn = document.getElementById("workspaceAnalysisBtn");
+  workspaceReportBtn = document.getElementById("workspaceReportBtn");
+  workspaceSettingsBtn = document.getElementById("workspaceSettingsBtn");
+  workspaceExitBtn = document.getElementById("workspaceExitBtn");
+  tabTriage = document.getElementById("tabTriage");
   tabSemantic = document.getElementById("tabSemantic");
   tabFacePeople = document.getElementById("tabFacePeople");
   tabVehicles = document.getElementById("tabVehicles");
@@ -118,12 +171,18 @@ function bindDomElements() {
   queryInput = document.getElementById("queryInput");
   topKInput = document.getElementById("topKInput");
   searchBtn = document.getElementById("searchBtn");
+  semanticSearchMeta = document.getElementById("semanticSearchMeta");
   resultsGrid = document.getElementById("resultsGrid");
+  triagePlayer = document.getElementById("triagePlayer");
+  triagePlayerMeta = document.getElementById("triagePlayerMeta");
   videoPlayer = document.getElementById("videoPlayer");
   playerMeta = document.getElementById("playerMeta");
   activeCaseMeta = document.getElementById("activeCaseMeta");
   caseList = document.getElementById("caseList");
+  appShell = document.querySelector("main.app-shell");
   workspace = document.querySelector(".workspace");
+  workspaceSettingsPage = document.getElementById("workspaceSettingsPage");
+  workspaceReportPage = document.getElementById("workspaceReportPage");
   caseSidebar = document.querySelector(".case-sidebar");
   sidebarResizeHandle = document.getElementById("sidebarResizeHandle");
 }
@@ -160,6 +219,89 @@ function setVehicleStatus(message, kind = "") {
   vehicleStatus.className = `status ${kind}`.trim();
 }
 
+function setTriageStatus(message, kind = "") {
+  if (!triageStatus) {
+    return;
+  }
+  triageStatus.textContent = message;
+  triageStatus.className = `status ${kind}`.trim();
+}
+
+function setSemanticSearchMeta(message, kind = "") {
+  if (!semanticSearchMeta) {
+    return;
+  }
+  semanticSearchMeta.textContent = String(message || "");
+  semanticSearchMeta.className = `status ${kind}`.trim();
+}
+
+function formatProcessSummaryForConfirm(processPayload) {
+  const processes = Array.isArray(processPayload?.processes) ? processPayload.processes : [];
+  if (!processes.length) {
+    return "No active background processes found.";
+  }
+
+  const lines = processes.map((item, index) => {
+    const processType = String(item?.type || "process");
+    const caseId = String(item?.case_id || "unknown");
+    const status = String(item?.status || "running");
+    const currentFilename = String(item?.current_filename || "").trim();
+    const completed = Math.max(0, Number(item?.completed || 0));
+    const total = Math.max(0, Number(item?.total || 0));
+    const progress = Number.isFinite(Number(item?.progress_percent))
+      ? Math.max(0, Math.min(100, Number(item.progress_percent)))
+      : 0;
+    const filePart = currentFilename ? ` | file: ${currentFilename}` : "";
+    return `${index + 1}. ${processType} | case=${caseId} | status=${status} | ${completed}/${total} (${progress.toFixed(1)}%)${filePart}`;
+  });
+
+  return lines.join("\n");
+}
+
+async function requestGracefulExit() {
+  try {
+    setStatus("Checking active processes before exit...", "working");
+    const processPayload = await fetchJson("/processes");
+    const processSummary = formatProcessSummaryForConfirm(processPayload);
+    const promptMessage = [
+      "Graceful exit will stop background work and shut down the local server.",
+      "",
+      "Current processes:",
+      processSummary,
+      "",
+      "Proceed with graceful exit?",
+    ].join("\n");
+
+    const confirmed = window.confirm(promptMessage);
+    if (!confirmed) {
+      setStatus("Exit cancelled.", "ok");
+      return;
+    }
+
+    setStatus("Stopping processes and shutting down...", "working");
+    const shutdownPayload = await fetchJson("/shutdown", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ confirm: true }),
+    });
+
+    const cancelledCount = Math.max(0, Number(shutdownPayload?.cancelled_count || 0));
+    const message = cancelledCount > 0
+      ? `Shutdown scheduled. Cancelled ${cancelledCount} background process(es).`
+      : "Shutdown scheduled. No background processes were running.";
+    setStatus(`${message} Closing tab if allowed...`, "ok");
+    setTriageStatus(message, "ok");
+    setAnalysisStatus(message, "ok");
+    setVehicleStatus(message, "ok");
+
+    window.setTimeout(() => {
+      window.close();
+    }, 300);
+  } catch (error) {
+    setStatus(`Exit failed: ${formatError(error)}`, "error");
+  }
+}
+
 function formatError(error) {
   if (!error) return "Unknown error";
 
@@ -190,6 +332,330 @@ function formatBytes(bytes) {
     index += 1;
   }
   return `${value.toFixed(index === 0 ? 0 : 1)} ${units[index]}`;
+}
+
+function makePendingUploadSourceKey(file, sourceIndex) {
+  const safeIndex = Number.isFinite(Number(sourceIndex)) ? Number(sourceIndex) : 0;
+  const safeName = String(file?.name || "");
+  const safeSize = Number(file?.size || 0);
+  const safeModified = Number(file?.lastModified || 0);
+  return `${safeIndex}::${safeName}::${safeSize}::${safeModified}`;
+}
+
+function syncPreUploadSelectAllControl() {
+  if (!preUploadSelectAll) {
+    return;
+  }
+  if (!pendingUploadItems.length) {
+    preUploadSelectAll.checked = false;
+    preUploadSelectAll.indeterminate = false;
+    preUploadSelectAll.disabled = true;
+    return;
+  }
+
+  const selectedCount = pendingUploadItems.reduce(
+    (count, item) => count + (item.selectedForIndex ? 1 : 0),
+    0,
+  );
+  preUploadSelectAll.disabled = false;
+  preUploadSelectAll.checked = selectedCount === pendingUploadItems.length;
+  preUploadSelectAll.indeterminate = selectedCount > 0 && selectedCount < pendingUploadItems.length;
+}
+
+function renderPreUploadIndexSelection() {
+  if (!preUploadIndexPanel || !preUploadIndexList) {
+    return;
+  }
+
+  preUploadIndexList.innerHTML = "";
+  if (!pendingUploadItems.length) {
+    preUploadIndexPanel.hidden = true;
+    syncPreUploadSelectAllControl();
+    return;
+  }
+
+  preUploadIndexPanel.hidden = false;
+  pendingUploadItems.forEach((item) => {
+    const row = document.createElement("div");
+    row.className = "analysis-video-item";
+
+    const label = document.createElement("label");
+    label.className = "analysis-video-label";
+
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.className = "analysis-select-checkbox";
+    checkbox.checked = Boolean(item.selectedForIndex);
+    checkbox.dataset.sourceIndex = String(item.sourceIndex);
+    checkbox.addEventListener("change", () => {
+      item.selectedForIndex = Boolean(checkbox.checked);
+      syncPreUploadSelectAllControl();
+    });
+
+    const text = document.createElement("span");
+    text.className = "analysis-video-name";
+    text.textContent = item.name;
+
+    label.appendChild(checkbox);
+    label.appendChild(text);
+
+    const status = document.createElement("div");
+    status.className = "analysis-video-status";
+    status.textContent = formatBytes(item.sizeBytes);
+
+    row.appendChild(label);
+    row.appendChild(status);
+    preUploadIndexList.appendChild(row);
+  });
+
+  syncPreUploadSelectAllControl();
+}
+
+function refreshPendingUploadItemsFromInput() {
+  const files = Array.from(videoInput?.files || []);
+  const previousSelection = new Map(
+    pendingUploadItems.map((item) => [item.sourceKey, Boolean(item.selectedForIndex)]),
+  );
+  pendingUploadItems = files.map((file, sourceIndex) => {
+    const sourceKey = makePendingUploadSourceKey(file, sourceIndex);
+    const selectedForIndex = previousSelection.has(sourceKey)
+      ? Boolean(previousSelection.get(sourceKey))
+      : true;
+    return {
+      sourceIndex,
+      sourceKey,
+      name: String(file?.name || ""),
+      sizeBytes: Number(file?.size || 0),
+      selectedForIndex,
+    };
+  });
+  renderPreUploadIndexSelection();
+}
+
+function clearPendingUploadItems() {
+  pendingUploadItems = [];
+  renderPreUploadIndexSelection();
+}
+
+function setAllPendingUploadSelection(checked) {
+  pendingUploadItems.forEach((item) => {
+    item.selectedForIndex = Boolean(checked);
+  });
+  renderPreUploadIndexSelection();
+}
+
+function getSelectedPendingUploadSourceIndices(files) {
+  const fileCount = Array.isArray(files) ? files.length : 0;
+  if (!fileCount) {
+    return new Set();
+  }
+
+  if (pendingUploadItems.length !== fileCount) {
+    return new Set(Array.from({ length: fileCount }, (_, index) => index));
+  }
+
+  const selected = new Set();
+  pendingUploadItems.forEach((item) => {
+    if (item.selectedForIndex) {
+      selected.add(Number(item.sourceIndex));
+    }
+  });
+  return selected;
+}
+
+function resolveSelectedSemanticIndexTargets(uploadResult, selectedSourceIndices, files) {
+  const uploadedItems = Array.isArray(uploadResult?.uploaded_items)
+    ? uploadResult.uploaded_items
+    : [];
+  const uploadedNames = Array.isArray(uploadResult?.uploaded) ? uploadResult.uploaded : [];
+  const targets = [];
+  const seen = new Set();
+
+  for (const item of uploadedItems) {
+    const sourceIndex = Number(item?.source_index);
+    const storedFilename = String(item?.stored_filename || "").trim();
+    if (!Number.isFinite(sourceIndex) || !storedFilename) {
+      continue;
+    }
+    if (!selectedSourceIndices.has(sourceIndex) || seen.has(storedFilename)) {
+      continue;
+    }
+    seen.add(storedFilename);
+    targets.push(storedFilename);
+  }
+
+  if (targets.length > 0) {
+    return targets;
+  }
+
+  const selectedSourceNames = new Set(
+    files
+      .map((file, sourceIndex) => ({ file, sourceIndex }))
+      .filter((item) => selectedSourceIndices.has(item.sourceIndex))
+      .map((item) => String(item.file?.name || "").trim())
+      .filter(Boolean),
+  );
+
+  for (const uploadedName of uploadedNames) {
+    const normalized = String(uploadedName || "").trim();
+    if (!normalized || seen.has(normalized)) {
+      continue;
+    }
+    if (selectedSourceNames.has(normalized)) {
+      seen.add(normalized);
+      targets.push(normalized);
+    }
+  }
+
+  if (
+    targets.length === 0
+    && selectedSourceIndices.size === files.length
+    && selectedSourceIndices.size > 0
+  ) {
+    for (const uploadedName of uploadedNames) {
+      const normalized = String(uploadedName || "").trim();
+      if (!normalized || seen.has(normalized)) {
+        continue;
+      }
+      seen.add(normalized);
+      targets.push(normalized);
+    }
+  }
+
+  return targets;
+}
+
+function isVideoSemanticallyIndexed(video) {
+  const indexedFrames = Math.max(0, Number(video?.indexed_frames || 0));
+  const indexedWindows = Math.max(0, Number(video?.indexed_windows || 0));
+  return indexedFrames > 0 || indexedWindows > 0;
+}
+
+function getExistingIndexCheckboxes() {
+  if (!existingIndexList) {
+    return [];
+  }
+  return Array.from(
+    existingIndexList.querySelectorAll("input.existing-index-checkbox[data-filename]"),
+  );
+}
+
+function syncExistingIndexSelectAllControl() {
+  if (!existingIndexSelectAll) {
+    return;
+  }
+  const checkboxes = getExistingIndexCheckboxes();
+  if (!checkboxes.length) {
+    existingIndexSelectAll.checked = false;
+    existingIndexSelectAll.indeterminate = false;
+    existingIndexSelectAll.disabled = true;
+    return;
+  }
+
+  const selectedCount = checkboxes.reduce(
+    (count, input) => count + (input.checked ? 1 : 0),
+    0,
+  );
+  existingIndexSelectAll.disabled = false;
+  existingIndexSelectAll.checked = selectedCount === checkboxes.length;
+  existingIndexSelectAll.indeterminate = selectedCount > 0 && selectedCount < checkboxes.length;
+}
+
+function setAllExistingIndexSelection(checked) {
+  const checkboxes = getExistingIndexCheckboxes();
+  checkboxes.forEach((input) => {
+    input.checked = Boolean(checked);
+  });
+  syncExistingIndexSelectAllControl();
+}
+
+function getSelectedExistingIndexFilenames() {
+  const checkboxes = getExistingIndexCheckboxes();
+  return checkboxes
+    .filter((input) => input.checked)
+    .map((input) => String(input.dataset.filename || "").trim())
+    .filter(Boolean);
+}
+
+function renderExistingIndexSelectionList(videos) {
+  if (!existingIndexPanel || !existingIndexList) {
+    return;
+  }
+
+  const activeCaseId = String(state.activeCaseId || "").trim();
+  existingIndexList.innerHTML = "";
+
+  if (!activeCaseId) {
+    existingIndexPanel.hidden = true;
+    if (runExistingIndexBtn) {
+      runExistingIndexBtn.disabled = true;
+    }
+    syncExistingIndexSelectAllControl();
+    return;
+  }
+
+  existingIndexPanel.hidden = false;
+  const list = Array.isArray(videos) ? videos : [];
+  if (!list.length) {
+    existingIndexList.appendChild(createInsightEmptyElement("No uploaded videos yet."));
+    if (runExistingIndexBtn) {
+      runExistingIndexBtn.disabled = true;
+    }
+    syncExistingIndexSelectAllControl();
+    return;
+  }
+
+  const unindexedVideos = list
+    .filter((video) => !isVideoSemanticallyIndexed(video))
+    .sort((a, b) => String(a.filename).localeCompare(String(b.filename)));
+
+  if (!unindexedVideos.length) {
+    existingIndexList.appendChild(
+      createInsightEmptyElement("All uploaded videos are already semantically indexed."),
+    );
+    if (runExistingIndexBtn) {
+      runExistingIndexBtn.disabled = true;
+    }
+    syncExistingIndexSelectAllControl();
+    return;
+  }
+
+  unindexedVideos.forEach((video) => {
+    const row = document.createElement("div");
+    row.className = "analysis-video-item";
+
+    const label = document.createElement("label");
+    label.className = "analysis-video-label";
+
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.checked = true;
+    checkbox.className = "analysis-select-checkbox existing-index-checkbox";
+    checkbox.dataset.filename = String(video.filename || "");
+    checkbox.addEventListener("change", () => {
+      syncExistingIndexSelectAllControl();
+    });
+
+    const text = document.createElement("span");
+    text.className = "analysis-video-name";
+    text.textContent = String(video.filename || "");
+
+    label.appendChild(checkbox);
+    label.appendChild(text);
+
+    const status = document.createElement("div");
+    status.className = "analysis-video-status";
+    status.textContent = `${formatBytes(video.size_bytes)} | not indexed`;
+
+    row.appendChild(label);
+    row.appendChild(status);
+    existingIndexList.appendChild(row);
+  });
+
+  if (runExistingIndexBtn) {
+    runExistingIndexBtn.disabled = false;
+  }
+  syncExistingIndexSelectAllControl();
 }
 
 function formatTime(totalSeconds) {
@@ -280,6 +746,202 @@ function hideTaskProgressUi() {
     taskProgressHideTimerId = null;
   }
   taskProgress.hidden = true;
+}
+
+function isBackgroundIndexRunning(statusPayload) {
+  if (!statusPayload || typeof statusPayload !== "object") {
+    return false;
+  }
+  if (Boolean(statusPayload.running)) {
+    return true;
+  }
+  const status = String(statusPayload.status || "").toLowerCase();
+  return status === "queued" || status === "running";
+}
+
+function backgroundIndexProgressPercent(statusPayload) {
+  const total = Math.max(0, Number(statusPayload?.total || 0));
+  const completed = Math.max(0, Number(statusPayload?.completed || 0));
+  const status = String(statusPayload?.status || "").toLowerCase();
+  const currentVideoPercent = Number(statusPayload?.current_video_progress_percent);
+
+  if (
+    total > 0
+    && (status === "running" || status === "queued")
+    && Number.isFinite(currentVideoPercent)
+    && currentVideoPercent > 0
+  ) {
+    return clampPercent(((completed + (Math.min(100, currentVideoPercent) / 100)) / total) * 100);
+  }
+
+  const payloadPercent = Number(statusPayload?.progress_percent);
+  if (Number.isFinite(payloadPercent)) {
+    return clampPercent(payloadPercent);
+  }
+  if (total <= 0) {
+    return 0;
+  }
+  return clampPercent((completed / total) * 100);
+}
+
+function formatBackgroundIndexMeta(statusPayload) {
+  const total = Math.max(0, Number(statusPayload?.total || 0));
+  const completed = Math.max(0, Number(statusPayload?.completed || 0));
+  const processed = Math.max(0, Number(statusPayload?.processed || 0));
+  const skipped = Math.max(0, Number(statusPayload?.skipped || 0));
+  const failed = Math.max(0, Number(statusPayload?.failed || 0));
+  const currentFilename = String(statusPayload?.current_filename || "").trim();
+  const currentVideoProcessed = Math.max(0, Number(statusPayload?.current_video_processed_frames || 0));
+  const currentVideoTotal = Math.max(0, Number(statusPayload?.current_video_total_frames || 0));
+  const currentVideoPercent = clampPercent(Number(statusPayload?.current_video_progress_percent || 0));
+  const currentVideoEta = statusPayload?.current_video_eta_seconds;
+
+  const lead = currentFilename ? `Current: ${currentFilename}` : "Waiting for next file";
+  const parts = [`${lead}`, `${completed}/${total} done`, `processed ${processed}, skipped ${skipped}, failed ${failed}`];
+
+  if (currentFilename) {
+    const totalLabel = currentVideoTotal > 0 ? String(currentVideoTotal) : "?";
+    parts.push(`this video ${currentVideoProcessed}/${totalLabel} (${Math.round(currentVideoPercent)}%)`);
+    parts.push(formatEtaLabel(currentVideoEta));
+  }
+
+  return parts.join(" | ");
+}
+
+function stopBackgroundIndexPolling() {
+  indexStatusPollToken += 1;
+  indexStatusPollCaseId = "";
+}
+
+function renderBackgroundIndexStatus(caseId, statusPayload) {
+  const normalizedCaseId = String(caseId || "").trim();
+  if (!normalizedCaseId || state.activeCaseId !== normalizedCaseId) {
+    return;
+  }
+  if (uploadFlowActive) {
+    return;
+  }
+  if (!statusPayload || typeof statusPayload !== "object") {
+    hideTaskProgressUi();
+    return;
+  }
+
+  const status = String(statusPayload.status || "").toLowerCase();
+  if (status === "idle") {
+    hideTaskProgressUi();
+    return;
+  }
+
+  const progressPercent = backgroundIndexProgressPercent(statusPayload);
+  const meta = formatBackgroundIndexMeta(statusPayload);
+  if (isBackgroundIndexRunning(statusPayload)) {
+    backgroundIndexTerminalSeen.delete(normalizedCaseId);
+    setTaskProgressUi("Semantic indexing (background)", progressPercent, meta);
+    setStatus(`Semantic indexing is running in background for ${normalizedCaseId}.`, "working");
+    return;
+  }
+
+  const terminalKey = [
+    status,
+    String(statusPayload.finished_at || ""),
+    String(statusPayload.completed || 0),
+    String(statusPayload.failed || 0),
+  ].join("|");
+  if (backgroundIndexTerminalSeen.get(normalizedCaseId) === terminalKey) {
+    return;
+  }
+  backgroundIndexTerminalSeen.set(normalizedCaseId, terminalKey);
+
+  const failed = Math.max(0, Number(statusPayload.failed || 0));
+  const indexedFrames = Math.max(0, Number(statusPayload.indexed_frames || 0));
+  const indexedWindows = Math.max(0, Number(statusPayload.indexed_windows || 0));
+  const summary = `Background indexing finished for ${normalizedCaseId}: indexed frames ${indexedFrames}, temporal windows ${indexedWindows}, failed ${failed}.`;
+  completeTaskProgressUi("Background indexing finished", meta);
+  setStatus(summary, failed > 0 ? "error" : "ok");
+}
+
+async function readBackgroundIndexStatus(caseId) {
+  const normalizedCaseId = String(caseId || "").trim();
+  if (!normalizedCaseId) {
+    return null;
+  }
+  try {
+    return await fetchJson(withCaseQuery("/index/status", normalizedCaseId));
+  } catch (error) {
+    console.warn(`Background index status unavailable for ${normalizedCaseId}: ${formatError(error)}`);
+    return null;
+  }
+}
+
+function startBackgroundIndexPolling(caseId) {
+  const normalizedCaseId = String(caseId || "").trim();
+  if (!normalizedCaseId) {
+    return;
+  }
+
+  stopBackgroundIndexPolling();
+  indexStatusPollCaseId = normalizedCaseId;
+  const pollToken = ++indexStatusPollToken;
+
+  const poll = async () => {
+    if (pollToken !== indexStatusPollToken || indexStatusPollCaseId !== normalizedCaseId) {
+      return;
+    }
+
+    const statusPayload = await readBackgroundIndexStatus(normalizedCaseId);
+    if (pollToken !== indexStatusPollToken || indexStatusPollCaseId !== normalizedCaseId) {
+      return;
+    }
+    if (!statusPayload) {
+      window.setTimeout(poll, 1800);
+      return;
+    }
+
+    renderBackgroundIndexStatus(normalizedCaseId, statusPayload);
+    if (isBackgroundIndexRunning(statusPayload)) {
+      window.setTimeout(poll, 1300);
+      return;
+    }
+
+    if (state.activeCaseId === normalizedCaseId) {
+      try {
+        await refreshVideos(normalizedCaseId);
+      } catch (error) {
+        console.warn(`Refresh after background index failed: ${formatError(error)}`);
+      }
+    }
+
+    if (pollToken === indexStatusPollToken && indexStatusPollCaseId === normalizedCaseId) {
+      stopBackgroundIndexPolling();
+    }
+  };
+
+  void poll();
+}
+
+async function syncBackgroundIndexStatus(caseId) {
+  const normalizedCaseId = String(caseId || "").trim();
+  if (!normalizedCaseId) {
+    stopBackgroundIndexPolling();
+    hideTaskProgressUi();
+    return null;
+  }
+
+  const statusPayload = await readBackgroundIndexStatus(normalizedCaseId);
+  if (!statusPayload) {
+    if (state.activeCaseId === normalizedCaseId) {
+      hideTaskProgressUi();
+    }
+    return null;
+  }
+
+  renderBackgroundIndexStatus(normalizedCaseId, statusPayload);
+  if (isBackgroundIndexRunning(statusPayload)) {
+    startBackgroundIndexPolling(normalizedCaseId);
+  } else if (indexStatusPollCaseId === normalizedCaseId) {
+    stopBackgroundIndexPolling();
+  }
+  return statusPayload;
 }
 
 function normalizedVideoAnalysis(video) {
@@ -389,22 +1051,64 @@ function setCaseUrl(caseId) {
 }
 
 function renderMainTabs() {
+  const triageActive = state.activeMainTab === "triage";
   const semanticActive = state.activeMainTab === "semantic";
   const faceActive = state.activeMainTab === "face_people";
   const vehicleActive = state.activeMainTab === "vehicles";
 
+  mainTabTriageBtn?.classList.toggle("active", triageActive);
   mainTabSemanticBtn?.classList.toggle("active", semanticActive);
   mainTabFacePeopleBtn?.classList.toggle("active", faceActive);
   mainTabVehiclesBtn?.classList.toggle("active", vehicleActive);
 
+  tabTriage?.classList.toggle("active", triageActive);
   tabSemantic?.classList.toggle("active", semanticActive);
   tabFacePeople?.classList.toggle("active", faceActive);
   tabVehicles?.classList.toggle("active", vehicleActive);
 }
 
+function applyWorkspaceView() {
+  const settingsActive = state.workspaceView === "settings" && Boolean(state.activeCaseId);
+  const reportActive = state.workspaceView === "report" && Boolean(state.activeCaseId);
+  workspace?.classList.toggle("show-settings", settingsActive);
+  workspace?.classList.toggle("show-report", reportActive);
+  if (workspaceSettingsPage) {
+    workspaceSettingsPage.hidden = !settingsActive;
+  }
+  if (workspaceReportPage) {
+    workspaceReportPage.hidden = !reportActive;
+  }
+  if (workspaceSettingsBtn) {
+    workspaceSettingsBtn.classList.toggle("active", settingsActive);
+    workspaceSettingsBtn.setAttribute("aria-pressed", settingsActive ? "true" : "false");
+  }
+  if (workspaceReportBtn) {
+    workspaceReportBtn.classList.toggle("active", reportActive);
+    workspaceReportBtn.setAttribute("aria-pressed", reportActive ? "true" : "false");
+  }
+  if (workspaceAnalysisBtn) {
+    const analysisActive = !settingsActive && !reportActive && Boolean(state.activeCaseId);
+    workspaceAnalysisBtn.classList.toggle("active", analysisActive);
+    workspaceAnalysisBtn.setAttribute("aria-pressed", analysisActive ? "true" : "false");
+  }
+}
+
+function setWorkspaceView(viewKey) {
+  if (viewKey === "settings") {
+    state.workspaceView = "settings";
+  } else if (viewKey === "report") {
+    state.workspaceView = "report";
+  } else {
+    state.workspaceView = "analysis";
+  }
+  applyWorkspaceView();
+}
+
 function setActiveMainTab(tabKey) {
   const normalized =
-    tabKey === "face_people" || tabKey === "vehicles" ? tabKey : "semantic";
+    tabKey === "triage" || tabKey === "face_people" || tabKey === "vehicles"
+      ? tabKey
+      : "semantic";
   state.activeMainTab = normalized;
   renderMainTabs();
 }
@@ -767,14 +1471,25 @@ function clearResults() {
 }
 
 function syncWorkspaceVisibility() {
-  if (!workspace) {
-    return;
+  const hasActiveCase = Boolean(state.activeCaseId);
+  if (!hasActiveCase) {
+    stopBackgroundIndexPolling();
+    hideTaskProgressUi();
   }
-  workspace.style.display = state.activeCaseId ? "flex" : "none";
+  if (appShell) {
+    appShell.classList.toggle("repository-mode", !hasActiveCase);
+    appShell.classList.toggle("workspace-mode", hasActiveCase);
+  }
+  if (!hasActiveCase && state.workspaceView !== "analysis") {
+    state.workspaceView = "analysis";
+  }
+  applyWorkspaceView();
   renderMainTabs();
   if (activeCaseMeta) {
-    if (!state.activeCaseId) {
+    if (!hasActiveCase) {
       activeCaseMeta.textContent = "";
+      setSemanticSearchMeta("", "");
+      setTriageStatus("", "");
       setAnalysisStatus("", "");
       setVehicleStatus("", "");
     } else {
@@ -782,8 +1497,34 @@ function syncWorkspaceVisibility() {
       const activeName = activeCase?.name || state.activeCaseId;
       const createdAtLabel = formatCaseCreatedAt(activeCase?.created_at);
       activeCaseMeta.textContent = `Active Case: ${activeName} (${state.activeCaseId}) | Created: ${createdAtLabel}`;
+      setSemanticSearchMeta("Search type will appear here after querying.", "");
     }
   }
+}
+
+function backToCaseRepository() {
+  if (!state.activeCaseId) {
+    stopBackgroundIndexPolling();
+    hideTaskProgressUi();
+    setWorkspaceView("analysis");
+    syncWorkspaceVisibility();
+    return;
+  }
+  saveActiveCasePlaybackSnapshot();
+  stopBackgroundIndexPolling();
+  hideTaskProgressUi();
+  state.activeCaseId = null;
+  setWorkspaceView("analysis");
+  markCaseStateChanged();
+  setCaseUrl(null);
+  clearResults();
+  renderVideoList([]);
+  renderTriagePanels();
+  resetPlayerForCase(null);
+  resetAuxPlayers(null);
+  renderCaseList();
+  syncWorkspaceVisibility();
+  setStatus("Case repository ready. Select a case to open workspace tabs.", "ok");
 }
 
 function defaultCaseName() {
@@ -1009,6 +1750,18 @@ function resetPlayerForCase(caseId = null) {
 function resetAuxPlayers(caseId = null) {
   const normalizedCaseId = caseId ? String(caseId) : "";
   closeSemanticPopup();
+  if (triagePlayer && triagePlayerMeta) {
+    triagePlayer.pause();
+    triagePlayer.removeAttribute("src");
+    triagePlayer.load();
+    triagePlayer.dataset.filename = "";
+    triagePlayer.dataset.videoUrl = "";
+    triagePlayer.dataset.caseId = normalizedCaseId;
+    triagePlayerMeta.textContent = normalizedCaseId
+      ? `Case ${normalizedCaseId}: select a triage timeline point.`
+      : "Select a timeline point to preview.";
+  }
+  updateTriageTimelinePlayheads(0);
   if (facePeoplePlayer && facePeoplePlayerMeta) {
     facePeoplePlayer.pause();
     facePeoplePlayer.removeAttribute("src");
@@ -1189,17 +1942,13 @@ async function loadCases() {
     state.cases = [];
   }
 
-  if (state.cases.length > 0) {
-    if (
-      !stateChangedDuringRequest
-      && (
-        !state.activeCaseId
-        || !state.cases.some((item) => item.case_id === state.activeCaseId)
-      )
-    ) {
-      state.activeCaseId = state.cases[0].case_id;
-    }
-  } else if (!stateChangedDuringRequest) {
+  if (
+    state.activeCaseId
+    && !state.cases.some((item) => item.case_id === state.activeCaseId)
+  ) {
+    state.activeCaseId = null;
+  }
+  if (!state.cases.length && !stateChangedDuringRequest) {
     state.activeCaseId = null;
   }
 
@@ -1217,6 +1966,22 @@ async function loadCases() {
   for (const cachedCaseId of state.caseVideos.keys()) {
     if (!validCaseIds.has(cachedCaseId)) {
       state.caseVideos.delete(cachedCaseId);
+    }
+  }
+  for (const cachedCaseId of triageCache.keys()) {
+    if (!validCaseIds.has(cachedCaseId)) {
+      triageCache.delete(cachedCaseId);
+    }
+  }
+  for (const key of triageErrors.keys()) {
+    const [cachedCaseId] = String(key).split("::", 1);
+    if (!validCaseIds.has(cachedCaseId)) {
+      triageErrors.delete(key);
+    }
+  }
+  for (const cachedCaseId of triageSelection.keys()) {
+    if (!validCaseIds.has(cachedCaseId)) {
+      triageSelection.delete(cachedCaseId);
     }
   }
 
@@ -1242,6 +2007,7 @@ async function loadCasesWithRetry(maxAttempts = 3) {
 
 function renderVideoList(videos) {
   if (!videoList) {
+    renderExistingIndexSelectionList(Array.isArray(videos) ? videos : []);
     return;
   }
   videoList.innerHTML = "";
@@ -1250,6 +2016,7 @@ function renderVideoList(videos) {
     empty.className = "empty";
     empty.textContent = "No uploaded videos yet.";
     videoList.appendChild(empty);
+    renderExistingIndexSelectionList(videos);
     return;
   }
 
@@ -1299,6 +2066,7 @@ function renderVideoList(videos) {
     row.appendChild(actions);
     videoList.appendChild(row);
   });
+  renderExistingIndexSelectionList(videos);
 }
 
 function getCaseVideos(caseId = null) {
@@ -1308,6 +2076,921 @@ function getCaseVideos(caseId = null) {
   }
   const videos = state.caseVideos.get(String(resolvedCaseId));
   return Array.isArray(videos) ? videos : [];
+}
+
+function makeTriageKey(caseId, filename) {
+  return `${String(caseId || "").trim()}::${String(filename || "").trim()}`;
+}
+
+function ensureCaseTriageCache(caseId) {
+  const normalizedCaseId = String(caseId || "").trim();
+  if (!normalizedCaseId) {
+    return null;
+  }
+  let caseCache = triageCache.get(normalizedCaseId);
+  if (!caseCache) {
+    caseCache = new Map();
+    triageCache.set(normalizedCaseId, caseCache);
+  }
+  return caseCache;
+}
+
+function getTriagePayload(caseId, filename) {
+  const caseCache = ensureCaseTriageCache(caseId);
+  if (!caseCache) {
+    return null;
+  }
+  return caseCache.get(String(filename || "").trim()) || null;
+}
+
+function setTriagePayload(caseId, filename, payload) {
+  const caseCache = ensureCaseTriageCache(caseId);
+  if (!caseCache) {
+    return;
+  }
+  caseCache.set(String(filename || "").trim(), payload);
+}
+
+function clearCaseTriageCache(caseId) {
+  const normalizedCaseId = String(caseId || "").trim();
+  if (!normalizedCaseId) {
+    return;
+  }
+  triageCache.delete(normalizedCaseId);
+  triageSelection.delete(normalizedCaseId);
+  for (const key of triageErrors.keys()) {
+    if (String(key).startsWith(`${normalizedCaseId}::`)) {
+      triageErrors.delete(key);
+    }
+  }
+}
+
+function ensureSelectedTriageVideo(caseId, videos) {
+  const normalizedCaseId = String(caseId || "").trim();
+  if (!normalizedCaseId) {
+    return "";
+  }
+  const list = Array.isArray(videos) ? videos : [];
+  if (!list.length) {
+    triageSelection.delete(normalizedCaseId);
+    return "";
+  }
+  const current = String(triageSelection.get(normalizedCaseId) || "").trim();
+  if (current && list.some((item) => item && item.filename === current)) {
+    return current;
+  }
+  const firstFilename = String(list[0]?.filename || "").trim();
+  if (firstFilename) {
+    triageSelection.set(normalizedCaseId, firstFilename);
+    return firstFilename;
+  }
+  triageSelection.delete(normalizedCaseId);
+  return "";
+}
+
+function getSelectedTriageVideo(caseId = null) {
+  const resolvedCaseId = String(caseId || state.activeCaseId || "").trim();
+  if (!resolvedCaseId) {
+    return null;
+  }
+  const videos = getCaseVideos(resolvedCaseId);
+  if (!videos.length) {
+    return null;
+  }
+  const selectedFilename = ensureSelectedTriageVideo(resolvedCaseId, videos);
+  if (!selectedFilename) {
+    return null;
+  }
+  return videos.find((item) => item && item.filename === selectedFilename) || null;
+}
+
+function triageIntensityColor(intensity, kind = "activity") {
+  const value = Math.max(0, Math.min(1, Number(intensity) || 0));
+  if (kind === "audio") {
+    const hue = 210 - (value * 55);
+    const sat = 72;
+    const light = 84 - (value * 38);
+    return `hsl(${hue} ${sat}% ${light}%)`;
+  }
+  const hue = 130 - (value * 118);
+  const sat = 72;
+  const light = 80 - (value * 35);
+  return `hsl(${hue} ${sat}% ${light}%)`;
+}
+
+function updateTriageTimelinePlayheads(forcedTimestampSeconds = null) {
+  if (!triageDetail) {
+    return;
+  }
+  const layers = triageDetail.querySelectorAll(".timeline-playhead-layer");
+  if (!layers.length) {
+    return;
+  }
+
+  const activeCaseId = String(state.activeCaseId || "").trim();
+  const selectedVideo = getSelectedTriageVideo(activeCaseId);
+  const selectedFilename = String(selectedVideo?.filename || "").trim();
+  const playerCaseId = String(triagePlayer?.dataset.caseId || "").trim();
+  const playerFilename = String(triagePlayer?.dataset.filename || "").trim();
+  const isSameVideo =
+    Boolean(activeCaseId)
+    && Boolean(selectedFilename)
+    && selectedFilename === playerFilename
+    && playerCaseId === activeCaseId;
+
+  const fallbackTime = Number(triagePlayer?.currentTime || 0);
+  const requestedTime = forcedTimestampSeconds === null
+    ? fallbackTime
+    : Number(forcedTimestampSeconds);
+  const safeTime = Math.max(0, Number.isFinite(requestedTime) ? requestedTime : 0);
+
+  layers.forEach((layer) => {
+    const totalSeconds = Number(layer.dataset.totalSeconds || 0);
+    const line = layer.querySelector(".timeline-playhead-line");
+    const dot = layer.querySelector(".timeline-playhead-dot");
+    const tooltip = layer.querySelector(".timeline-playhead-tooltip");
+    const shouldShow = isSameVideo && Number.isFinite(totalSeconds) && totalSeconds > 0;
+    layer.classList.toggle("visible", shouldShow);
+    if (!shouldShow || !line || !dot || !tooltip) {
+      return;
+    }
+
+    const progress = Math.max(0, Math.min(1, safeTime / totalSeconds));
+    const width = Math.max(1, layer.clientWidth || layer.getBoundingClientRect().width || 1);
+    const inset = 6;
+    const usableWidth = Math.max(1, width - (inset * 2));
+    const x = inset + (usableWidth * progress);
+    line.style.left = `${x}px`;
+    dot.style.left = `${x}px`;
+    tooltip.style.left = `${x}px`;
+    tooltip.textContent = formatTime(safeTime);
+  });
+}
+
+function drawTriageTimeline(canvas, values, peaks, kind = "activity", options = {}) {
+  if (!canvas) {
+    return;
+  }
+  const safeValues = Array.isArray(values) ? values : [];
+  const safeLineTimestamps = Array.isArray(options?.lineTimestamps) ? options.lineTimestamps : [];
+  const safeTotalSeconds = Math.max(0, Number(options?.totalSeconds || 0));
+  const width = 820;
+  const height = 56;
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) {
+    return;
+  }
+
+  ctx.clearRect(0, 0, width, height);
+  ctx.fillStyle = "#f3f7fb";
+  ctx.fillRect(0, 0, width, height);
+  ctx.fillStyle = "#d3dfe9";
+  ctx.fillRect(0, height - 1, width, 1);
+
+  if (!safeValues.length) {
+    return;
+  }
+
+  for (let i = 0; i < safeValues.length; i += 1) {
+    const intensity = Math.max(0, Math.min(1, Number(safeValues[i]) || 0));
+    const x1 = Math.floor((i / safeValues.length) * width);
+    const x2 = Math.floor(((i + 1) / safeValues.length) * width);
+    const barWidth = Math.max(1, x2 - x1);
+    const barHeight = Math.max(1, Math.round(intensity * (height - 6)));
+    ctx.fillStyle = triageIntensityColor(intensity, kind);
+    ctx.fillRect(x1, height - barHeight - 1, barWidth, barHeight);
+  }
+
+  if (!(safeTotalSeconds > 0) || !safeLineTimestamps.length) {
+    return;
+  }
+
+  const seenX = new Set();
+  for (const ts of safeLineTimestamps) {
+    const numericTs = Number(ts);
+    if (!Number.isFinite(numericTs) || numericTs < 0) {
+      continue;
+    }
+    const ratio = Math.max(0, Math.min(1, numericTs / safeTotalSeconds));
+    const x = Math.max(0, Math.min(width - 1, Math.round(ratio * (width - 1))));
+    const key = String(x);
+    if (seenX.has(key)) {
+      continue;
+    }
+    seenX.add(key);
+    ctx.strokeStyle = "rgba(34, 74, 106, 0.36)";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(x + 0.5, 0);
+    ctx.lineTo(x + 0.5, height);
+    ctx.stroke();
+  }
+}
+
+function triageLocalPeakTimestamps(
+  values,
+  {
+    bucketSeconds = 1,
+    durationSeconds = 0,
+    maxCount = 24,
+    minGapSeconds = 1.2,
+    minIntensity = 0.08,
+    minProminence = 0.012,
+  } = {},
+) {
+  const safeValues = Array.isArray(values) ? values : [];
+  if (!safeValues.length) {
+    return [];
+  }
+  const safeBucketSeconds = Math.max(0.001, Number(bucketSeconds || 1));
+  const safeDurationSeconds = Math.max(0, Number(durationSeconds || 0));
+  const minGapBuckets = Math.max(1, Math.round(minGapSeconds / safeBucketSeconds));
+
+  const candidates = [];
+  for (let i = 0; i < safeValues.length; i += 1) {
+    const center = Math.max(0, Math.min(1, Number(safeValues[i]) || 0));
+    if (center < minIntensity) {
+      continue;
+    }
+    const left = i > 0 ? Math.max(0, Math.min(1, Number(safeValues[i - 1]) || 0)) : center;
+    const right = i < (safeValues.length - 1)
+      ? Math.max(0, Math.min(1, Number(safeValues[i + 1]) || 0))
+      : center;
+    const isLocalMax = center >= left && center >= right && (center > left || center > right);
+    if (!isLocalMax) {
+      continue;
+    }
+    const prominence = center - Math.max(left, right);
+    if (prominence < minProminence && center < (minIntensity * 1.8)) {
+      continue;
+    }
+    const score = center + (Math.max(0, prominence) * 0.65);
+    candidates.push({ index: i, score });
+  }
+
+  if (!candidates.length) {
+    return [];
+  }
+
+  candidates.sort((a, b) => b.score - a.score);
+  const selected = [];
+  const out = [];
+  for (const item of candidates) {
+    if (selected.some((idx) => Math.abs(idx - item.index) < minGapBuckets)) {
+      continue;
+    }
+    selected.push(item.index);
+    const rawTs = item.index * safeBucketSeconds;
+    const ts = safeDurationSeconds > 0
+      ? Math.min(safeDurationSeconds, rawTs)
+      : rawTs;
+    out.push(Math.max(0, ts));
+    if (out.length >= maxCount) {
+      break;
+    }
+  }
+  return out.sort((a, b) => a - b);
+}
+
+function triagePeakTimestamps(
+  peaks,
+  {
+    values = [],
+    bucketSeconds = 1,
+    durationSeconds = 0,
+  } = {},
+) {
+  const timestamps = [];
+  const seen = new Set();
+  const addTimestamp = (value) => {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric) || numeric < 0) {
+      return;
+    }
+    const rounded = Math.round(numeric * 1000) / 1000;
+    const key = String(rounded);
+    if (seen.has(key)) {
+      return;
+    }
+    seen.add(key);
+    timestamps.push(rounded);
+  };
+
+  if (Array.isArray(peaks)) {
+    for (const peak of peaks) {
+      addTimestamp(peak?.timestamp_seconds);
+    }
+  }
+
+  const fallbackLocals = triageLocalPeakTimestamps(values, {
+    bucketSeconds,
+    durationSeconds,
+    maxCount: 24,
+    minGapSeconds: 1.2,
+    minIntensity: 0.08,
+    minProminence: 0.012,
+  });
+  for (const ts of fallbackLocals) {
+    addTimestamp(ts);
+  }
+  return timestamps.sort((a, b) => a - b);
+}
+
+function isMediaPlayerPlaying(player) {
+  return Boolean(
+    player
+    && !player.paused
+    && !player.ended
+    && Number(player.readyState || 0) >= 1,
+  );
+}
+
+function playTriageAt(video, timestampSeconds, options = {}) {
+  if (!video || !state.activeCaseId) {
+    return;
+  }
+  const safeTimestamp = Math.max(0, Number(timestampSeconds) || 0);
+  const shouldAutoPlay = options.autoPlay === true;
+  const fallbackVideoUrl = `/media/cases/${encodeURIComponent(state.activeCaseId)}/videos/${encodeURIComponent(video.filename)}`;
+  const videoUrl = String(video.video_url || fallbackVideoUrl);
+  if (triagePlayer && triagePlayerMeta) {
+    playInPlayer(
+      triagePlayer,
+      triagePlayerMeta,
+      video.filename,
+      videoUrl,
+      safeTimestamp,
+      { autoPlay: shouldAutoPlay },
+    );
+  }
+  updateTriageTimelinePlayheads(safeTimestamp);
+  playVideoAt(video.filename, videoUrl, safeTimestamp, { autoPlay: shouldAutoPlay });
+}
+
+function createTriageTimelineRow({
+  title,
+  values,
+  peaks,
+  kind,
+  video,
+  bucketSeconds,
+  durationSeconds,
+}) {
+  const row = document.createElement("div");
+  row.className = "timeline-row";
+  const label = document.createElement("div");
+  label.className = "timeline-label";
+  const titleEl = document.createElement("span");
+  titleEl.textContent = title;
+  const detailEl = document.createElement("span");
+  detailEl.className = "timeline-label-detail";
+  const primaryPeak = Array.isArray(peaks) && peaks.length ? peaks[0] : null;
+  detailEl.textContent = primaryPeak && Number.isFinite(Number(primaryPeak.timestamp_seconds))
+    ? `Peak @ ${formatTime(Number(primaryPeak.timestamp_seconds))}`
+    : "No peak detected";
+  const safeValues = Array.isArray(values) ? values : [];
+  const safeBucketSeconds = Math.max(0.001, Number(bucketSeconds || 1));
+  const safeDurationSeconds = Math.max(0, Number(durationSeconds || 0));
+  const totalSeconds = safeDurationSeconds > 0
+    ? safeDurationSeconds
+    : (safeValues.length * safeBucketSeconds);
+  const peakTimestamps = triagePeakTimestamps(peaks, {
+    values: safeValues,
+    bucketSeconds: safeBucketSeconds,
+    durationSeconds: safeDurationSeconds,
+  });
+
+  const rightMeta = document.createElement("div");
+  rightMeta.className = "timeline-label-right";
+  rightMeta.appendChild(detailEl);
+  const nav = document.createElement("div");
+  nav.className = "timeline-peak-nav";
+  const prevBtn = document.createElement("button");
+  prevBtn.type = "button";
+  prevBtn.className = "timeline-peak-nav-btn";
+  prevBtn.textContent = "<";
+  prevBtn.title = "Previous high occurrence";
+  prevBtn.setAttribute("aria-label", `Previous high ${title.toLowerCase()} occurrence`);
+  const nextBtn = document.createElement("button");
+  nextBtn.type = "button";
+  nextBtn.className = "timeline-peak-nav-btn";
+  nextBtn.textContent = ">";
+  nextBtn.title = "Next high occurrence";
+  nextBtn.setAttribute("aria-label", `Next high ${title.toLowerCase()} occurrence`);
+  prevBtn.disabled = peakTimestamps.length === 0;
+  nextBtn.disabled = peakTimestamps.length === 0;
+  nav.appendChild(prevBtn);
+  nav.appendChild(nextBtn);
+  rightMeta.appendChild(nav);
+  label.appendChild(titleEl);
+  label.appendChild(rightMeta);
+
+  const canvas = document.createElement("canvas");
+  canvas.className = "timeline-canvas";
+  canvas.style.touchAction = "none";
+  drawTriageTimeline(canvas, values, peaks, kind, {
+    lineTimestamps: peakTimestamps,
+    totalSeconds,
+  });
+  const canvasWrap = document.createElement("div");
+  canvasWrap.className = "timeline-canvas-wrap";
+  const playheadLayer = document.createElement("div");
+  playheadLayer.className = "timeline-playhead-layer";
+  playheadLayer.dataset.totalSeconds = String(totalSeconds);
+  const playheadLine = document.createElement("div");
+  playheadLine.className = "timeline-playhead-line";
+  const playheadDot = document.createElement("div");
+  playheadDot.className = "timeline-playhead-dot";
+  const playheadTooltip = document.createElement("div");
+  playheadTooltip.className = "timeline-playhead-tooltip";
+  playheadTooltip.textContent = "0:00";
+  playheadLayer.appendChild(playheadLine);
+  playheadLayer.appendChild(playheadDot);
+  playheadLayer.appendChild(playheadTooltip);
+  canvasWrap.appendChild(canvas);
+  canvasWrap.appendChild(playheadLayer);
+  let scrubbing = false;
+  let lastSeekSeconds = -1;
+  let scrubShouldAutoPlay = false;
+  let lastRequestedPeakIndex = -1;
+
+  const timestampFromClientX = (clientX) => {
+    const rect = canvas.getBoundingClientRect();
+    if (!rect.width || !(totalSeconds > 0)) {
+      return null;
+    }
+    const ratio = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+    return ratio * totalSeconds;
+  };
+
+  const jumpToClientX = (clientX, force = false, autoPlay = false) => {
+    const timestampSeconds = timestampFromClientX(clientX);
+    if (!Number.isFinite(timestampSeconds)) {
+      return;
+    }
+    const clampedSeconds = Math.max(0, Math.min(totalSeconds, timestampSeconds));
+    if (!force && lastSeekSeconds >= 0 && Math.abs(clampedSeconds - lastSeekSeconds) < 0.04) {
+      return;
+    }
+    lastSeekSeconds = clampedSeconds;
+    if (peakTimestamps.length) {
+      let nearestIndex = 0;
+      let nearestDelta = Number.POSITIVE_INFINITY;
+      for (let i = 0; i < peakTimestamps.length; i += 1) {
+        const delta = Math.abs(Number(peakTimestamps[i]) - clampedSeconds);
+        if (delta < nearestDelta) {
+          nearestDelta = delta;
+          nearestIndex = i;
+        }
+      }
+      lastRequestedPeakIndex = nearestIndex;
+    } else {
+      lastRequestedPeakIndex = -1;
+    }
+    playTriageAt(video, clampedSeconds, { autoPlay });
+  };
+
+  const getCurrentReferenceTime = () => {
+    const activeCaseId = String(state.activeCaseId || "").trim();
+    const currentCaseId = String(triagePlayer?.dataset.caseId || "").trim();
+    const currentFilename = String(triagePlayer?.dataset.filename || "").trim();
+    const rowFilename = String(video?.filename || "").trim();
+    if (
+      !activeCaseId
+      || currentCaseId !== activeCaseId
+      || !currentFilename
+      || currentFilename !== rowFilename
+    ) {
+      return 0;
+    }
+    return Math.max(0, Number(triagePlayer?.currentTime || 0));
+  };
+
+  const seekToPeak = (direction) => {
+    if (!peakTimestamps.length) {
+      return;
+    }
+    const epsilon = 0.05;
+    const now = getCurrentReferenceTime();
+    let targetIndex = -1;
+    if (direction < 0) {
+      for (let i = peakTimestamps.length - 1; i >= 0; i -= 1) {
+        if (peakTimestamps[i] < (now - epsilon)) {
+          targetIndex = i;
+          break;
+        }
+      }
+    } else {
+      for (let i = 0; i < peakTimestamps.length; i += 1) {
+        if (peakTimestamps[i] > (now + epsilon)) {
+          targetIndex = i;
+          break;
+        }
+      }
+    }
+    if (targetIndex < 0 || targetIndex >= peakTimestamps.length) {
+      return;
+    }
+
+    // If the player hasn't caught up from the previous jump yet, force a true step.
+    const lastTargetStillCurrent = (
+      lastRequestedPeakIndex >= 0
+      && lastRequestedPeakIndex < peakTimestamps.length
+      && Math.abs(now - Number(peakTimestamps[lastRequestedPeakIndex])) <= 0.45
+    );
+    if (lastTargetStillCurrent && targetIndex === lastRequestedPeakIndex) {
+      const candidate = targetIndex + (direction < 0 ? -1 : 1);
+      if (candidate >= 0 && candidate < peakTimestamps.length) {
+        targetIndex = candidate;
+      }
+    }
+
+    const target = Number(peakTimestamps[targetIndex]);
+    if (!Number.isFinite(target)) {
+      return;
+    }
+    const keepPlaying = isMediaPlayerPlaying(triagePlayer);
+    lastRequestedPeakIndex = targetIndex;
+    playTriageAt(video, target, { autoPlay: keepPlaying });
+  };
+
+  prevBtn.addEventListener("click", () => {
+    seekToPeak(-1);
+  });
+  nextBtn.addEventListener("click", () => {
+    seekToPeak(1);
+  });
+
+  if (typeof window !== "undefined" && "PointerEvent" in window) {
+    const endScrub = (event) => {
+      if (!scrubbing) {
+        return;
+      }
+      scrubbing = false;
+      if (
+        event
+        && Number.isFinite(Number(event.pointerId))
+        && canvas.hasPointerCapture
+        && canvas.hasPointerCapture(event.pointerId)
+      ) {
+        try {
+          canvas.releasePointerCapture(event.pointerId);
+        } catch {
+          // no-op
+        }
+      }
+    };
+
+    canvas.addEventListener("pointerdown", (event) => {
+      if (!(totalSeconds > 0)) {
+        return;
+      }
+      scrubbing = true;
+      lastSeekSeconds = -1;
+      scrubShouldAutoPlay = isMediaPlayerPlaying(triagePlayer);
+      if (canvas.setPointerCapture) {
+        try {
+          canvas.setPointerCapture(event.pointerId);
+        } catch {
+          // no-op
+        }
+      }
+      jumpToClientX(event.clientX, true, scrubShouldAutoPlay);
+      event.preventDefault();
+    });
+
+    canvas.addEventListener("pointermove", (event) => {
+      if (!scrubbing) {
+        return;
+      }
+      jumpToClientX(event.clientX, false, scrubShouldAutoPlay);
+    });
+
+    canvas.addEventListener("pointerup", endScrub);
+    canvas.addEventListener("pointercancel", endScrub);
+    canvas.addEventListener("lostpointercapture", () => {
+      scrubbing = false;
+    });
+  } else {
+    canvas.addEventListener("click", (event) => {
+      if (!(totalSeconds > 0)) {
+        return;
+      }
+      jumpToClientX(event.clientX, true, isMediaPlayerPlaying(triagePlayer));
+    });
+  }
+  row.appendChild(label);
+  row.appendChild(canvasWrap);
+  return row;
+}
+
+function renderTriageList() {
+  if (!triageList) {
+    return;
+  }
+  triageList.innerHTML = "";
+  if (!state.activeCaseId) {
+    triageList.appendChild(createInsightEmptyElement("Select a case first."));
+    return;
+  }
+  const videos = getCaseVideos(state.activeCaseId);
+  if (!videos.length) {
+    triageList.appendChild(createInsightEmptyElement("No videos available for triage."));
+    return;
+  }
+  const selected = ensureSelectedTriageVideo(state.activeCaseId, videos);
+  const sortedVideos = [...videos].sort((a, b) => String(a.filename).localeCompare(String(b.filename)));
+
+  sortedVideos.forEach((video) => {
+    const itemButton = document.createElement("button");
+    itemButton.type = "button";
+    itemButton.className = "triage-video-item";
+    if (video.filename === selected) {
+      itemButton.classList.add("active");
+    }
+    itemButton.addEventListener("click", () => {
+      void selectTriageVideo(video.filename);
+    });
+
+    const thumbUrl = String(video.preview_thumbnail_url || "").trim();
+    if (thumbUrl) {
+      const image = document.createElement("img");
+      image.className = "triage-video-thumb";
+      image.loading = "lazy";
+      image.src = thumbUrl;
+      image.alt = `${video.filename} preview thumbnail`;
+      itemButton.appendChild(image);
+    } else {
+      const placeholder = document.createElement("div");
+      placeholder.className = "triage-video-thumb placeholder";
+      placeholder.textContent = "No thumbnail";
+      itemButton.appendChild(placeholder);
+    }
+
+    const meta = document.createElement("div");
+    meta.className = "triage-video-meta";
+    const title = document.createElement("div");
+    title.className = "triage-video-title";
+    title.textContent = video.filename;
+    const triageKey = makeTriageKey(state.activeCaseId, video.filename);
+    const cached = getTriagePayload(state.activeCaseId, video.filename);
+    const loading = triageLoading.has(triageKey);
+    const sub = document.createElement("div");
+    sub.className = "triage-video-sub";
+    if (cached) {
+      const durationLabel = formatTime(Number(cached.duration_seconds || 0));
+      sub.textContent = `Ready | ${durationLabel}`;
+    } else if (loading) {
+      sub.textContent = "Loading timeline...";
+    } else {
+      sub.textContent = "Timeline not loaded";
+    }
+    meta.appendChild(title);
+    meta.appendChild(sub);
+    itemButton.appendChild(meta);
+    triageList.appendChild(itemButton);
+  });
+}
+
+function renderTriageDetail() {
+  if (!triageDetail) {
+    return;
+  }
+  triageDetail.innerHTML = "";
+  if (!state.activeCaseId) {
+    triageDetail.appendChild(createInsightEmptyElement("Select a case first."));
+    return;
+  }
+  const selectedVideo = getSelectedTriageVideo(state.activeCaseId);
+  if (!selectedVideo) {
+    triageDetail.appendChild(createInsightEmptyElement("Select a video from the left list."));
+    return;
+  }
+  const triageKey = makeTriageKey(state.activeCaseId, selectedVideo.filename);
+  const loading = triageLoading.has(triageKey);
+  const error = triageErrors.get(triageKey);
+  const cached = getTriagePayload(state.activeCaseId, selectedVideo.filename);
+
+  const header = document.createElement("div");
+  header.className = "triage-detail-head";
+  const title = document.createElement("h3");
+  title.className = "triage-detail-title";
+  title.textContent = selectedVideo.filename;
+  const sub = document.createElement("div");
+  sub.className = "triage-detail-sub";
+  if (cached) {
+    sub.textContent = `Duration ${formatTime(Number(cached.duration_seconds || 0))} | Buckets ${Number(cached.bucket_count || 0)} | 1s`;
+  } else if (loading) {
+    sub.textContent = "Building timelines...";
+  } else {
+    sub.textContent = "Timeline not generated yet.";
+  }
+  header.appendChild(title);
+  header.appendChild(sub);
+  triageDetail.appendChild(header);
+
+  const actions = document.createElement("div");
+  actions.className = "triage-actions";
+  const loadBtn = document.createElement("button");
+  loadBtn.type = "button";
+  loadBtn.className = "ghost";
+  loadBtn.textContent = loading ? "Refreshing..." : (cached ? "Refresh Timelines" : "Generate Timelines");
+  loadBtn.disabled = loading;
+  loadBtn.addEventListener("click", () => {
+    void loadTriageForVideo(state.activeCaseId, selectedVideo.filename, true);
+  });
+  actions.appendChild(loadBtn);
+  triageDetail.appendChild(actions);
+
+  if (!cached) {
+    if (error) {
+      const err = document.createElement("div");
+      err.className = "triage-muted";
+      err.textContent = `Failed: ${error}`;
+      triageDetail.appendChild(err);
+    } else if (!loading) {
+      triageDetail.appendChild(createInsightEmptyElement("Generate timelines to view activity and audio intensity."));
+    }
+    return;
+  }
+
+  const activityValues = Array.isArray(cached?.activity_timeline?.values)
+    ? cached.activity_timeline.values
+    : [];
+  const audioValues = Array.isArray(cached?.audio_timeline?.values)
+    ? cached.audio_timeline.values
+    : [];
+  const activityPeaks = Array.isArray(cached?.peaks?.activity) ? cached.peaks.activity : [];
+  const audioPeaks = Array.isArray(cached?.peaks?.audio) ? cached.peaks.audio : [];
+  const bucketSeconds = Number(cached.bucket_seconds || 1);
+  const durationSeconds = Number(cached.duration_seconds || 0);
+
+  triageDetail.appendChild(
+    createTriageTimelineRow({
+      title: "Activity Intensity",
+      values: activityValues,
+      peaks: activityPeaks,
+      kind: "activity",
+      video: selectedVideo,
+      bucketSeconds,
+      durationSeconds,
+    }),
+  );
+
+  triageDetail.appendChild(
+    createTriageTimelineRow({
+      title: "Audio Intensity",
+      values: audioValues,
+      peaks: audioPeaks,
+      kind: "audio",
+      video: selectedVideo,
+      bucketSeconds,
+      durationSeconds,
+    }),
+  );
+
+  const audioInfo = String(cached?.audio_timeline?.status || "ok");
+  if (audioInfo !== "ok") {
+    const note = document.createElement("div");
+    note.className = "triage-muted";
+    note.textContent = `Audio timeline unavailable: ${String(cached?.audio_timeline?.message || "no audio stream")}`;
+    triageDetail.appendChild(note);
+  }
+  if (!cached?.analysis_available?.face_people || !cached?.analysis_available?.vehicles) {
+    const note = document.createElement("div");
+    note.className = "triage-muted";
+    note.textContent = "Tip: run Face & People / Vehicle analysis to improve activity timeline signal.";
+    triageDetail.appendChild(note);
+  }
+  updateTriageTimelinePlayheads();
+}
+
+function renderTriagePanels() {
+  renderTriageList();
+  renderTriageDetail();
+}
+
+async function selectTriageVideo(filename) {
+  if (!state.activeCaseId) {
+    return;
+  }
+  const videos = getCaseVideos(state.activeCaseId);
+  const target = String(filename || "").trim();
+  const selectedVideo = videos.find((item) => item && item.filename === target);
+  if (!selectedVideo) {
+    return;
+  }
+  triageSelection.set(state.activeCaseId, target);
+  const videoUrl = String(selectedVideo.video_url || "");
+  if (videoUrl && triagePlayer && triagePlayerMeta) {
+    playInPlayer(
+      triagePlayer,
+      triagePlayerMeta,
+      selectedVideo.filename,
+      videoUrl,
+      0,
+      { autoPlay: false },
+    );
+    updateTriageTimelinePlayheads(0);
+  }
+  renderTriagePanels();
+  await loadTriageForVideo(state.activeCaseId, target, false);
+}
+
+async function loadTriageForVideo(caseId, filename, force = false) {
+  const normalizedCaseId = String(caseId || "").trim();
+  const normalizedFilename = String(filename || "").trim();
+  if (!normalizedCaseId || !normalizedFilename) {
+    return null;
+  }
+  const key = makeTriageKey(normalizedCaseId, normalizedFilename);
+  if (triageLoading.has(key)) {
+    return getTriagePayload(normalizedCaseId, normalizedFilename);
+  }
+  if (!force) {
+    const cached = getTriagePayload(normalizedCaseId, normalizedFilename);
+    if (cached) {
+      return cached;
+    }
+  }
+
+  triageLoading.add(key);
+  if (normalizedCaseId === state.activeCaseId) {
+    renderTriagePanels();
+  }
+  try {
+    const payload = await fetchJson("/triage_timeline", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        case_id: normalizedCaseId,
+        filename: normalizedFilename,
+        bucket_seconds: 1.0,
+        force: Boolean(force),
+      }),
+    });
+    setTriagePayload(normalizedCaseId, normalizedFilename, payload);
+    triageErrors.delete(key);
+    return payload;
+  } catch (error) {
+    triageErrors.set(key, formatError(error));
+    return null;
+  } finally {
+    triageLoading.delete(key);
+    if (normalizedCaseId === state.activeCaseId) {
+      renderTriagePanels();
+    }
+  }
+}
+
+async function refreshTriageList(force = false) {
+  if (!state.activeCaseId) {
+    renderTriagePanels();
+    setTriageStatus("", "");
+    return;
+  }
+  const caseId = state.activeCaseId;
+  const videos = getCaseVideos(caseId);
+  const selected = ensureSelectedTriageVideo(caseId, videos);
+  renderTriagePanels();
+  if (!videos.length) {
+    setTriageStatus("No videos to triage in this case.", "ok");
+    return;
+  }
+  if (!selected) {
+    setTriageStatus("Select a video to build timelines.", "ok");
+    return;
+  }
+  const selectedVideo = videos.find((item) => item && item.filename === selected) || null;
+  if (selectedVideo && triagePlayer && triagePlayerMeta) {
+    const selectedUrl = String(selectedVideo.video_url || "");
+    const currentFilename = String(triagePlayer.dataset.filename || "").trim();
+    const hasSource = Boolean(String(triagePlayer.getAttribute("src") || "").trim());
+    if (selectedUrl && (currentFilename !== selectedVideo.filename || !hasSource)) {
+      playInPlayer(
+        triagePlayer,
+        triagePlayerMeta,
+        selectedVideo.filename,
+        selectedUrl,
+        0,
+        { autoPlay: false },
+      );
+      updateTriageTimelinePlayheads(0);
+    }
+  }
+  const refreshToken = ++triageRefreshToken;
+  setTriageStatus(`Building triage timelines for ${selected}...`, "working");
+  const payload = await loadTriageForVideo(caseId, selected, force);
+  if (refreshToken !== triageRefreshToken || caseId !== state.activeCaseId) {
+    return;
+  }
+  if (!payload) {
+    setTriageStatus(`Failed to build timelines for ${selected}.`, "error");
+    return;
+  }
+  setTriageStatus(`Triage ready for ${selected}.`, "ok");
 }
 
 function createInsightEmptyElement(message) {
@@ -1867,9 +3550,13 @@ async function refreshVideos(caseId = null, expectedSwitchVersion = null) {
   const videos = Array.isArray(payload.videos) ? payload.videos : [];
   state.caseVideos.set(String(resolvedCaseId), videos);
   renderVideoList(videos);
+  renderTriagePanels();
   if (resolvedCaseId === state.activeCaseId) {
     renderAnalysisSelectionLists();
     await refreshAnalysisWalls();
+    if (state.activeMainTab === "triage") {
+      await refreshTriageList(false);
+    }
   }
   return videos;
 }
@@ -1987,7 +3674,9 @@ async function selectCase(caseId) {
   }
 
   saveActiveCasePlaybackSnapshot();
+  stopBackgroundIndexPolling();
   state.activeCaseId = nextCaseId;
+  setWorkspaceView("analysis");
   markCaseStateChanged();
   restoreSearchForCase(nextCaseId);
   resetPlayerForCase(nextCaseId);
@@ -2004,13 +3693,21 @@ async function selectCase(caseId) {
       return;
     }
     restorePlaybackForCase(nextCaseId, videos);
+    const indexStatus = await syncBackgroundIndexStatus(nextCaseId);
+    const backgroundRunning = isBackgroundIndexRunning(indexStatus);
+    if (state.activeMainTab === "triage") {
+      setTriageStatus(`Case ${nextCaseId}: triage timelines ready.`, "ok");
+    }
     setAnalysisStatus("Face & People tab: select videos to run analysis.", "ok");
     setVehicleStatus("Vehicle tab: select videos to run analysis.", "ok");
-    setStatus(`Case ${nextCaseId} ready.`, "ok");
+    if (!backgroundRunning) {
+      setStatus(`Case ${nextCaseId} ready.`, "ok");
+    }
   } catch (error) {
     if (switchVersion !== caseSwitchVersion || state.activeCaseId !== nextCaseId) {
       return;
     }
+    setTriageStatus(`Case switch failed: ${formatError(error)}`, "error");
     setAnalysisStatus(`Case switch failed: ${formatError(error)}`, "error");
     setVehicleStatus(`Case switch failed: ${formatError(error)}`, "error");
     setStatus(`Case switch failed: ${formatError(error)}`, "error");
@@ -2050,7 +3747,11 @@ async function deleteVideo(filename) {
     }
 
     removeVideoFromSearchCache(caseId, safeFilename);
+    const caseTriageCache = ensureCaseTriageCache(caseId);
+    caseTriageCache?.delete(safeFilename);
+    triageErrors.delete(makeTriageKey(caseId, safeFilename));
     restoreSearchForCase(caseId);
+    clearCaseTriageCache(caseId);
     await refreshVideos(caseId);
     setStatus(`Deleted ${safeFilename} from ${caseId}.`, "ok");
   } catch (error) {
@@ -2130,6 +3831,7 @@ async function deleteCase(caseId) {
 
   try {
     setStatus(`Deleting case ${targetCaseId}...`, "working");
+    const deletingActiveCase = state.activeCaseId === targetCaseId;
     saveActiveCasePlaybackSnapshot();
     const payload = await fetchJson(`/cases/${encodeURIComponent(targetCaseId)}`, {
       method: "DELETE",
@@ -2145,26 +3847,35 @@ async function deleteCase(caseId) {
     playbackCache.delete(targetCaseId);
     searchCache.delete(targetCaseId);
     state.caseVideos.delete(targetCaseId);
+    clearCaseTriageCache(targetCaseId);
+    backgroundIndexTerminalSeen.delete(targetCaseId);
     markCaseStateChanged();
     renderCaseList();
 
     if (!state.cases.length) {
       state.activeCaseId = null;
+      stopBackgroundIndexPolling();
+      hideTaskProgressUi();
       clearResults();
       renderVideoList([]);
       resetPlayerForCase(null);
       resetAuxPlayers(null);
       setCaseUrl(null);
       syncWorkspaceVisibility();
+      setTriageStatus("", "");
       setAnalysisStatus("", "");
       setStatus(`Deleted case ${targetCaseId}. No cases remaining.`, "ok");
       return;
     }
 
-    const fallbackCaseId = state.cases[state.cases.length - 1].case_id;
-    state.activeCaseId = null;
-    await selectCase(fallbackCaseId);
-    setStatus(`Deleted case ${targetCaseId}. Switched to ${fallbackCaseId}.`, "ok");
+    if (deletingActiveCase) {
+      backToCaseRepository();
+      setStatus(`Deleted case ${targetCaseId}. Select another case from repository.`, "ok");
+      return;
+    }
+
+    syncWorkspaceVisibility();
+    setStatus(`Deleted case ${targetCaseId}.`, "ok");
   } catch (error) {
     setStatus(`Delete case failed: ${formatError(error)}`, "error");
   }
@@ -2185,21 +3896,31 @@ async function uploadAndIndex() {
     return;
   }
 
+  const selectedSourceIndices = getSelectedPendingUploadSourceIndices(files);
+  const selectedForIndexCount = selectedSourceIndices.size;
+
   try {
+    uploadFlowActive = true;
+    stopBackgroundIndexPolling();
     const caseId = ensureActiveCaseId();
-    let engineLabel = getLoadedEmbeddingEngineLabel();
+    const engineLabel = getLoadedEmbeddingEngineLabel();
     const totalUploadBytes = files.reduce((sum, file) => sum + Number(file.size || 0), 0);
     const uploadStartedAt = Date.now();
-    const uploadWeight = 25;
-    const indexWeight = 75;
-    setStatus(`Uploading videos to ${caseId} (engine: ${engineLabel})...`, "working");
+    setStatus(
+      `Transferring videos to ${caseId} (engine: ${engineLabel}) | semantic index selected: ${selectedForIndexCount}/${files.length}.`,
+      "working",
+    );
     setTaskProgressUi(
-      "Uploading videos",
+      "Transferring files to server",
       0,
       `${files.length} file(s) | ${formatBytes(totalUploadBytes)}`,
     );
     const formData = new FormData();
     files.forEach((file) => formData.append("files", file));
+    const TRANSFER_STAGE_MAX = 70;
+    const SERVER_PROCESSING_STAGE = 80;
+    const SERVER_RECEIVED_STAGE = 90;
+    const INDEX_QUEUE_STAGE = 95;
 
     const uploadResult = await postFormDataWithProgress(
       withCaseQuery("/upload", caseId),
@@ -2209,110 +3930,189 @@ async function uploadAndIndex() {
         const estimatedTotal = event.lengthComputable && event.total > 0
           ? event.total
           : totalUploadBytes;
-        const loadedBytes = Math.min(event.loaded, estimatedTotal || event.loaded);
+        const totalBytesForDisplay = Math.max(0, Number(estimatedTotal || totalUploadBytes || event.loaded || 0));
+        const loadedBytes = Math.min(Number(event.loaded || 0), totalBytesForDisplay || Number(event.loaded || 0));
         const fraction = estimatedTotal > 0 ? loadedBytes / estimatedTotal : 0;
-        const progressPercent = clampPercent(fraction * uploadWeight);
+        const transferFraction = Math.max(0, Math.min(1, fraction));
         const speedBytesPerSecond = loadedBytes / elapsedSec;
-        const remainingBytes = Math.max(0, estimatedTotal - loadedBytes);
+        const remainingBytes = Math.max(0, totalBytesForDisplay - loadedBytes);
         const etaSeconds = speedBytesPerSecond > 0 ? remainingBytes / speedBytesPerSecond : null;
-        const meta = [
-          `${formatBytes(loadedBytes)} / ${formatBytes(estimatedTotal || totalUploadBytes)}`,
-          `${formatBytes(speedBytesPerSecond)}/s`,
-          formatEtaLabel(etaSeconds),
-        ].join(" | ");
-        setTaskProgressUi("Uploading videos", progressPercent, meta);
+        const uploadSent = totalBytesForDisplay > 0 && loadedBytes >= totalBytesForDisplay;
+        const metaParts = [];
+        if (uploadSent) {
+          metaParts.push(`${formatBytes(totalBytesForDisplay)} sent from browser`);
+          metaParts.push(
+            "Browser upload finished; server is still receiving/writing/converting (files may not appear in /videos yet)",
+          );
+          setTaskProgressUi(
+            "Server ingest + conversion in progress",
+            SERVER_PROCESSING_STAGE,
+            metaParts.join(" | "),
+          );
+          return;
+        } else {
+          metaParts.push(`${formatBytes(loadedBytes)} / ${formatBytes(totalBytesForDisplay)} transferred`);
+          metaParts.push(`${formatBytes(speedBytesPerSecond)}/s`);
+          metaParts.push(formatEtaLabel(etaSeconds));
+        }
+        const meta = metaParts.join(" | ");
+        setTaskProgressUi(
+          "Transferring files to server",
+          clampPercent((transferFraction * TRANSFER_STAGE_MAX)),
+          meta,
+        );
       },
+    );
+
+    setTaskProgressUi(
+      "Upload received by server",
+      SERVER_RECEIVED_STAGE,
+      "Server finished ingest/transcode. Preparing background indexing...",
     );
 
     const uploaded = uploadResult.uploaded || [];
     const errors = uploadResult.errors || [];
     const transcoded = uploadResult.transcoded || [];
-    const indexErrors = [];
-    let indexedCount = 0;
-    let skippedCount = 0;
-    let indexedWindows = 0;
-    const indexStartedAt = Date.now();
+    const selectedIndexTargets = resolveSelectedSemanticIndexTargets(
+      uploadResult,
+      selectedSourceIndices,
+      files,
+    );
 
-    if (!uploaded.length) {
-      setTaskProgressUi(
-        "Upload complete",
-        100,
-        "No new files were uploaded for indexing.",
-      );
+    if (uploaded.length) {
+      clearCaseTriageCache(caseId);
     }
+    videoInput.value = "";
+    clearPendingUploadItems();
+    await refreshVideos(caseId);
 
-    for (let i = 0; i < uploaded.length; i += 1) {
-      const filename = uploaded[i];
-      const progressStart = uploadWeight + ((i / uploaded.length) * indexWeight);
-      const etaBefore = estimateEtaSeconds(indexStartedAt, i, uploaded.length);
+    const allErrors = [...errors];
+    let backgroundMessage = "No new videos queued for indexing.";
+    if (uploaded.length > 0 && selectedIndexTargets.length > 0) {
       setTaskProgressUi(
-        "Indexing uploaded videos",
-        progressStart,
-        `Processing ${filename} (${i + 1}/${uploaded.length}) | ${formatEtaLabel(etaBefore)}`,
-      );
-      setStatus(
-        `Base indexing ${filename} (${i + 1}/${uploaded.length}) in ${caseId} using ${engineLabel}...`,
-        "working",
+        "Queueing semantic indexing",
+        INDEX_QUEUE_STAGE,
+        `Preparing ${selectedIndexTargets.length} selected uploaded video(s) for background indexing...`,
       );
       try {
-        const processResult = await fetchJson("/process_video", {
+        const startPayload = await fetchJson("/index/start", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             case_id: caseId,
-            filename,
+            filenames: selectedIndexTargets,
             frame_interval_seconds: frameInterval,
             batch_size: 32,
             force: false,
-            analysis_face_people: false,
-            analysis_vehicles: false,
-            analysis_only: false,
           }),
         });
-        const responseEngineLabel = formatEmbeddingEngineLabel(processResult.embedding_engine);
-        if (responseEngineLabel) {
-          engineLabel = responseEngineLabel;
-        }
-
-        if (processResult.status === "skipped") {
-          skippedCount += 1;
+        const started = Boolean(startPayload?.started);
+        if (started) {
+          backgroundMessage = `Background semantic indexing started for ${selectedIndexTargets.length} selected video(s).`;
         } else {
-          indexedCount += 1;
+          backgroundMessage = String(startPayload?.message || "Background indexing already running.");
         }
-        indexedWindows += Number(processResult.indexed_windows || 0);
+        startBackgroundIndexPolling(caseId);
       } catch (error) {
-        indexErrors.push(`${filename}: ${formatError(error)}`);
+        allErrors.push(`index start: ${formatError(error)}`);
+        backgroundMessage = "Upload finished, but background indexing failed to start.";
       }
-
-      const processedCount = i + 1;
-      const etaAfter = estimateEtaSeconds(indexStartedAt, processedCount, uploaded.length);
-      const progressAfter = uploadWeight + ((processedCount / uploaded.length) * indexWeight);
-      setTaskProgressUi(
-        "Indexing uploaded videos",
-        progressAfter,
-        `Processed ${processedCount}/${uploaded.length} | indexed ${indexedCount}, skipped ${skippedCount} | ${formatEtaLabel(etaAfter)}`,
-      );
+    } else if (uploaded.length > 0) {
+      backgroundMessage = "Upload finished. No videos were selected for semantic indexing.";
     }
 
-    const allErrors = [...errors, ...indexErrors];
-    const successNote = `Case ${caseId}: uploaded ${uploaded.length}, indexed ${indexedCount}, skipped ${skippedCount}, temporal windows ${indexedWindows}, transcoded ${transcoded.length}, engine ${engineLabel}.`;
+    const summary = `Case ${caseId}: uploaded ${uploaded.length}, transcoded ${transcoded.length}, selected for semantic indexing ${selectedIndexTargets.length}, engine ${engineLabel}. ${backgroundMessage}`;
     const errorNote = allErrors.length ? ` Errors: ${allErrors.join(" | ")}` : "";
-    setStatus(`${successNote}${errorNote}`, allErrors.length ? "error" : "ok");
-    videoInput.value = "";
-    setTaskProgressUi(
-      "Refreshing case view",
-      99,
-      `Finalizing results for ${caseId}...`,
-    );
-    await refreshVideos(caseId);
+    setStatus(`${summary}${errorNote}`, allErrors.length ? "error" : "ok");
+    const progressMeta = uploaded.length > 0
+      ? backgroundMessage
+      : "No new videos were uploaded. You can continue triage immediately.";
     completeTaskProgressUi(
-      allErrors.length ? "Completed with warnings" : "Upload + indexing completed",
-      successNote,
+      allErrors.length ? "Upload completed with warnings" : "Upload completed",
+      progressMeta,
     );
+    uploadFlowActive = false;
+    await syncBackgroundIndexStatus(caseId);
   } catch (error) {
     setStatus(`Upload/index failed: ${formatError(error)}`, "error");
     setTaskProgressUi(
       "Upload/index failed",
+      100,
+      formatError(error),
+    );
+  } finally {
+    uploadFlowActive = false;
+  }
+}
+
+async function runExistingSemanticIndex() {
+  let caseId;
+  try {
+    caseId = ensureActiveCaseId();
+  } catch (error) {
+    setStatus(formatError(error), "error");
+    return;
+  }
+
+  const filenames = getSelectedExistingIndexFilenames();
+  if (!filenames.length) {
+    setStatus("Select one or more uploaded videos to index first.", "error");
+    return;
+  }
+
+  const frameInterval = Number.parseFloat(intervalInput?.value || "1");
+  const safeFrameInterval = Number.isFinite(frameInterval) && frameInterval > 0
+    ? frameInterval
+    : 1;
+
+  const confirmed = window.confirm(
+    `Run semantic indexing for ${filenames.length} selected uploaded video(s)?`,
+  );
+  if (!confirmed) {
+    return;
+  }
+
+  try {
+    stopBackgroundIndexPolling();
+    setStatus(
+      `Queueing semantic indexing for ${filenames.length} selected uploaded video(s)...`,
+      "working",
+    );
+    setTaskProgressUi(
+      "Queueing semantic indexing",
+      95,
+      `Preparing ${filenames.length} existing selected video(s) for background indexing...`,
+    );
+
+    const startPayload = await fetchJson("/index/start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        case_id: caseId,
+        filenames,
+        frame_interval_seconds: safeFrameInterval,
+        batch_size: 32,
+        force: false,
+      }),
+    });
+
+    const started = Boolean(startPayload?.started);
+    if (started) {
+      setStatus(
+        `Background semantic indexing started for ${filenames.length} selected uploaded video(s).`,
+        "working",
+      );
+    } else {
+      const message = String(startPayload?.message || "Background indexing already running.");
+      setStatus(message, "ok");
+    }
+
+    startBackgroundIndexPolling(caseId);
+    await syncBackgroundIndexStatus(caseId);
+  } catch (error) {
+    setStatus(`Failed to start semantic indexing: ${formatError(error)}`, "error");
+    setTaskProgressUi(
+      "Queueing semantic indexing failed",
       100,
       formatError(error),
     );
@@ -2350,7 +4150,7 @@ async function runSelectedAnalysisForCategory(category) {
   }
 
   try {
-    const frameInterval = Number.parseFloat(intervalInput?.value || "2");
+    const frameInterval = Number.parseFloat(intervalInput?.value || "1");
     const safeFrameInterval = Number.isFinite(frameInterval) && frameInterval > 0 ? frameInterval : 2;
     let processed = 0;
     let skipped = 0;
@@ -2416,6 +4216,7 @@ async function runSearch() {
   const query = queryInput.value.trim();
   if (!query) {
     setStatus("Type a search query.", "error");
+    setSemanticSearchMeta("Type a search query first.", "error");
     return;
   }
 
@@ -2425,6 +4226,7 @@ async function runSearch() {
   try {
     const caseId = ensureActiveCaseId();
     setStatus(`Searching in ${caseId}...`, "working");
+    setSemanticSearchMeta("Analyzing query intent...", "working");
     const payload = await fetchJson("/search", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -2448,8 +4250,18 @@ async function runSearch() {
     }
     const metaSuffix = metaParts.length ? ` (${metaParts.join(", ")})` : "";
     setStatus(`Case ${caseId}: found ${payload.count || results.length} result(s).${metaSuffix}`, "ok");
+    const fallbackUsed = Boolean(payload.fallback_used);
+    const searchTypeLabel = intent || "unknown";
+    const modeLabel = mode || "unknown";
+    const fallbackLabel = fallbackUsed ? "yes" : "no";
+    const engineMeta = engineLabel ? ` | Engine: ${engineLabel}` : "";
+    setSemanticSearchMeta(
+      `Search Type: ${searchTypeLabel} | Mode: ${modeLabel} | Fallback: ${fallbackLabel}${engineMeta}`,
+      "ok",
+    );
   } catch (error) {
     setStatus(`Search failed: ${formatError(error)}`, "error");
+    setSemanticSearchMeta(`Search failed: ${formatError(error)}`, "error");
   }
 }
 
@@ -2487,21 +4299,13 @@ async function createCase() {
         : caseNameToCreate;
     const createdAt = typeof payload.created_at === "string" ? payload.created_at.trim() : "";
     upsertCase(newCaseId, caseName, createdAt);
-    saveActiveCasePlaybackSnapshot();
-    state.activeCaseId = newCaseId;
     state.caseVideos.set(String(newCaseId), []);
     markCaseStateChanged();
-    restoreSearchForCase(newCaseId);
-    resetPlayerForCase(newCaseId);
-    resetAuxPlayers(newCaseId);
-    setCaseUrl(newCaseId);
     renderCaseList();
     syncWorkspaceVisibility();
-    await refreshVideos(newCaseId);
-    setAnalysisStatus("Face & People tab: select videos to run analysis.", "ok");
-    setVehicleStatus("Vehicle tab: select videos to run analysis.", "ok");
-    setStatus(`Created case ${newCaseId}.`, "ok");
+    setStatus(`Created case ${newCaseId}. Open it from Case Repository.`, "ok");
   } catch (error) {
+    setTriageStatus(`Create case failed: ${formatError(error)}`, "error");
     setAnalysisStatus(`Create case failed: ${formatError(error)}`, "error");
     setVehicleStatus(`Create case failed: ${formatError(error)}`, "error");
     setStatus(`Create case failed: ${formatError(error)}`, "error");
@@ -2539,8 +4343,47 @@ function setupListeners() {
     console.log("New Case clicked");
     createCase();
   });
+  workspaceBackBtn?.addEventListener("click", () => {
+    backToCaseRepository();
+  });
+  workspaceAnalysisBtn?.addEventListener("click", () => {
+    if (!state.activeCaseId) {
+      setStatus("Select a case from Case Repository first.", "error");
+      return;
+    }
+    setWorkspaceView("analysis");
+  });
+  workspaceReportBtn?.addEventListener("click", () => {
+    if (!state.activeCaseId) {
+      setStatus("Select a case from Case Repository first.", "error");
+      return;
+    }
+    setWorkspaceView("report");
+  });
+  workspaceSettingsBtn?.addEventListener("click", () => {
+    if (!state.activeCaseId) {
+      setStatus("Select a case from Case Repository first.", "error");
+      return;
+    }
+    setWorkspaceView("settings");
+  });
+  workspaceExitBtn?.addEventListener("click", () => {
+    requestGracefulExit();
+  });
 
   uploadBtn?.addEventListener("click", uploadAndIndex);
+  videoInput?.addEventListener("change", () => {
+    refreshPendingUploadItemsFromInput();
+  });
+  preUploadSelectAll?.addEventListener("change", () => {
+    setAllPendingUploadSelection(Boolean(preUploadSelectAll.checked));
+  });
+  existingIndexSelectAll?.addEventListener("change", () => {
+    setAllExistingIndexSelection(Boolean(existingIndexSelectAll.checked));
+  });
+  runExistingIndexBtn?.addEventListener("click", () => {
+    runExistingSemanticIndex();
+  });
   saveEmbeddingSettingsBtn?.addEventListener("click", () => {
     saveEmbeddingSettings();
   });
@@ -2549,6 +4392,10 @@ function setupListeners() {
   });
   runVehiclesSelectedBtn?.addEventListener("click", () => {
     runSelectedAnalysisForCategory("vehicles");
+  });
+  mainTabTriageBtn?.addEventListener("click", async () => {
+    setActiveMainTab("triage");
+    await refreshTriageList(false);
   });
   mainTabSemanticBtn?.addEventListener("click", () => {
     setActiveMainTab("semantic");
@@ -2564,11 +4411,37 @@ function setupListeners() {
 
   refreshBtn?.addEventListener("click", async () => {
     try {
-      await refreshVideos(ensureActiveCaseId());
-      setStatus("Video list refreshed.", "ok");
+      const activeCaseId = ensureActiveCaseId();
+      await refreshVideos(activeCaseId);
+      const indexStatus = await syncBackgroundIndexStatus(activeCaseId);
+      if (!isBackgroundIndexRunning(indexStatus)) {
+        setStatus("Video list refreshed.", "ok");
+      }
     } catch (error) {
       setStatus(`Refresh failed: ${formatError(error)}`, "error");
     }
+  });
+  refreshTriageBtn?.addEventListener("click", async () => {
+    try {
+      await refreshTriageList(true);
+    } catch (error) {
+      setTriageStatus(`Triage refresh failed: ${formatError(error)}`, "error");
+    }
+  });
+  triagePlayer?.addEventListener("timeupdate", () => {
+    updateTriageTimelinePlayheads();
+  });
+  triagePlayer?.addEventListener("seeking", () => {
+    updateTriageTimelinePlayheads();
+  });
+  triagePlayer?.addEventListener("seeked", () => {
+    updateTriageTimelinePlayheads();
+  });
+  triagePlayer?.addEventListener("loadedmetadata", () => {
+    updateTriageTimelinePlayheads();
+  });
+  window.addEventListener("resize", () => {
+    updateTriageTimelinePlayheads();
   });
 
   searchBtn?.addEventListener("click", runSearch);
@@ -2620,7 +4493,7 @@ async function init() {
   bindDomElements();
   syncWorkspaceVisibility();
   setupListeners();
-  setActiveMainTab("semantic");
+  setActiveMainTab("triage");
   await loadEmbeddingSettings();
 
   clearResults();
@@ -2635,18 +4508,27 @@ async function init() {
       resetAuxPlayers(null);
       setCaseUrl(null);
       syncWorkspaceVisibility();
+      setTriageStatus("", "");
       setAnalysisStatus("", "");
       setVehicleStatus("", "");
       setStatus("No cases yet. Click + New Case to begin.", "ok");
       return;
     }
 
-    const initialCaseId = state.activeCaseId;
     state.activeCaseId = null;
-    await selectCase(initialCaseId);
+    resetPlayerForCase(null);
+    resetAuxPlayers(null);
+    setCaseUrl(null);
+    syncWorkspaceVisibility();
     await restorePlaybackFromUrl();
-    setStatus("Ready.", "ok");
+    if (state.activeCaseId) {
+      await refreshTriageList(false);
+      setStatus("Ready.", "ok");
+    } else {
+      setStatus("Select a case from Case Repository to open workspace tabs.", "ok");
+    }
   } catch (error) {
+    setTriageStatus(`Startup failed: ${formatError(error)}`, "error");
     setAnalysisStatus(`Startup failed: ${formatError(error)}`, "error");
     setVehicleStatus(`Startup failed: ${formatError(error)}`, "error");
     setStatus(`Startup failed: ${formatError(error)}. Check backend at http://127.0.0.1:8000/.`, "error");

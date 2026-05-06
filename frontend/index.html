@@ -4,12 +4,13 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Local Video Semantic Search</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260502a" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260506e" />
   </head>
   <body>
-    <main class="app-shell">
+    <main class="app-shell repository-mode">
       <aside class="panel case-sidebar">
-        <h2>Cases</h2>
+        <h2>Case Repository</h2>
+        <p class="analysis-note">Select a case to open workspace tabs.</p>
         <button id="createCaseBtn" type="button">+ New Case</button>
         <div id="caseList" class="case-list"></div>
       </aside>
@@ -20,43 +21,87 @@
         aria-orientation="vertical"
         aria-label="Resize case sidebar"
       ></div>
+      <aside class="panel workspace-utility-sidebar" aria-label="Workspace actions">
+        <button id="workspaceBackBtn" type="button" class="ghost">Back</button>
+        <button id="workspaceAnalysisBtn" type="button" class="ghost active">Analysis</button>
+        <button id="workspaceReportBtn" type="button" class="ghost">Report</button>
+        <button id="workspaceSettingsBtn" type="button" class="ghost">Settings</button>
+        <button id="workspaceExitBtn" type="button" class="danger">Exit</button>
+      </aside>
 
       <section class="workspace">
         <section class="panel app-tabs-panel">
-          <p id="activeCaseMeta" class="active-case-meta"></p>
+          <div class="workspace-topbar">
+            <h1 class="project-title">VisioX</h1>
+          </div>
           <div class="app-tabs">
-            <button id="mainTabSemanticBtn" type="button" class="ghost active">Semantic Search</button>
+            <button id="mainTabTriageBtn" type="button" class="ghost active">Video Triage</button>
+            <button id="mainTabSemanticBtn" type="button" class="ghost">Semantic Search</button>
             <button id="mainTabFacePeopleBtn" type="button" class="ghost">Face &amp; People</button>
             <button id="mainTabVehiclesBtn" type="button" class="ghost">Vehicle</button>
           </div>
+          <p id="activeCaseMeta" class="active-case-meta"></p>
+        </section>
+        <section id="workspaceSettingsPage" class="panel workspace-settings-page" hidden>
+          <h2>Settings</h2>
+          <p class="analysis-note">Configure embedding engine and compute device.</p>
+          <section class="embedding-settings-panel">
+            <h2>Embedding Engine</h2>
+            <div class="embedding-controls">
+              <label for="embeddingProfileSelect">Model Type</label>
+              <select id="embeddingProfileSelect"></select>
+              <label for="embeddingDeviceSelect">Compute Device</label>
+              <select id="embeddingDeviceSelect">
+                <option value="auto">Auto (GPU if available)</option>
+                <option value="cuda">GPU (CUDA)</option>
+                <option value="cpu">CPU</option>
+              </select>
+              <button id="saveEmbeddingSettingsBtn" type="button" class="ghost">
+                Save Embedding Settings
+              </button>
+            </div>
+            <p id="embeddingSettingsMeta" class="status"></p>
+          </section>
+        </section>
+        <section id="workspaceReportPage" class="panel workspace-report-page" hidden>
+          <h2>Report</h2>
+          <p class="analysis-note">In Development</p>
         </section>
 
-        <section id="tabSemantic" class="tab-pane active">
+        <section id="tabTriage" class="tab-pane active">
           <section class="panel upload-panel">
-            <h1>Video Ingestion &amp; Indexing</h1>
+            <h1 class="ingestion-title">Video Ingestion &amp; Indexing</h1>
             <div class="upload-controls">
               <input id="videoInput" type="file" multiple accept="video/*" />
               <label for="intervalInput">Frame Interval (s)</label>
-              <input id="intervalInput" type="number" min="0.25" step="0.25" value="2" />
+              <input id="intervalInput" type="number" min="0.25" step="0.25" value="1" />
               <button id="uploadBtn" type="button">Upload + Base Index</button>
               <button id="refreshBtn" type="button" class="ghost">Refresh List</button>
             </div>
-            <section class="embedding-settings-panel">
-              <h2>Embedding Engine</h2>
-              <div class="embedding-controls">
-                <label for="embeddingProfileSelect">Model Type</label>
-                <select id="embeddingProfileSelect"></select>
-                <label for="embeddingDeviceSelect">Compute Device</label>
-                <select id="embeddingDeviceSelect">
-                  <option value="auto">Auto (GPU if available)</option>
-                  <option value="cuda">GPU (CUDA)</option>
-                  <option value="cpu">CPU</option>
-                </select>
-                <button id="saveEmbeddingSettingsBtn" type="button" class="ghost">
-                  Save Embedding Settings
+            <section id="preUploadIndexPanel" class="preupload-index-panel" hidden>
+              <div class="preupload-index-head">
+                <h3>Choose Files To Semantic Index (Before Upload)</h3>
+                <label class="preupload-select-all">
+                  <input id="preUploadSelectAll" type="checkbox" />
+                  Select All
+                </label>
+              </div>
+              <div id="preUploadIndexList" class="analysis-video-list"></div>
+            </section>
+            <section id="existingIndexPanel" class="preupload-index-panel" hidden>
+              <div class="preupload-index-head">
+                <h3>Index Existing Uploaded Videos</h3>
+                <label class="preupload-select-all">
+                  <input id="existingIndexSelectAll" type="checkbox" />
+                  Select All
+                </label>
+              </div>
+              <div id="existingIndexList" class="analysis-video-list"></div>
+              <div class="analysis-select-actions">
+                <button id="runExistingIndexBtn" type="button" class="ghost">
+                  Run Semantic Index For Selected
                 </button>
               </div>
-              <p id="embeddingSettingsMeta" class="status"></p>
             </section>
             <p id="uploadStatus" class="status"></p>
             <section id="taskProgress" class="task-progress" hidden>
@@ -72,6 +117,36 @@
             <div id="videoList" class="video-list"></div>
           </section>
 
+          <section class="panel triage-panel">
+            <div class="triage-head">
+              <h2>Video Triage</h2>
+              <button id="refreshTriageBtn" type="button" class="ghost">Refresh Timelines</button>
+            </div>
+            <p class="analysis-note">
+              Timelines are 1-second buckets. Click timeline to jump to that timestamp (paused).
+            </p>
+            <div class="triage-legend">
+              <span class="legend-item"><span class="legend-swatch low"></span>Low</span>
+              <span class="legend-item"><span class="legend-swatch medium"></span>Medium</span>
+              <span class="legend-item"><span class="legend-swatch high"></span>High</span>
+            </div>
+            <p id="triageStatus" class="status"></p>
+            <section class="triage-layout">
+              <aside>
+                <section id="triageList" class="triage-video-list"></section>
+              </aside>
+              <section id="triageMain" class="triage-main">
+                <section class="player-panel triage-main-player">
+                  <video id="triagePlayer" controls preload="metadata"></video>
+                  <p id="triagePlayerMeta" class="player-meta">Select a timeline point to preview.</p>
+                </section>
+                <section id="triageDetail" class="triage-detail"></section>
+              </section>
+            </section>
+          </section>
+        </section>
+
+        <section id="tabSemantic" class="tab-pane">
           <section class="panel search-panel">
             <h2>Semantic Search</h2>
             <div class="search-controls">
@@ -85,6 +160,7 @@
               <input id="topKInput" type="number" min="1" max="100" value="10" />
               <button id="searchBtn" type="button">Search</button>
             </div>
+            <p id="semanticSearchMeta" class="status">Search type will appear here after querying.</p>
           </section>
 
           <section class="panel player-panel">
@@ -182,6 +258,6 @@
         <p id="semanticPopupMeta" class="player-meta">Jump to a result to preview here.</p>
       </div>
     </div>
-    <script src="/static/script.js?v=20260503c"></script>
+    <script src="/static/script.js?v=20260506j"></script>
   </body>
 </html>
