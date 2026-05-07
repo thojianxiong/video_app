@@ -2893,6 +2893,14 @@ async function selectTriageVideo(filename) {
       0,
       { autoPlay: false },
     );
+    // Keep the main player in sync so hidden/background audio from the
+    // previously selected triage video is stopped immediately.
+    playVideoAt(
+      selectedVideo.filename,
+      videoUrl,
+      0,
+      { autoPlay: false },
+    );
     updateTriageTimelinePlayheads(0);
   }
   renderTriagePanels();
@@ -2972,6 +2980,13 @@ async function refreshTriageList(force = false) {
       playInPlayer(
         triagePlayer,
         triagePlayerMeta,
+        selectedVideo.filename,
+        selectedUrl,
+        0,
+        { autoPlay: false },
+      );
+      // Also reset/sync the shared main player to avoid stale background audio.
+      playVideoAt(
         selectedVideo.filename,
         selectedUrl,
         0,
