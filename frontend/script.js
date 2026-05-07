@@ -16,6 +16,7 @@ let taskProgressLabel = null;
 let taskProgressPercent = null;
 let taskProgressBar = null;
 let taskProgressMeta = null;
+let taskProgressStopBtn = null;
 let triageStatus = null;
 let triageList = null;
 let triageDetail = null;
@@ -102,9 +103,16 @@ let triageRefreshToken = 0;
 let indexStatusPollToken = 0;
 let indexStatusPollCaseId = "";
 let uploadFlowActive = false;
+let stopBackgroundIndexInFlight = false;
+let taskProgressStopCaseId = "";
 const backgroundIndexTerminalSeen = new Map();
+const backgroundIndexStatusByCase = new Map();
 const SIDEBAR_MIN_WIDTH = 220;
 const SIDEBAR_MAX_WIDTH = 560;
+const RESUMABLE_UPLOAD_STATE_KEY = "visiox_resumable_upload_v1";
+const DEFAULT_RESUMABLE_CHUNK_SIZE_BYTES = 8 * 1024 * 1024;
+const RESUMABLE_UPLOAD_CHUNK_RETRIES = 3;
+const RESUMABLE_UPLOAD_RETRY_DELAY_MS = 350;
 
 function bindDomElements() {
   videoInput = document.getElementById("videoInput");
@@ -125,6 +133,7 @@ function bindDomElements() {
   taskProgressPercent = document.getElementById("taskProgressPercent");
   taskProgressBar = document.getElementById("taskProgressBar");
   taskProgressMeta = document.getElementById("taskProgressMeta");
+  taskProgressStopBtn = document.getElementById("taskProgressStopBtn");
   triageStatus = document.getElementById("triageStatus");
   triageList = document.getElementById("triageList");
   triageDetail = document.getElementById("triageDetail");
@@ -577,6 +586,31 @@ function getSelectedExistingIndexFilenames() {
     .filter(Boolean);
 }
 
+function getActiveQueuedOrRunningIndexFilenames(caseId) {
+  const normalizedCaseId = String(caseId || "").trim();
+  if (!normalizedCaseId) {
+    return new Set();
+  }
+  const statusPayload = backgroundIndexStatusByCase.get(normalizedCaseId);
+  if (!isBackgroundIndexRunning(statusPayload)) {
+    return new Set();
+  }
+
+  const queued = new Set();
+  const filenames = Array.isArray(statusPayload?.filenames) ? statusPayload.filenames : [];
+  filenames.forEach((item) => {
+    const safeName = String(item || "").trim();
+    if (safeName) {
+      queued.add(safeName);
+    }
+  });
+  const currentFilename = String(statusPayload?.current_filename || "").trim();
+  if (currentFilename) {
+    queued.add(currentFilename);
+  }
+  return queued;
+}
+
 function renderExistingIndexSelectionList(videos) {
   if (!existingIndexPanel || !existingIndexList) {
     return;
@@ -608,10 +642,17 @@ function renderExistingIndexSelectionList(videos) {
   const unindexedVideos = list
     .filter((video) => !isVideoSemanticallyIndexed(video))
     .sort((a, b) => String(a.filename).localeCompare(String(b.filename)));
+  const queuedOrRunningFilenames = getActiveQueuedOrRunningIndexFilenames(activeCaseId);
+  const selectableUnindexedVideos = unindexedVideos.filter((video) => (
+    !queuedOrRunningFilenames.has(String(video?.filename || "").trim())
+  ));
 
-  if (!unindexedVideos.length) {
+  if (!selectableUnindexedVideos.length) {
+    const message = unindexedVideos.length && queuedOrRunningFilenames.size
+      ? "All unindexed videos are already queued/running for semantic indexing."
+      : "All uploaded videos are already semantically indexed.";
     existingIndexList.appendChild(
-      createInsightEmptyElement("All uploaded videos are already semantically indexed."),
+      createInsightEmptyElement(message),
     );
     if (runExistingIndexBtn) {
       runExistingIndexBtn.disabled = true;
@@ -620,7 +661,7 @@ function renderExistingIndexSelectionList(videos) {
     return;
   }
 
-  unindexedVideos.forEach((video) => {
+  selectableUnindexedVideos.forEach((video) => {
     const row = document.createElement("div");
     row.className = "analysis-video-item";
 
@@ -708,7 +749,18 @@ function formatEtaLabel(etaSeconds) {
   return `ETA: ${formatTime(Math.ceil(numeric))}`;
 }
 
-function setTaskProgressUi(label, percent, meta) {
+function setTaskProgressStopCase(caseId) {
+  if (!taskProgressStopBtn) {
+    return;
+  }
+  const normalizedCaseId = String(caseId || "").trim();
+  const canStop = Boolean(normalizedCaseId);
+  taskProgressStopCaseId = canStop ? normalizedCaseId : "";
+  taskProgressStopBtn.hidden = !canStop;
+  taskProgressStopBtn.disabled = !canStop || stopBackgroundIndexInFlight;
+}
+
+function setTaskProgressUi(label, percent, meta, options = null) {
   if (!taskProgress || !taskProgressLabel || !taskProgressPercent || !taskProgressBar || !taskProgressMeta) {
     return;
   }
@@ -722,6 +774,11 @@ function setTaskProgressUi(label, percent, meta) {
   taskProgressPercent.textContent = `${Math.round(safePercent)}%`;
   taskProgressBar.style.width = `${safePercent.toFixed(1)}%`;
   taskProgressMeta.textContent = String(meta || "");
+
+  const stopCaseId = options && typeof options === "object"
+    ? String(options.stopCaseId || "").trim()
+    : "";
+  setTaskProgressStopCase(stopCaseId);
 }
 
 function completeTaskProgressUi(label, meta) {
@@ -734,6 +791,7 @@ function completeTaskProgressUi(label, meta) {
       return;
     }
     taskProgress.hidden = true;
+    setTaskProgressStopCase("");
   }, 1600);
 }
 
@@ -746,6 +804,7 @@ function hideTaskProgressUi() {
     taskProgressHideTimerId = null;
   }
   taskProgress.hidden = true;
+  setTaskProgressStopCase("");
 }
 
 function isBackgroundIndexRunning(statusPayload) {
@@ -836,7 +895,12 @@ function renderBackgroundIndexStatus(caseId, statusPayload) {
   const meta = formatBackgroundIndexMeta(statusPayload);
   if (isBackgroundIndexRunning(statusPayload)) {
     backgroundIndexTerminalSeen.delete(normalizedCaseId);
-    setTaskProgressUi("Semantic indexing (background)", progressPercent, meta);
+    setTaskProgressUi(
+      "Semantic indexing (background)",
+      progressPercent,
+      meta,
+      { stopCaseId: normalizedCaseId },
+    );
     setStatus(`Semantic indexing is running in background for ${normalizedCaseId}.`, "working");
     return;
   }
@@ -924,15 +988,25 @@ async function syncBackgroundIndexStatus(caseId) {
   if (!normalizedCaseId) {
     stopBackgroundIndexPolling();
     hideTaskProgressUi();
+    backgroundIndexStatusByCase.clear();
     return null;
   }
 
   const statusPayload = await readBackgroundIndexStatus(normalizedCaseId);
   if (!statusPayload) {
+    backgroundIndexStatusByCase.delete(normalizedCaseId);
+    if (state.activeCaseId === normalizedCaseId) {
+      renderExistingIndexSelectionList(getCaseVideos(normalizedCaseId));
+    }
     if (state.activeCaseId === normalizedCaseId) {
       hideTaskProgressUi();
     }
     return null;
+  }
+
+  backgroundIndexStatusByCase.set(normalizedCaseId, statusPayload);
+  if (state.activeCaseId === normalizedCaseId) {
+    renderExistingIndexSelectionList(getCaseVideos(normalizedCaseId));
   }
 
   renderBackgroundIndexStatus(normalizedCaseId, statusPayload);
@@ -942,6 +1016,56 @@ async function syncBackgroundIndexStatus(caseId) {
     stopBackgroundIndexPolling();
   }
   return statusPayload;
+}
+
+async function stopBackgroundIndexFromProgress() {
+  const targetCaseId = String(taskProgressStopCaseId || state.activeCaseId || "").trim();
+  if (!targetCaseId) {
+    setStatus("No active case selected for stopping indexing.", "error");
+    return;
+  }
+
+  if (stopBackgroundIndexInFlight) {
+    return;
+  }
+
+  const confirmed = window.confirm(
+    `Stop semantic indexing for case ${targetCaseId}? Current in-flight video work may take a short while to settle.`,
+  );
+  if (!confirmed) {
+    return;
+  }
+
+  try {
+    stopBackgroundIndexInFlight = true;
+    setTaskProgressStopCase(targetCaseId);
+    setStatus(`Stopping semantic indexing for ${targetCaseId}...`, "working");
+    const payload = await fetchJson("/processes/index/cancel", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ case_id: targetCaseId, force: false }),
+    });
+    const queueCancelled = Math.max(0, Number(payload?.queue_cancelled_count || 0));
+    const requested = Boolean(payload?.cancel_requested);
+    const message = requested
+      ? `Stop requested for ${targetCaseId}. Queue entries cancelled: ${queueCancelled}. Current in-flight file will stop shortly.`
+      : `No active semantic indexing found for ${targetCaseId}.`;
+    setStatus(message, requested ? "ok" : "error");
+
+    const latestStatus = await syncBackgroundIndexStatus(targetCaseId);
+    if (!isBackgroundIndexRunning(latestStatus)) {
+      hideTaskProgressUi();
+    }
+
+    if (state.activeCaseId === targetCaseId) {
+      await refreshVideos(targetCaseId);
+    }
+  } catch (error) {
+    setStatus(`Stop indexing failed: ${formatError(error)}`, "error");
+  } finally {
+    stopBackgroundIndexInFlight = false;
+    setTaskProgressStopCase(taskProgressStopCaseId);
+  }
 }
 
 function normalizedVideoAnalysis(video) {
@@ -1277,6 +1401,224 @@ async function postFormDataWithProgress(url, formData, onProgress) {
       reject(new Error(`Upload failed: ${formatError(error)}`));
     }
   });
+}
+
+function buildResumableSourceKey(file) {
+  const name = String(file?.name || "").trim();
+  const size = Math.max(0, Number(file?.size || 0));
+  const lastModified = Math.max(0, Number(file?.lastModified || 0));
+  return `${name}::${size}::${lastModified}`;
+}
+
+function getSavedResumableUploadState() {
+  try {
+    const raw = window.localStorage.getItem(RESUMABLE_UPLOAD_STATE_KEY);
+    if (!raw) {
+      return null;
+    }
+    const payload = JSON.parse(raw);
+    if (!payload || typeof payload !== "object") {
+      return null;
+    }
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
+function saveResumableUploadState(payload) {
+  try {
+    window.localStorage.setItem(
+      RESUMABLE_UPLOAD_STATE_KEY,
+      JSON.stringify(payload || {}),
+    );
+  } catch {
+    // Ignore storage errors.
+  }
+}
+
+function clearResumableUploadState() {
+  try {
+    window.localStorage.removeItem(RESUMABLE_UPLOAD_STATE_KEY);
+  } catch {
+    // Ignore storage errors.
+  }
+}
+
+function normalizeSessionFiles(rawFiles) {
+  const list = Array.isArray(rawFiles) ? rawFiles : [];
+  const normalized = [];
+  for (const item of list) {
+    if (!item || typeof item !== "object") {
+      continue;
+    }
+    const fileId = String(item.file_id || "").trim();
+    const sourceFilename = String(item.source_filename || "").trim();
+    const sourceKey = String(item.source_key || "").trim();
+    if (!fileId || !sourceFilename || !sourceKey) {
+      continue;
+    }
+    normalized.push({
+      file_id: fileId,
+      source_filename: sourceFilename,
+      source_key: sourceKey,
+      source_size: Math.max(0, Number(item.source_size || 0)),
+      source_index: Math.max(0, Number(item.source_index || 0)),
+      total_chunks: Math.max(1, Number(item.total_chunks || 1)),
+      received_chunks: Math.max(0, Number(item.received_chunks || 0)),
+      received_bytes: Math.max(0, Number(item.received_bytes || 0)),
+      status: String(item.status || ""),
+    });
+  }
+  return normalized;
+}
+
+function doesResumeStateMatchFiles(resumeState, caseId, files) {
+  if (!resumeState || typeof resumeState !== "object") {
+    return false;
+  }
+  const resumeCaseId = String(resumeState.case_id || "").trim();
+  if (!resumeCaseId || resumeCaseId !== String(caseId || "").trim()) {
+    return false;
+  }
+  const resumeKeys = Array.isArray(resumeState.source_keys)
+    ? resumeState.source_keys.map((item) => String(item || "").trim()).filter(Boolean).sort()
+    : [];
+  if (!resumeKeys.length || resumeKeys.length !== files.length) {
+    return false;
+  }
+  const fileKeys = files.map((file) => buildResumableSourceKey(file)).sort();
+  if (fileKeys.length !== resumeKeys.length) {
+    return false;
+  }
+  for (let i = 0; i < fileKeys.length; i += 1) {
+    if (fileKeys[i] !== resumeKeys[i]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+async function resolveResumableUploadSession(caseId, files) {
+  const normalizedCaseId = String(caseId || "").trim();
+  if (!normalizedCaseId) {
+    throw new Error("No active case available.");
+  }
+  const safeFiles = Array.isArray(files) ? files : [];
+  if (!safeFiles.length) {
+    throw new Error("No files selected.");
+  }
+
+  const resumeState = getSavedResumableUploadState();
+  if (doesResumeStateMatchFiles(resumeState, normalizedCaseId, safeFiles)) {
+    const resumeSessionId = String(resumeState.session_id || "").trim();
+    if (resumeSessionId) {
+      try {
+        const statusPayload = await fetchJson(
+          `/upload_session/status?session_id=${encodeURIComponent(resumeSessionId)}`,
+        );
+        const statusCaseId = String(statusPayload.case_id || "").trim();
+        if (statusCaseId === normalizedCaseId) {
+          const statusFiles = normalizeSessionFiles(statusPayload.files);
+          if (statusFiles.length) {
+            return {
+              session: statusPayload,
+              files: statusFiles,
+              resumed: true,
+            };
+          }
+        }
+      } catch {
+        clearResumableUploadState();
+      }
+    }
+  }
+
+  const startPayload = await fetchJson("/upload_session/start", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      case_id: normalizedCaseId,
+      chunk_size_bytes: DEFAULT_RESUMABLE_CHUNK_SIZE_BYTES,
+      files: safeFiles.map((file, sourceIndex) => ({
+        source_index: sourceIndex,
+        source_filename: String(file.name || ""),
+        source_size: Math.max(0, Number(file.size || 0)),
+        source_last_modified_ms: Math.max(0, Number(file.lastModified || 0)),
+        source_key: buildResumableSourceKey(file),
+      })),
+    }),
+  });
+
+  const sessionId = String(startPayload.session_id || "").trim();
+  if (!sessionId) {
+    throw new Error("Invalid upload session response: missing session_id");
+  }
+  const sessionFiles = normalizeSessionFiles(startPayload.files);
+  if (!sessionFiles.length) {
+    throw new Error("Upload session created without file entries");
+  }
+
+  saveResumableUploadState({
+    session_id: sessionId,
+    case_id: normalizedCaseId,
+    source_keys: safeFiles.map((file) => buildResumableSourceKey(file)),
+    created_at: Date.now(),
+  });
+
+  return {
+    session: startPayload,
+    files: sessionFiles,
+    resumed: false,
+  };
+}
+
+async function postResumableChunkWithRetry({
+  sessionId,
+  fileId,
+  chunkIndex,
+  totalChunks,
+  payload,
+}) {
+  const chunkBody = payload instanceof Blob ? payload : new Blob([payload || new Uint8Array(0)]);
+  let lastError = null;
+  for (let attempt = 1; attempt <= RESUMABLE_UPLOAD_CHUNK_RETRIES; attempt += 1) {
+    try {
+      const response = await fetch(
+        `/upload_session/chunk?session_id=${encodeURIComponent(sessionId)}&file_id=${encodeURIComponent(fileId)}&chunk_index=${chunkIndex}&total_chunks=${totalChunks}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/octet-stream" },
+          body: chunkBody,
+        },
+      );
+      const rawBody = await response.text();
+      let parsed = null;
+      if (rawBody) {
+        try {
+          parsed = JSON.parse(rawBody);
+        } catch {
+          parsed = null;
+        }
+      }
+      if (!response.ok) {
+        const detail = parsed && typeof parsed === "object"
+          ? formatError(parsed.detail ?? parsed)
+          : rawBody || response.statusText || "chunk upload failed";
+        throw new Error(`[${response.status}] ${detail}`);
+      }
+      if (!parsed || typeof parsed !== "object") {
+        throw new Error(`[${response.status}] Invalid JSON response`);
+      }
+      return parsed;
+    } catch (error) {
+      lastError = error;
+      if (attempt < RESUMABLE_UPLOAD_CHUNK_RETRIES) {
+        await sleep(RESUMABLE_UPLOAD_RETRY_DELAY_MS * attempt);
+      }
+    }
+  }
+  throw new Error(`Chunk upload failed after retries: ${formatError(lastError)}`);
 }
 
 function normalizeEmbeddingProfiles(rawProfiles) {
@@ -1786,6 +2128,53 @@ function resetAuxPlayers(caseId = null) {
   }
 }
 
+function isPlayerTargetingVideo(player, caseId, filename) {
+  if (!player) {
+    return false;
+  }
+  const normalizedCaseId = String(caseId || "").trim();
+  const normalizedFilename = String(filename || "").trim();
+  if (!normalizedCaseId || !normalizedFilename) {
+    return false;
+  }
+  return (
+    String(player.dataset.caseId || "").trim() === normalizedCaseId
+    && String(player.dataset.filename || "").trim() === normalizedFilename
+  );
+}
+
+async function releaseVideoPlaybackLocks(caseId, filename) {
+  const normalizedCaseId = String(caseId || "").trim();
+  const normalizedFilename = String(filename || "").trim();
+  if (!normalizedCaseId || !normalizedFilename) {
+    return false;
+  }
+
+  let released = false;
+  if (isPlayerTargetingVideo(videoPlayer, normalizedCaseId, normalizedFilename)) {
+    resetPlayerForCase(normalizedCaseId);
+    setCaseUrl(normalizedCaseId);
+    released = true;
+  }
+
+  const auxMatched = [
+    triagePlayer,
+    facePeoplePlayer,
+    vehiclePlayer,
+    semanticPopupVideo,
+  ].some((player) => isPlayerTargetingVideo(player, normalizedCaseId, normalizedFilename));
+
+  if (auxMatched) {
+    resetAuxPlayers(normalizedCaseId);
+    released = true;
+  }
+
+  if (released) {
+    await new Promise((resolve) => window.setTimeout(resolve, 180));
+  }
+  return released;
+}
+
 function restorePlaybackForCase(caseId, videos) {
   const normalizedCaseId = String(caseId || "").trim();
   if (!normalizedCaseId) {
@@ -1984,6 +2373,11 @@ async function loadCases() {
       triageSelection.delete(cachedCaseId);
     }
   }
+  for (const cachedCaseId of backgroundIndexStatusByCase.keys()) {
+    if (!validCaseIds.has(cachedCaseId)) {
+      backgroundIndexStatusByCase.delete(cachedCaseId);
+    }
+  }
 
   console.log("Active case:", state.activeCaseId);
   syncWorkspaceVisibility();
@@ -2046,7 +2440,7 @@ function renderVideoList(videos) {
     openBtn.className = "ghost";
     openBtn.textContent = "Play";
     openBtn.addEventListener("click", () => {
-      playVideoAt(video.filename, video.video_url, 0);
+      playFromVideoList(video);
     });
 
     const deleteBtn = document.createElement("button");
@@ -2067,6 +2461,48 @@ function renderVideoList(videos) {
     videoList.appendChild(row);
   });
   renderExistingIndexSelectionList(videos);
+}
+
+function playFromVideoList(video) {
+  if (!video || !state.activeCaseId) {
+    return;
+  }
+  const caseId = String(state.activeCaseId || "").trim();
+  const filename = String(video.filename || "").trim();
+  if (!caseId || !filename) {
+    return;
+  }
+
+  const fallbackVideoUrl = `/media/cases/${encodeURIComponent(caseId)}/videos/${encodeURIComponent(filename)}`;
+  const videoUrl = String(video.video_url || fallbackVideoUrl);
+
+  // Video list belongs to triage workflow, so route playback to triage player.
+  triageSelection.set(caseId, filename);
+  renderTriagePanels();
+
+  if (triagePlayer && triagePlayerMeta) {
+    playInPlayer(
+      triagePlayer,
+      triagePlayerMeta,
+      filename,
+      videoUrl,
+      0,
+      { autoPlay: true },
+    );
+    updateTriageTimelinePlayheads(0);
+  }
+
+  // Keep semantic player synchronized but paused to avoid hidden background playback.
+  playVideoAt(filename, videoUrl, 0, { autoPlay: false });
+
+  void loadTriageForVideo(caseId, filename, false).then(() => {
+    if (
+      state.activeCaseId === caseId
+      && String(triageSelection.get(caseId) || "").trim() === filename
+    ) {
+      renderTriagePanels();
+    }
+  });
 }
 
 function getCaseVideos(caseId = null) {
@@ -2922,6 +3358,39 @@ async function loadTriageForVideo(caseId, filename, force = false) {
     if (cached) {
       return cached;
     }
+    try {
+      const persisted = await fetchJson("/triage_timeline_cached", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          case_id: normalizedCaseId,
+          filename: normalizedFilename,
+          bucket_seconds: 1.0,
+          force: false,
+        }),
+      });
+      const cacheStatus = String(persisted?.cache_status || "").toLowerCase();
+      if (cacheStatus === "hit" || persisted?.cached === true) {
+        setTriagePayload(normalizedCaseId, normalizedFilename, persisted);
+        triageErrors.delete(key);
+        if (normalizedCaseId === state.activeCaseId) {
+          renderTriagePanels();
+        }
+        return persisted;
+      }
+    } catch (error) {
+      const message = formatError(error);
+      if (
+        message.includes("[404]")
+        || message.includes("[400]")
+      ) {
+        triageErrors.set(key, message);
+        if (normalizedCaseId === state.activeCaseId) {
+          renderTriagePanels();
+        }
+        return null;
+      }
+    }
   }
 
   triageLoading.add(key);
@@ -2996,7 +3465,7 @@ async function refreshTriageList(force = false) {
     }
   }
   const refreshToken = ++triageRefreshToken;
-  setTriageStatus(`Building triage timelines for ${selected}...`, "working");
+  setTriageStatus(`Loading triage timelines for ${selected}...`, "working");
   const payload = await loadTriageForVideo(caseId, selected, force);
   if (refreshToken !== triageRefreshToken || caseId !== state.activeCaseId) {
     return;
@@ -3005,7 +3474,12 @@ async function refreshTriageList(force = false) {
     setTriageStatus(`Failed to build timelines for ${selected}.`, "error");
     return;
   }
-  setTriageStatus(`Triage ready for ${selected}.`, "ok");
+  const cacheStatus = String(payload.cache_status || "").toLowerCase();
+  if (cacheStatus === "hit" || payload.cached === true) {
+    setTriageStatus(`Triage loaded from saved cache for ${selected}.`, "ok");
+  } else {
+    setTriageStatus(`Triage ready for ${selected}.`, "ok");
+  }
 }
 
 function createInsightEmptyElement(message) {
@@ -3546,12 +4020,13 @@ function getSelectedInsightFilenames(category) {
     .filter((name) => Boolean(name));
 }
 
-async function refreshVideos(caseId = null, expectedSwitchVersion = null) {
+async function refreshVideos(caseId = null, expectedSwitchVersion = null, options = {}) {
   const resolvedCaseId = caseId || ensureActiveCaseId();
   if (!resolvedCaseId) {
     renderVideoList([]);
     return;
   }
+  const skipFollowups = Boolean(options && options.skipFollowups);
 
   const switchVersionAtRequest = expectedSwitchVersion;
   const payload = await fetchJson(withCaseQuery("/videos", resolvedCaseId));
@@ -3568,7 +4043,7 @@ async function refreshVideos(caseId = null, expectedSwitchVersion = null) {
   state.caseVideos.set(String(resolvedCaseId), videos);
   renderVideoList(videos);
   renderTriagePanels();
-  if (resolvedCaseId === state.activeCaseId) {
+  if (!skipFollowups && resolvedCaseId === state.activeCaseId) {
     renderAnalysisSelectionLists();
     await refreshAnalysisWalls();
     if (state.activeMainTab === "triage") {
@@ -3746,6 +4221,8 @@ async function deleteVideo(filename) {
   }
 
   try {
+    setStatus(`Preparing ${safeFilename} for delete...`, "working");
+    await releaseVideoPlaybackLocks(caseId, safeFilename);
     setStatus(`Deleting ${safeFilename} from ${caseId}...`, "working");
     const url = `${withCaseQuery("/videos", caseId)}&filename=${encodeURIComponent(safeFilename)}`;
     await fetchJson(url, { method: "DELETE" });
@@ -3932,60 +4409,203 @@ async function uploadAndIndex() {
       0,
       `${files.length} file(s) | ${formatBytes(totalUploadBytes)}`,
     );
-    const formData = new FormData();
-    files.forEach((file) => formData.append("files", file));
-    const TRANSFER_STAGE_MAX = 70;
-    const SERVER_PROCESSING_STAGE = 80;
+    const TRANSFER_STAGE_MAX = 80;
     const SERVER_RECEIVED_STAGE = 90;
     const INDEX_QUEUE_STAGE = 95;
-
-    const uploadResult = await postFormDataWithProgress(
-      withCaseQuery("/upload", caseId),
-      formData,
-      (event) => {
-        const elapsedSec = Math.max(0.001, (Date.now() - uploadStartedAt) / 1000);
-        const estimatedTotal = event.lengthComputable && event.total > 0
-          ? event.total
-          : totalUploadBytes;
-        const totalBytesForDisplay = Math.max(0, Number(estimatedTotal || totalUploadBytes || event.loaded || 0));
-        const loadedBytes = Math.min(Number(event.loaded || 0), totalBytesForDisplay || Number(event.loaded || 0));
-        const fraction = estimatedTotal > 0 ? loadedBytes / estimatedTotal : 0;
-        const transferFraction = Math.max(0, Math.min(1, fraction));
-        const speedBytesPerSecond = loadedBytes / elapsedSec;
-        const remainingBytes = Math.max(0, totalBytesForDisplay - loadedBytes);
-        const etaSeconds = speedBytesPerSecond > 0 ? remainingBytes / speedBytesPerSecond : null;
-        const uploadSent = totalBytesForDisplay > 0 && loadedBytes >= totalBytesForDisplay;
-        const metaParts = [];
-        if (uploadSent) {
-          metaParts.push(`${formatBytes(totalBytesForDisplay)} sent from browser`);
-          metaParts.push(
-            "Browser upload finished; server is still receiving/writing/converting (files may not appear in /videos yet)",
-          );
-          setTaskProgressUi(
-            "Server ingest + conversion in progress",
-            SERVER_PROCESSING_STAGE,
-            metaParts.join(" | "),
-          );
-          return;
-        } else {
-          metaParts.push(`${formatBytes(loadedBytes)} / ${formatBytes(totalBytesForDisplay)} transferred`);
-          metaParts.push(`${formatBytes(speedBytesPerSecond)}/s`);
-          metaParts.push(formatEtaLabel(etaSeconds));
-        }
-        const meta = metaParts.join(" | ");
-        setTaskProgressUi(
-          "Transferring files to server",
-          clampPercent((transferFraction * TRANSFER_STAGE_MAX)),
-          meta,
-        );
-      },
+    const uploadSession = await resolveResumableUploadSession(caseId, files);
+    const sessionId = String(uploadSession?.session?.session_id || "").trim();
+    if (!sessionId) {
+      throw new Error("Upload session missing session_id");
+    }
+    const sessionFiles = Array.isArray(uploadSession?.files) ? uploadSession.files : [];
+    const sessionFileByKey = new Map(
+      sessionFiles.map((item) => [String(item.source_key || "").trim(), item]),
     );
+    let sessionReceivedBytes = Math.max(
+      0,
+      Number(uploadSession?.session?.received_bytes || 0),
+    );
+    const sessionTotalBytes = Math.max(
+      0,
+      Number(uploadSession?.session?.total_bytes || totalUploadBytes),
+    ) || totalUploadBytes;
+    let transferredBytesForEta = sessionReceivedBytes;
+    const resumedLabel = uploadSession?.resumed ? "resuming" : "starting";
+    setStatus(
+      `Transferring videos to ${caseId} (engine: ${engineLabel}) | semantic index selected: ${selectedForIndexCount}/${files.length} | ${resumedLabel} resumable upload.`,
+      "working",
+    );
+
+    const updateTransferProgress = (receivedBytesOverride = null) => {
+      const receivedBytes = receivedBytesOverride === null
+        ? sessionReceivedBytes
+        : Math.max(0, Number(receivedBytesOverride || 0));
+      sessionReceivedBytes = receivedBytes;
+      transferredBytesForEta = Math.max(transferredBytesForEta, receivedBytes);
+      const elapsedSec = Math.max(0.001, (Date.now() - uploadStartedAt) / 1000);
+      const transferFraction = sessionTotalBytes > 0
+        ? Math.max(0, Math.min(1, receivedBytes / sessionTotalBytes))
+        : 1;
+      const speedBytesPerSecond = transferredBytesForEta / elapsedSec;
+      const remainingBytes = Math.max(0, sessionTotalBytes - receivedBytes);
+      const etaSeconds = speedBytesPerSecond > 0 ? remainingBytes / speedBytesPerSecond : null;
+      const meta = [
+        `${formatBytes(receivedBytes)} / ${formatBytes(sessionTotalBytes)} transferred`,
+        `${formatBytes(speedBytesPerSecond)}/s`,
+        formatEtaLabel(etaSeconds),
+      ].join(" | ");
+      setTaskProgressUi(
+        "Transferring files to server",
+        clampPercent(transferFraction * TRANSFER_STAGE_MAX),
+        meta,
+      );
+    };
+
+    updateTransferProgress(sessionReceivedBytes);
+    for (let sourceIndex = 0; sourceIndex < files.length; sourceIndex += 1) {
+      const file = files[sourceIndex];
+      const sourceKey = buildResumableSourceKey(file);
+      const sessionFile = sessionFileByKey.get(sourceKey);
+      if (!sessionFile) {
+        throw new Error(`Upload session file mapping missing for ${file.name}`);
+      }
+      const fileId = String(sessionFile.file_id || "").trim();
+      const chunkSizeBytes = Math.max(
+        1,
+        Number(uploadSession?.session?.chunk_size_bytes || DEFAULT_RESUMABLE_CHUNK_SIZE_BYTES),
+      );
+      const totalChunks = Math.max(
+        1,
+        Number(sessionFile.total_chunks || Math.ceil((Number(file.size || 0) || 1) / chunkSizeBytes)),
+      );
+      let startChunk = Math.max(0, Number(sessionFile.received_chunks || 0));
+      if (startChunk > totalChunks) {
+        startChunk = totalChunks;
+      }
+      for (let chunkIndex = startChunk; chunkIndex < totalChunks; chunkIndex += 1) {
+        const chunkStart = chunkIndex * chunkSizeBytes;
+        const chunkEnd = Math.min(Number(file.size || 0), chunkStart + chunkSizeBytes);
+        const chunkBlob = file.slice(chunkStart, chunkEnd);
+        const chunkPayload = await postResumableChunkWithRetry({
+          sessionId,
+          fileId,
+          chunkIndex,
+          totalChunks,
+          payload: chunkBlob,
+        });
+        const chunkSession = chunkPayload && typeof chunkPayload.session === "object"
+          ? chunkPayload.session
+          : null;
+        if (chunkSession) {
+          updateTransferProgress(Number(chunkSession.received_bytes || sessionReceivedBytes));
+        } else {
+          updateTransferProgress(sessionReceivedBytes + (chunkEnd - chunkStart));
+        }
+      }
+    }
 
     setTaskProgressUi(
       "Upload received by server",
       SERVER_RECEIVED_STAGE,
-      "Server finished ingest/transcode. Preparing background indexing...",
+      "Browser transfer is complete. Server ingest/transcode is still running...",
     );
+    const FINALIZE_STAGE_MAX = 94;
+    let finalizeWatcherActive = true;
+    let lastFinalizedCount = -1;
+    let lastCompletedCount = -1;
+    let lastFailedCount = -1;
+    const pollFinalizeProgress = async () => {
+      while (finalizeWatcherActive) {
+        try {
+          const statusPayload = await fetchJson(
+            `/upload_session/status?session_id=${encodeURIComponent(sessionId)}`,
+          );
+          const sessionFiles = Array.isArray(statusPayload?.files) ? statusPayload.files : [];
+          const completedCount = sessionFiles.filter((item) => {
+            if (!item || typeof item !== "object") {
+              return false;
+            }
+            const status = String(item.status || "").toLowerCase();
+            const storedName = String(item.uploaded_filename || "").trim();
+            return status === "completed" && Boolean(storedName);
+          }).length;
+          const failedCount = sessionFiles.filter((item) => {
+            if (!item || typeof item !== "object") {
+              return false;
+            }
+            const status = String(item.status || "").toLowerCase();
+            return status === "failed";
+          }).length;
+          const finalizedCount = completedCount + failedCount;
+          const totalFinalizeFiles = Math.max(files.length, sessionFiles.length || files.length);
+          const finalizeFraction = totalFinalizeFiles > 0
+            ? Math.max(0, Math.min(1, finalizedCount / totalFinalizeFiles))
+            : 0;
+          if (completedCount !== lastCompletedCount || failedCount !== lastFailedCount) {
+            lastCompletedCount = completedCount;
+            lastFailedCount = failedCount;
+            const detailParts = [
+              `${completedCount}/${totalFinalizeFiles} finalized`,
+            ];
+            if (failedCount > 0) {
+              detailParts.push(`${failedCount} failed`);
+            }
+            detailParts.push("showing videos as each finalize completes");
+            setTaskProgressUi(
+              "Server ingest/transcode in progress",
+              clampPercent(
+                SERVER_RECEIVED_STAGE
+                + (finalizeFraction * (FINALIZE_STAGE_MAX - SERVER_RECEIVED_STAGE)),
+              ),
+              detailParts.join(" | "),
+            );
+          }
+          if (finalizedCount > lastFinalizedCount) {
+            lastFinalizedCount = finalizedCount;
+            try {
+              await refreshVideos(caseId, null, { skipFollowups: true });
+            } catch {
+              // Non-fatal during polling; final refresh still runs after completion.
+            }
+          }
+          const sessionStatus = String(statusPayload?.status || "").toLowerCase();
+          if (
+            sessionStatus === "completed"
+            || sessionStatus === "completed_with_errors"
+            || sessionStatus === "failed"
+            || sessionStatus === "cancelled"
+          ) {
+            break;
+          }
+        } catch {
+          // Keep polling; completion response is the source of truth.
+        }
+        await sleep(900);
+      }
+    };
+
+    const finalizeWatcherPromise = pollFinalizeProgress();
+    let uploadResult;
+    try {
+      uploadResult = await fetchJson("/upload_session/complete", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: sessionId }),
+      });
+    } finally {
+      finalizeWatcherActive = false;
+      try {
+        await finalizeWatcherPromise;
+      } catch {
+        // no-op
+      }
+    }
+    setTaskProgressUi(
+      "Server ingest/transcode complete",
+      FINALIZE_STAGE_MAX,
+      "Preparing background indexing...",
+    );
+    clearResumableUploadState();
 
     const uploaded = uploadResult.uploaded || [];
     const errors = uploadResult.errors || [];
@@ -4360,6 +4980,9 @@ function setupListeners() {
     console.log("New Case clicked");
     createCase();
   });
+  taskProgressStopBtn?.addEventListener("click", () => {
+    stopBackgroundIndexFromProgress();
+  });
   workspaceBackBtn?.addEventListener("click", () => {
     backToCaseRepository();
   });
@@ -4460,6 +5083,13 @@ function setupListeners() {
   window.addEventListener("resize", () => {
     updateTriageTimelinePlayheads();
   });
+  window.addEventListener("beforeunload", (event) => {
+    if (!uploadFlowActive) {
+      return;
+    }
+    event.preventDefault();
+    event.returnValue = "";
+  });
 
   searchBtn?.addEventListener("click", runSearch);
 
@@ -4499,6 +5129,7 @@ function setupListeners() {
 
   renderMainTabs();
   renderAnalysisSelectionLists();
+  setTaskProgressStopCase("");
   listenersBound = true;
 }
 

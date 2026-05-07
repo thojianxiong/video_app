@@ -16,6 +16,7 @@ class InsightsService:
         resolve_case_id_or_default: Any,
         get_analysis_store_for_case: Any,
         hydrate_crop_item: Any,
+        load_cached_video_triage_sync: Any,
         build_video_triage_sync: Any,
         get_vector_store_for_case: Any,
         get_temporal_store_for_case: Any,
@@ -33,6 +34,7 @@ class InsightsService:
         self.resolve_case_id_or_default = resolve_case_id_or_default
         self.get_analysis_store_for_case = get_analysis_store_for_case
         self.hydrate_crop_item = hydrate_crop_item
+        self.load_cached_video_triage_sync = load_cached_video_triage_sync
         self.build_video_triage_sync = build_video_triage_sync
         self.get_vector_store_for_case = get_vector_store_for_case
         self.get_temporal_store_for_case = get_temporal_store_for_case
@@ -136,6 +138,33 @@ class InsightsService:
                 filename=filename,
                 bucket_seconds=bucket_seconds,
                 force=force,
+            )
+        except FileNotFoundError:
+            raise HTTPException(status_code=404, detail=f"Video not found: {filename}")
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"Case not found: {case_id}")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc))
+
+    async def triage_timeline_cached(
+        self,
+        *,
+        case_id: str | None,
+        filename: str,
+        bucket_seconds: float,
+    ) -> dict:
+        try:
+            selected_case_id = await asyncio.to_thread(
+                self.resolve_case_id_or_default,
+                case_id,
+            )
+            return await asyncio.to_thread(
+                self.load_cached_video_triage_sync,
+                case_id=selected_case_id,
+                filename=filename,
+                bucket_seconds=bucket_seconds,
             )
         except FileNotFoundError:
             raise HTTPException(status_code=404, detail=f"Video not found: {filename}")
@@ -305,4 +334,3 @@ class InsightsService:
             raise HTTPException(status_code=400, detail=str(exc))
         except Exception as exc:
             raise HTTPException(status_code=500, detail=str(exc))
-

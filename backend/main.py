@@ -58,6 +58,8 @@ from backend.services.insights_service import InsightsService
 from backend.services.media_service import MediaService
 from backend.services.process_control_service import ProcessControlService
 from backend.stores.index_job_store import IndexJobStore
+from backend.stores.index_queue_store import IndexQueueStore
+from backend.stores.upload_session_store import UploadSessionStore
 from backend.stores.video_pipeline_store import VideoPipelineStore
 from backend.temporal_store import TemporalWindowStore
 from backend.triage import build_video_triage_payload
@@ -76,7 +78,9 @@ CASES_DIR = BASE_DIR / "cases"
 CASES_REGISTRY_PATH = CASES_DIR / "cases.json"
 APP_SETTINGS_PATH = CASES_DIR / "app_settings.json"
 INDEX_JOBS_DB_PATH = CASES_DIR / "index_jobs.db"
+INDEX_QUEUE_DB_PATH = CASES_DIR / "index_queue.db"
 VIDEO_PIPELINE_DB_PATH = CASES_DIR / "video_pipeline.db"
+UPLOAD_SESSIONS_DB_PATH = CASES_DIR / "upload_sessions.db"
 
 SEMANTIC_OBJECT = "object"
 SEMANTIC_ACTION = "action"
@@ -119,7 +123,7 @@ SCENE_KEYWORDS = {
     "crowd", "crowded", "traffic", "residential", "apartment", "building",
 }
 
-VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".wmv"}
 CASE_REGISTRY_LOCK = Lock()
 APP_SETTINGS_LOCK = Lock()
 
@@ -155,10 +159,16 @@ async def _startup_application(application: FastAPI) -> None:
     application.state.index_tasks = {}
     index_job_store = await asyncio.to_thread(IndexJobStore, INDEX_JOBS_DB_PATH)
     application.state.index_job_store = index_job_store
+    index_queue_store = await asyncio.to_thread(IndexQueueStore, INDEX_QUEUE_DB_PATH)
+    application.state.index_queue_store = index_queue_store
     video_pipeline_store = await asyncio.to_thread(VideoPipelineStore, VIDEO_PIPELINE_DB_PATH)
     application.state.video_pipeline_store = video_pipeline_store
+    upload_session_store = await asyncio.to_thread(UploadSessionStore, UPLOAD_SESSIONS_DB_PATH)
+    application.state.upload_session_store = upload_session_store
+    application.state.upload_session_chunk_lock = Lock()
 
     interrupted_jobs = await asyncio.to_thread(index_job_store.mark_incomplete_jobs_interrupted)
+    interrupted_queue_jobs = await asyncio.to_thread(index_queue_store.mark_running_jobs_interrupted)
     interrupted_pipeline = await asyncio.to_thread(video_pipeline_store.mark_running_as_interrupted)
     raw_snapshots = await asyncio.to_thread(index_job_store.load_all_snapshots)
     restored_jobs: dict[str, dict] = {}
@@ -182,11 +192,14 @@ async def _startup_application(application: FastAPI) -> None:
     )
     if interrupted_jobs > 0:
         print(f"[startup] Marked {interrupted_jobs} incomplete index job(s) as interrupted.")
+    if interrupted_queue_jobs > 0:
+        print(f"[startup] Marked {interrupted_queue_jobs} running queued job(s) as interrupted.")
     if interrupted_pipeline > 0:
         print(f"[startup] Marked {interrupted_pipeline} running pipeline stage(s) as interrupted.")
     if restored_jobs:
         print(f"[startup] Restored {len(restored_jobs)} persisted index job snapshot(s).")
     await asyncio.to_thread(_list_cases_sync)
+    application.state.index_queue_worker_task = asyncio.create_task(_index_queue_worker_loop())
 
 
 @asynccontextmanager
@@ -195,7 +208,13 @@ async def _app_lifespan(application: FastAPI):
     try:
         yield
     finally:
-        pass
+        worker_task = getattr(application.state, "index_queue_worker_task", None)
+        if isinstance(worker_task, asyncio.Task):
+            worker_task.cancel()
+            try:
+                await worker_task
+            except asyncio.CancelledError:
+                pass
 
 
 app = FastAPI(
@@ -572,6 +591,7 @@ def _index_job_snapshot(job: dict | None, *, case_id: str) -> dict:
             "embedding_engine": _embedding_engine_info(),
             "errors": [],
             "results": [],
+            "filenames": [],
             "cancel_requested": False,
             "started_at": "",
             "updated_at": "",
@@ -620,6 +640,7 @@ def _index_job_snapshot(job: dict | None, *, case_id: str) -> dict:
         "embedding_engine": dict(job.get("embedding_engine") or _embedding_engine_info()),
         "errors": [str(item) for item in (job.get("errors") or [])],
         "results": [item for item in (job.get("results") or []) if isinstance(item, dict)],
+        "filenames": [str(item) for item in (job.get("filenames") or []) if str(item).strip()],
         "cancel_requested": bool(job.get("cancel_requested", False)),
         "started_at": str(job.get("started_at") or ""),
         "updated_at": str(job.get("updated_at") or ""),
@@ -740,6 +761,112 @@ async def _persist_index_job_snapshot(case_id: str) -> None:
         print(f"[index-persist][{case_id}] failed error={exc}")
 
 
+def _map_index_snapshot_to_queue_status(snapshot: dict) -> tuple[str, str]:
+    status = str(snapshot.get("status") or "").strip().lower()
+    if status in {"completed", "completed_with_errors"}:
+        return "completed", ""
+    if status in {"failed"}:
+        errors = snapshot.get("errors") or []
+        if isinstance(errors, list) and errors:
+            return "failed", _truncate_error(str(errors[-1]))
+        return "failed", "Background indexing failed."
+    if status in {"cancelled", "cancelling"}:
+        return "cancelled", "Background indexing cancelled."
+    if status in {"interrupted"}:
+        return "interrupted", "Background indexing interrupted."
+    return "failed", f"Unexpected index job status: {status or 'unknown'}"
+
+
+async def _index_queue_worker_loop() -> None:
+    queue_store = getattr(app.state, "index_queue_store", None)
+    if not isinstance(queue_store, IndexQueueStore):
+        return
+
+    while True:
+        try:
+            queued_job = await asyncio.to_thread(queue_store.claim_next_queued)
+            if not isinstance(queued_job, dict):
+                await asyncio.sleep(0.5)
+                continue
+
+            job_id = int(queued_job.get("job_id", 0))
+            payload = queued_job.get("payload") or {}
+            case_id = _normalize_case_id(str(queued_job.get("case_id") or payload.get("case_id") or ""))
+
+            filenames = [str(item) for item in (payload.get("filenames") or []) if str(item).strip()]
+            if not filenames:
+                await asyncio.to_thread(
+                    queue_store.complete_job,
+                    job_id=job_id,
+                    status="failed",
+                    error="Queued job payload missing filenames.",
+                )
+                continue
+
+            frame_interval_seconds = float(payload.get("frame_interval_seconds", 1.0))
+            batch_size = int(payload.get("batch_size", 32))
+            force = bool(payload.get("force", False))
+
+            try:
+                await asyncio.to_thread(_get_case_paths_or_raise, case_id)
+            except Exception as exc:
+                await asyncio.to_thread(
+                    queue_store.complete_job,
+                    job_id=job_id,
+                    status="failed",
+                    error=_truncate_error(f"Case validation failed: {exc}"),
+                )
+                continue
+
+            with app.state.index_jobs_lock:
+                job = _new_index_job_record(
+                    case_id=case_id,
+                    filenames=filenames,
+                    frame_interval_seconds=frame_interval_seconds,
+                    batch_size=batch_size,
+                    force=force,
+                )
+                job["running"] = False
+                job["status"] = "queued"
+                job["queue_job_id"] = int(job_id)
+                app.state.index_jobs[case_id] = job
+
+            await _persist_index_job_snapshot(case_id)
+
+            run_task = asyncio.create_task(_run_index_job_async(case_id))
+            with app.state.index_jobs_lock:
+                app.state.index_tasks[case_id] = run_task
+
+            try:
+                await run_task
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                await asyncio.to_thread(
+                    queue_store.complete_job,
+                    job_id=job_id,
+                    status="failed",
+                    error=_truncate_error(str(exc)),
+                )
+                continue
+
+            with app.state.index_jobs_lock:
+                snapshot = _index_job_snapshot(app.state.index_jobs.get(case_id), case_id=case_id)
+
+            queue_status, queue_error = _map_index_snapshot_to_queue_status(snapshot)
+            await asyncio.to_thread(
+                queue_store.complete_job,
+                job_id=job_id,
+                status=queue_status,
+                error=queue_error,
+            )
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            print(f"[index-queue] worker_error={exc}")
+            await asyncio.sleep(0.5)
+
+
 async def _run_index_job_async(case_id: str) -> None:
     jobs: dict[str, dict] = app.state.index_jobs
     lock: Lock = app.state.index_jobs_lock
@@ -751,10 +878,19 @@ async def _run_index_job_async(case_id: str) -> None:
         if not isinstance(initial, dict):
             tasks.pop(normalized_case_id, None)
             return
-        filenames = [str(item) for item in (initial.get("filenames") or [])]
         frame_interval_seconds = float(initial.get("frame_interval_seconds", 2.0))
         batch_size = int(initial.get("batch_size", 32))
         force = bool(initial.get("force", False))
+        initial_filenames: list[str] = []
+        initial_seen: set[str] = set()
+        for item in (initial.get("filenames") or []):
+            safe = str(item).strip()
+            if not safe or safe in initial_seen:
+                continue
+            initial_seen.add(safe)
+            initial_filenames.append(safe)
+        initial["filenames"] = initial_filenames
+        initial["total"] = len(initial_filenames)
         initial["status"] = "running"
         initial["running"] = True
         initial["updated_at"] = _utc_now_iso()
@@ -762,13 +898,28 @@ async def _run_index_job_async(case_id: str) -> None:
     await _persist_index_job_snapshot(normalized_case_id)
 
     try:
-        for filename in filenames:
+        next_index = 0
+        while True:
             with lock:
                 current = jobs.get(normalized_case_id)
                 if not isinstance(current, dict):
                     return
                 if bool(current.get("cancel_requested", False)):
                     raise asyncio.CancelledError()
+                dynamic_filenames: list[str] = []
+                dynamic_seen: set[str] = set()
+                for item in (current.get("filenames") or []):
+                    safe = str(item).strip()
+                    if not safe or safe in dynamic_seen:
+                        continue
+                    dynamic_seen.add(safe)
+                    dynamic_filenames.append(safe)
+                current["filenames"] = dynamic_filenames
+                current["total"] = len(dynamic_filenames)
+                if next_index >= len(dynamic_filenames):
+                    break
+                filename = dynamic_filenames[next_index]
+                next_index += 1
                 current["current_filename"] = str(filename)
                 current["current_video_processed_frames"] = 0
                 current["current_video_total_frames"] = 0
@@ -794,6 +945,13 @@ async def _run_index_job_async(case_id: str) -> None:
             await _persist_index_job_snapshot(normalized_case_id)
 
             try:
+                def _is_cancel_requested() -> bool:
+                    with lock:
+                        running_job = jobs.get(normalized_case_id)
+                        if not isinstance(running_job, dict):
+                            return True
+                        return bool(running_job.get("cancel_requested", False))
+
                 def _on_video_progress(processed_frames: int, estimated_total_frames: int | None) -> None:
                     with lock:
                         running_job = jobs.get(normalized_case_id)
@@ -839,6 +997,7 @@ async def _run_index_job_async(case_id: str) -> None:
                     analysis_vehicles=False,
                     analysis_only=False,
                     progress_callback=_on_video_progress,
+                    cancel_check=_is_cancel_requested,
                 )
                 status = str(result.get("status", "processed"))
                 indexed_frames = max(0, int(result.get("indexed_frames", 0)))
@@ -899,6 +1058,20 @@ async def _run_index_job_async(case_id: str) -> None:
                     },
                 )
                 await _persist_index_job_snapshot(normalized_case_id)
+            except _IndexCancellationRequested as exc:
+                await _pipeline_update_stage(
+                    case_id=normalized_case_id,
+                    filename=filename,
+                    stage="base_index",
+                    status="interrupted",
+                    event="background_index_cancelled",
+                    error="Background indexing cancelled.",
+                    details={
+                        "source": "background_index",
+                        "message": _truncate_error(str(exc)),
+                    },
+                )
+                raise asyncio.CancelledError()
             except asyncio.CancelledError:
                 await _pipeline_update_stage(
                     case_id=normalized_case_id,
@@ -1141,7 +1314,13 @@ def _truncate_error(message: str, limit: int = 300) -> str:
     return clean[: max(0, limit - 3)] + "..."
 
 
-def _unlink_with_retry(path: Path, attempts: int = 8, delay_seconds: float = 0.2) -> None:
+def _unlink_with_retry(
+    path: Path,
+    attempts: int = 8,
+    delay_seconds: float = 0.08,
+    backoff_multiplier: float = 1.6,
+    max_delay_seconds: float = 0.6,
+) -> None:
     last_error: PermissionError | None = None
     for attempt_index in range(max(1, attempts)):
         try:
@@ -1150,10 +1329,83 @@ def _unlink_with_retry(path: Path, attempts: int = 8, delay_seconds: float = 0.2
         except PermissionError as exc:
             last_error = exc
             if attempt_index < attempts - 1:
-                time.sleep(max(0.0, float(delay_seconds)))
+                delay = max(0.0, float(delay_seconds))
+                if attempt_index > 0:
+                    delay *= float(backoff_multiplier) ** attempt_index
+                delay = min(delay, max(0.0, float(max_delay_seconds)))
+                time.sleep(delay)
 
     if last_error is not None:
         raise last_error
+
+
+def _describe_video_lock_context(case_id: str, filename: str) -> str:
+    normalized_case_id = str(case_id or "").strip()
+    normalized_filename = Path(str(filename or "")).name.strip()
+    hints: list[str] = []
+
+    index_jobs = getattr(app.state, "index_jobs", None)
+    index_lock = getattr(app.state, "index_jobs_lock", None)
+    if isinstance(index_jobs, dict) and isinstance(index_lock, Lock) and normalized_case_id:
+        with index_lock:
+            existing_job = index_jobs.get(normalized_case_id)
+            if isinstance(existing_job, dict):
+                status = str(existing_job.get("status") or "").strip().lower()
+                running = bool(existing_job.get("running")) or status in {"queued", "running", "cancelling"}
+                if running:
+                    current_filename = str(existing_job.get("current_filename") or "").strip()
+                    if current_filename and current_filename == normalized_filename:
+                        hints.append(f"background indexing is processing '{current_filename}'")
+                    elif current_filename:
+                        hints.append(f"background indexing is running (current file: '{current_filename}')")
+                    else:
+                        hints.append("background indexing is running for this case")
+
+    pipeline_store = getattr(app.state, "video_pipeline_store", None)
+    if pipeline_store is not None and normalized_case_id and normalized_filename:
+        snapshot: dict[str, Any] | None
+        try:
+            snapshot = pipeline_store.get_video_snapshot(normalized_case_id, normalized_filename)
+        except Exception:
+            snapshot = None
+
+        if isinstance(snapshot, dict):
+            overall_status = str(snapshot.get("overall_status") or "").strip().lower()
+            current_stage = str(snapshot.get("current_stage") or "").strip()
+            running_stage = ""
+            stages = snapshot.get("stages")
+            if isinstance(stages, dict):
+                if current_stage:
+                    current_payload = stages.get(current_stage)
+                    current_status = (
+                        str(current_payload.get("status") or "").strip().lower()
+                        if isinstance(current_payload, dict)
+                        else ""
+                    )
+                    if current_status == "running":
+                        running_stage = current_stage
+                if not running_stage:
+                    for stage_name, stage_payload in stages.items():
+                        if not isinstance(stage_payload, dict):
+                            continue
+                        stage_status = str(stage_payload.get("status") or "").strip().lower()
+                        if stage_status == "running":
+                            running_stage = str(stage_name).strip()
+                            break
+            if overall_status == "running":
+                if running_stage:
+                    hints.append(f"pipeline stage '{running_stage}' is still running")
+                elif current_stage:
+                    hints.append(f"pipeline stage '{current_stage}' may still be finalizing")
+                else:
+                    hints.append("video pipeline is still running for this video")
+
+    if hints:
+        return f"Possible lock owner: {'; '.join(hints)}."
+    return (
+        "Possible lock owner: browser playback tab, ffmpeg conversion, "
+        "antivirus scanning, or another media app."
+    )
 
 
 def _float_from_env(name: str, default_value: float) -> float:
@@ -1844,6 +2096,10 @@ def _estimate_sampled_frame_count(video_path: Path, interval_seconds: float) -> 
         capture.release()
 
 
+class _IndexCancellationRequested(Exception):
+    pass
+
+
 def _process_video_sync(
     *,
     case_id: str,
@@ -1855,6 +2111,7 @@ def _process_video_sync(
     analysis_vehicles: bool,
     analysis_only: bool,
     progress_callback=None,
+    cancel_check=None,
 ) -> dict:
     case_paths, vector_store = _get_vector_store_for_case(case_id)
     _, temporal_store = _get_temporal_store_for_case(case_id)
@@ -1919,6 +2176,10 @@ def _process_video_sync(
                 except Exception:
                     pass
         else:
+            if cancel_check is not None and bool(cancel_check()):
+                raise _IndexCancellationRequested(
+                    f"Background indexing cancelled before frame extraction: {resolved_filename}"
+                )
             thumbnail_dir = case_paths.thumbnails_dir / Path(resolved_filename).stem
             if force and thumbnail_dir.exists():
                 shutil.rmtree(thumbnail_dir)
@@ -1936,6 +2197,10 @@ def _process_video_sync(
                     pass
 
             for frame in iter_video_frames(video_path, interval_seconds=frame_interval_seconds):
+                if cancel_check is not None and bool(cancel_check()):
+                    raise _IndexCancellationRequested(
+                        f"Background indexing cancelled while processing frames: {resolved_filename}"
+                    )
                 thumb_path = save_thumbnail(
                     frame_rgb=frame.frame_rgb,
                     output_dir=thumbnail_dir,
@@ -1958,12 +2223,20 @@ def _process_video_sync(
                         pass
 
                 if len(pending_images) >= batch_size:
+                    if cancel_check is not None and bool(cancel_check()):
+                        raise _IndexCancellationRequested(
+                            f"Background indexing cancelled before embedding batch: {resolved_filename}"
+                        )
                     embeddings_batches.append(
                         app.state.embedder.encode_images(pending_images, batch_size=batch_size)
                     )
                     pending_images.clear()
 
             if pending_images:
+                if cancel_check is not None and bool(cancel_check()):
+                    raise _IndexCancellationRequested(
+                        f"Background indexing cancelled before final embedding batch: {resolved_filename}"
+                    )
                 embeddings_batches.append(
                     app.state.embedder.encode_images(pending_images, batch_size=batch_size)
                 )
@@ -2072,9 +2345,13 @@ def _delete_video_sync(case_id: str, filename: str) -> dict:
     try:
         _unlink_with_retry(video_path)
     except PermissionError as exc:
+        lock_context = _describe_video_lock_context(case_paths.case_id, safe_filename)
+        os_error = _truncate_error(str(exc), limit=180)
         raise PermissionError(
-            "Video file is currently in use. Stop playback and wait for background "
-            f"indexing to finish, then try deleting again: {video_path}"
+            "Video file is currently in use. "
+            f"{lock_context} "
+            "Close anything playing or editing this file, then retry. "
+            f"Path: {video_path}. OS error: {os_error}"
         ) from exc
 
     vector_result = vector_store.delete_video_embeddings(safe_filename)
@@ -2103,6 +2380,13 @@ def _delete_video_sync(case_id: str, filename: str) -> dict:
         "removed_face_people_crops": int(crop_result.get("removed_face_people", 0)),
         "removed_vehicle_crops": int(crop_result.get("removed_vehicles", 0)),
     }
+
+_process_control_service = ProcessControlService(
+    app=app,
+    utc_now_iso=_utc_now_iso,
+    index_job_snapshot=_index_job_snapshot,
+)
+app.state.process_control_service = _process_control_service
 
 app.include_router(
     build_cases_router(
@@ -2145,12 +2429,6 @@ _media_service = MediaService(
 )
 app.include_router(build_media_router(media_service=_media_service))
 
-
-_process_control_service = ProcessControlService(
-    app=app,
-    utc_now_iso=_utc_now_iso,
-    index_job_snapshot=_index_job_snapshot,
-)
 app.include_router(
     build_process_control_router(process_control_service=_process_control_service)
 )
@@ -2316,11 +2594,87 @@ def _build_video_triage_sync(
     return payload
 
 
+def _load_cached_video_triage_sync(
+    *,
+    case_id: str,
+    filename: str,
+    bucket_seconds: float,
+) -> dict:
+    case_paths, vector_store = _get_vector_store_for_case(case_id)
+    resolved_filename, video_path = _resolve_video_path_for_processing(
+        case_paths,
+        filename,
+    )
+    if not video_path.exists() or not video_path.is_file():
+        raise FileNotFoundError(resolved_filename)
+    if not _is_supported_video(video_path.name):
+        raise ValueError(
+            "Unsupported video format. Allowed extensions: "
+            + ", ".join(sorted(VIDEO_EXTENSIONS))
+        )
+
+    analysis_summary = vector_store.analysis_summary_by_filename().get(
+        resolved_filename,
+        {
+            "face_people": {"processed": False},
+            "vehicles": {"processed": False},
+        },
+    )
+    face_people = (
+        analysis_summary.get("face_people")
+        if isinstance(analysis_summary.get("face_people"), dict)
+        else {}
+    )
+    vehicles = (
+        analysis_summary.get("vehicles")
+        if isinstance(analysis_summary.get("vehicles"), dict)
+        else {}
+    )
+
+    safe_bucket_seconds = max(0.5, float(bucket_seconds))
+    video_signature = compute_video_signature(video_path)
+    face_people_mtime_ns = _metadata_mtime_ns(case_paths.face_people_metadata_path)
+    vehicles_mtime_ns = _metadata_mtime_ns(case_paths.vehicles_metadata_path)
+    analysis_signature = _triage_analysis_signature(face_people, vehicles)
+    cache_path = _triage_cache_path(
+        case_paths,
+        resolved_filename,
+        safe_bucket_seconds,
+    )
+    cached_payload = _load_triage_cache_sync(
+        cache_path=cache_path,
+        bucket_seconds=safe_bucket_seconds,
+        video_signature=video_signature,
+        analysis_signature=analysis_signature,
+        face_people_metadata_mtime_ns=face_people_mtime_ns,
+        vehicles_metadata_mtime_ns=vehicles_mtime_ns,
+    )
+    if not isinstance(cached_payload, dict):
+        return {
+            "case_id": case_paths.case_id,
+            "filename": resolved_filename,
+            "bucket_seconds": safe_bucket_seconds,
+            "video_url": _media_url_for_case_path(case_paths.videos_dir / resolved_filename),
+            "cache_status": "miss",
+            "cached": False,
+        }
+
+    cached_payload["case_id"] = case_paths.case_id
+    cached_payload["filename"] = resolved_filename
+    cached_payload["video_url"] = _media_url_for_case_path(
+        case_paths.videos_dir / resolved_filename
+    )
+    cached_payload["cache_status"] = "hit"
+    cached_payload["cached"] = True
+    return cached_payload
+
+
 _insights_service = InsightsService(
     app=app,
     resolve_case_id_or_default=_resolve_case_id_or_default,
     get_analysis_store_for_case=_get_analysis_store_for_case,
     hydrate_crop_item=_hydrate_crop_item,
+    load_cached_video_triage_sync=_load_cached_video_triage_sync,
     build_video_triage_sync=_build_video_triage_sync,
     get_vector_store_for_case=_get_vector_store_for_case,
     get_temporal_store_for_case=_get_temporal_store_for_case,

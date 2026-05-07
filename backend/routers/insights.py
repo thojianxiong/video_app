@@ -28,6 +28,14 @@ def build_insights_router(*, insights_service: InsightsService) -> APIRouter:
             force=request.force,
         )
 
+    @router.post("/triage_timeline_cached")
+    async def triage_timeline_cached(request: TriageTimelineRequest) -> dict:
+        return await insights_service.triage_timeline_cached(
+            case_id=request.case_id,
+            filename=request.filename,
+            bucket_seconds=request.bucket_seconds,
+        )
+
     @router.post("/search")
     async def search(request: SearchRequest) -> dict:
         return await insights_service.search(
