@@ -10,3 +10,4 @@ data/
 
 # Local test temp directories
 .tmp_test/
+tests/.tmp_index_job_store/

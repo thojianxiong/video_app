@@ -77,6 +77,27 @@ class MediaService:
             },
         }
 
+    async def _persist_index_snapshot(self, snapshot: dict) -> None:
+        index_job_store = getattr(self.app.state, "index_job_store", None)
+        if index_job_store is None:
+            return
+        try:
+            await asyncio.to_thread(index_job_store.upsert_snapshot, snapshot)
+        except Exception as exc:
+            case_id = str(snapshot.get("case_id") or "").strip()
+            print(f"[index-persist][{case_id}] failed error={exc}")
+
+    async def _load_persisted_index_snapshot(self, case_id: str) -> dict | None:
+        index_job_store = getattr(self.app.state, "index_job_store", None)
+        if index_job_store is None:
+            return None
+        try:
+            payload = await asyncio.to_thread(index_job_store.get_case_snapshot, case_id)
+        except Exception as exc:
+            print(f"[index-persist][{case_id}] read_failed error={exc}")
+            return None
+        return payload if isinstance(payload, dict) else None
+
     async def upload(self, case_id: str | None, files: list[UploadFile]) -> dict:
         if not files:
             raise HTTPException(status_code=400, detail="No files provided")
@@ -424,6 +445,9 @@ class MediaService:
                 force=force,
             )
             jobs[resolved_case_id] = job
+            snapshot = self.index_job_snapshot(job, case_id=resolved_case_id)
+
+        await self._persist_index_snapshot(snapshot)
 
         task = asyncio.create_task(self.run_index_job_async(resolved_case_id))
         task.add_done_callback(lambda _task: None)
@@ -462,5 +486,12 @@ class MediaService:
         lock: Lock = self.app.state.index_jobs_lock
         with lock:
             job = jobs.get(selected_case_id)
+
+        if isinstance(job, dict):
             return self.index_job_snapshot(job, case_id=selected_case_id)
 
+        persisted = await self._load_persisted_index_snapshot(selected_case_id)
+        if isinstance(persisted, dict):
+            return self.index_job_snapshot(persisted, case_id=selected_case_id)
+
+        return self.index_job_snapshot(None, case_id=selected_case_id)

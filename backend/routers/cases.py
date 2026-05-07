@@ -123,6 +123,15 @@ def build_cases_router(
                 if dangling_task and not dangling_task.done():
                     dangling_task.cancel()
 
+            index_job_store = getattr(request.app.state, "index_job_store", None)
+            if index_job_store is not None:
+                try:
+                    await asyncio.to_thread(index_job_store.delete_case, deleted["case_id"])
+                except Exception as exc:
+                    print(
+                        f"[index-persist][{deleted['case_id']}] delete_failed error={exc}"
+                    )
+
             try:
                 cases = await asyncio.to_thread(list_cases_sync)
             except Exception:

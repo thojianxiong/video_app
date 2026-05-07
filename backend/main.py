@@ -57,6 +57,7 @@ from backend.services.embedding_settings_service import (
 from backend.services.insights_service import InsightsService
 from backend.services.media_service import MediaService
 from backend.services.process_control_service import ProcessControlService
+from backend.stores.index_job_store import IndexJobStore
 from backend.temporal_store import TemporalWindowStore
 from backend.triage import build_video_triage_payload
 from backend.vector_store import VectorStore
@@ -73,6 +74,7 @@ FRONTEND_DIR = BASE_DIR / "frontend"
 CASES_DIR = BASE_DIR / "cases"
 CASES_REGISTRY_PATH = CASES_DIR / "cases.json"
 APP_SETTINGS_PATH = CASES_DIR / "app_settings.json"
+INDEX_JOBS_DB_PATH = CASES_DIR / "index_jobs.db"
 
 SEMANTIC_OBJECT = "object"
 SEMANTIC_ACTION = "action"
@@ -149,6 +151,20 @@ async def _startup_application(application: FastAPI) -> None:
     application.state.index_jobs = {}
     application.state.index_jobs_lock = Lock()
     application.state.index_tasks = {}
+    index_job_store = await asyncio.to_thread(IndexJobStore, INDEX_JOBS_DB_PATH)
+    application.state.index_job_store = index_job_store
+
+    interrupted_jobs = await asyncio.to_thread(index_job_store.mark_incomplete_jobs_interrupted)
+    raw_snapshots = await asyncio.to_thread(index_job_store.load_all_snapshots)
+    restored_jobs: dict[str, dict] = {}
+    if isinstance(raw_snapshots, dict):
+        for raw_case_id, raw_job in raw_snapshots.items():
+            case_id = str(raw_case_id or "").strip()
+            if not case_id or not isinstance(raw_job, dict):
+                continue
+            restored_jobs[case_id] = _index_job_snapshot(raw_job, case_id=case_id)
+    application.state.index_jobs = restored_jobs
+
     application.state.shutdown_requested = False
     application.state.shutdown_requested_at = ""
     application.state.embedding_settings = embedding_settings
@@ -159,6 +175,10 @@ async def _startup_application(application: FastAPI) -> None:
         f"device={embedder.device} "
         f"device_preference={embedder.device_preference}"
     )
+    if interrupted_jobs > 0:
+        print(f"[startup] Marked {interrupted_jobs} incomplete index job(s) as interrupted.")
+    if restored_jobs:
+        print(f"[startup] Restored {len(restored_jobs)} persisted index job snapshot(s).")
     await asyncio.to_thread(_list_cases_sync)
 
 
@@ -609,6 +629,33 @@ def _find_running_index_case_id_locked(jobs: dict[str, dict]) -> str | None:
     return None
 
 
+def _persist_index_job_snapshot_sync(case_id: str) -> None:
+    index_job_store = getattr(app.state, "index_job_store", None)
+    if not isinstance(index_job_store, IndexJobStore):
+        return
+
+    normalized_case_id = str(case_id or "").strip()
+    if not normalized_case_id:
+        return
+
+    jobs: dict[str, dict] = app.state.index_jobs
+    lock: Lock = app.state.index_jobs_lock
+    with lock:
+        current = jobs.get(normalized_case_id)
+        if not isinstance(current, dict):
+            return
+        snapshot = _index_job_snapshot(current, case_id=normalized_case_id)
+
+    index_job_store.upsert_snapshot(snapshot)
+
+
+async def _persist_index_job_snapshot(case_id: str) -> None:
+    try:
+        await asyncio.to_thread(_persist_index_job_snapshot_sync, case_id)
+    except Exception as exc:
+        print(f"[index-persist][{case_id}] failed error={exc}")
+
+
 async def _run_index_job_async(case_id: str) -> None:
     jobs: dict[str, dict] = app.state.index_jobs
     lock: Lock = app.state.index_jobs_lock
@@ -628,6 +675,8 @@ async def _run_index_job_async(case_id: str) -> None:
         initial["running"] = True
         initial["updated_at"] = _utc_now_iso()
 
+    await _persist_index_job_snapshot(normalized_case_id)
+
     try:
         for filename in filenames:
             with lock:
@@ -643,6 +692,8 @@ async def _run_index_job_async(case_id: str) -> None:
                 current["current_video_eta_seconds"] = None
                 current["current_video_started_ts"] = float(time.time())
                 current["updated_at"] = _utc_now_iso()
+
+            await _persist_index_job_snapshot(normalized_case_id)
 
             try:
                 def _on_video_progress(processed_frames: int, estimated_total_frames: int | None) -> None:
@@ -729,6 +780,7 @@ async def _run_index_job_async(case_id: str) -> None:
                             }
                         )
                     current["updated_at"] = _utc_now_iso()
+                await _persist_index_job_snapshot(normalized_case_id)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -743,12 +795,14 @@ async def _run_index_job_async(case_id: str) -> None:
                         errors.append(f"{filename}: {exc}")
                     current["current_video_eta_seconds"] = None
                     current["updated_at"] = _utc_now_iso()
+                await _persist_index_job_snapshot(normalized_case_id)
     except asyncio.CancelledError:
         with lock:
             current = jobs.get(normalized_case_id)
             if isinstance(current, dict):
                 current["cancel_requested"] = True
                 current["updated_at"] = _utc_now_iso()
+        await _persist_index_job_snapshot(normalized_case_id)
     except Exception as exc:
         with lock:
             current = jobs.get(normalized_case_id)
@@ -758,6 +812,7 @@ async def _run_index_job_async(case_id: str) -> None:
                 if isinstance(errors, list):
                     errors.append(f"Background indexing error: {exc}")
                 current["updated_at"] = _utc_now_iso()
+        await _persist_index_job_snapshot(normalized_case_id)
     finally:
         with lock:
             current = jobs.get(normalized_case_id)
@@ -783,6 +838,7 @@ async def _run_index_job_async(case_id: str) -> None:
                 current["updated_at"] = now
                 current["finished_at"] = now
             tasks.pop(normalized_case_id, None)
+        await _persist_index_job_snapshot(normalized_case_id)
 
 
 def _reset_store_files(paths: list[Path], label: str, reason: str) -> None:
