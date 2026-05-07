@@ -5,11 +5,11 @@ import hashlib
 import json
 import os
 import re
-import signal
 import shutil
 import threading
 import time
 import webbrowser
+from contextlib import asynccontextmanager
 from pathlib import Path
 from threading import Lock
 from typing import Any
@@ -20,7 +20,6 @@ import cv2
 from fastapi import FastAPI, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
 from PIL import Image
 
 from backend.analysis import AnalysisSelection, VideoAnalyzer
@@ -30,6 +29,7 @@ from backend.routers.cases import build_cases_router
 from backend.routers.embedding_settings import build_embedding_settings_router
 from backend.routers.insights import build_insights_router
 from backend.routers.media import build_media_router
+from backend.routers.process_control import build_process_control_router
 from backend.services.case_service import (
     CasePaths,
     build_case_paths as _build_case_paths_impl,
@@ -56,6 +56,7 @@ from backend.services.embedding_settings_service import (
 )
 from backend.services.insights_service import InsightsService
 from backend.services.media_service import MediaService
+from backend.services.process_control_service import ProcessControlService
 from backend.temporal_store import TemporalWindowStore
 from backend.triage import build_video_triage_payload
 from backend.vector_store import VectorStore
@@ -122,14 +123,62 @@ for path in (FRONTEND_DIR, CASES_DIR):
     path.mkdir(parents=True, exist_ok=True)
 
 
-app = FastAPI(title="Local Video Semantic Search", version="1.0.0")
+async def _startup_application(application: FastAPI) -> None:
+    embedding_settings = await asyncio.to_thread(_resolve_effective_embedding_settings_sync)
+    embedder = await asyncio.to_thread(
+        OpenCLIPEmbedder,
+        model_name=embedding_settings["model_name"],
+        pretrained=embedding_settings["pretrained"],
+        cache_dir=os.getenv("OPENCLIP_CACHE_DIR"),
+        device_preference=embedding_settings["device_preference"],
+    )
+    analyzer = await asyncio.to_thread(
+        VideoAnalyzer,
+        os.getenv("YOLO_MODEL_PATH"),
+        _float_from_env("YOLO_CONFIDENCE", 0.3),
+        _float_from_env("YOLO_IOU", 0.45),
+    )
+    application.state.embedder = embedder
+    application.state.analyzer = analyzer
+    application.state.vector_stores = {}
+    application.state.vector_stores_lock = Lock()
+    application.state.temporal_stores = {}
+    application.state.temporal_stores_lock = Lock()
+    application.state.analysis_stores = {}
+    application.state.analysis_stores_lock = Lock()
+    application.state.index_jobs = {}
+    application.state.index_jobs_lock = Lock()
+    application.state.index_tasks = {}
+    application.state.shutdown_requested = False
+    application.state.shutdown_requested_at = ""
+    application.state.embedding_settings = embedding_settings
+    application.state.intent_prompt_embeddings = _build_intent_prompt_embeddings(embedder)
+    print(
+        f"[startup] OpenCLIP model={embedder.model_name} "
+        f"pretrained={embedder.pretrained} "
+        f"device={embedder.device} "
+        f"device_preference={embedder.device_preference}"
+    )
+    await asyncio.to_thread(_list_cases_sync)
+
+
+@asynccontextmanager
+async def _app_lifespan(application: FastAPI):
+    await _startup_application(application)
+    try:
+        yield
+    finally:
+        pass
+
+
+app = FastAPI(
+    title="Local Video Semantic Search",
+    version="1.0.0",
+    lifespan=_app_lifespan,
+)
 
 app.mount("/media/cases", StaticFiles(directory=str(CASES_DIR)), name="media-cases")
 app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR)), name="static")
-
-
-class ShutdownRequest(BaseModel):
-    confirm: bool = False
 
 
 def _read_saved_embedding_settings_sync() -> dict[str, str]:
@@ -299,46 +348,6 @@ def _embedding_engine_info() -> dict[str, Any]:
         "device": str(getattr(embedder, "device", "")),
         "embedding_dim": int(getattr(embedder, "embedding_dim", 0)),
     }
-
-
-@app.on_event("startup")
-async def on_startup() -> None:
-    embedding_settings = await asyncio.to_thread(_resolve_effective_embedding_settings_sync)
-    embedder = await asyncio.to_thread(
-        OpenCLIPEmbedder,
-        model_name=embedding_settings["model_name"],
-        pretrained=embedding_settings["pretrained"],
-        cache_dir=os.getenv("OPENCLIP_CACHE_DIR"),
-        device_preference=embedding_settings["device_preference"],
-    )
-    analyzer = await asyncio.to_thread(
-        VideoAnalyzer,
-        os.getenv("YOLO_MODEL_PATH"),
-        _float_from_env("YOLO_CONFIDENCE", 0.3),
-        _float_from_env("YOLO_IOU", 0.45),
-    )
-    app.state.embedder = embedder
-    app.state.analyzer = analyzer
-    app.state.vector_stores = {}
-    app.state.vector_stores_lock = Lock()
-    app.state.temporal_stores = {}
-    app.state.temporal_stores_lock = Lock()
-    app.state.analysis_stores = {}
-    app.state.analysis_stores_lock = Lock()
-    app.state.index_jobs = {}
-    app.state.index_jobs_lock = Lock()
-    app.state.index_tasks = {}
-    app.state.shutdown_requested = False
-    app.state.shutdown_requested_at = ""
-    app.state.embedding_settings = embedding_settings
-    app.state.intent_prompt_embeddings = _build_intent_prompt_embeddings(embedder)
-    print(
-        f"[startup] OpenCLIP model={embedder.model_name} "
-        f"pretrained={embedder.pretrained} "
-        f"device={embedder.device} "
-        f"device_preference={embedder.device_preference}"
-    )
-    await asyncio.to_thread(_list_cases_sync)
 
 
 @app.get("/", include_in_schema=False)
@@ -1932,133 +1941,14 @@ _media_service = MediaService(
 app.include_router(build_media_router(media_service=_media_service))
 
 
-def _list_active_processes_sync() -> dict:
-    jobs: dict[str, dict] = app.state.index_jobs
-    lock: Lock = app.state.index_jobs_lock
-    processes: list[dict] = []
-
-    with lock:
-        for raw_case_id, job in jobs.items():
-            if not isinstance(job, dict):
-                continue
-            case_id = str(raw_case_id or "").strip()
-            if not case_id:
-                continue
-            status = str(job.get("status") or "")
-            running = bool(job.get("running")) or status in {"queued", "running", "cancelling"}
-            if not running:
-                continue
-            snapshot = _index_job_snapshot(job, case_id=case_id)
-            processes.append(
-                {
-                    "type": "background_index",
-                    "case_id": case_id,
-                    "status": snapshot.get("status", status),
-                    "current_filename": snapshot.get("current_filename", ""),
-                    "completed": int(snapshot.get("completed", 0)),
-                    "total": int(snapshot.get("total", 0)),
-                    "progress_percent": float(snapshot.get("progress_percent", 0.0)),
-                    "started_at": snapshot.get("started_at", ""),
-                    "updated_at": snapshot.get("updated_at", ""),
-                }
-            )
-
-    return {
-        "shutdown_requested": bool(getattr(app.state, "shutdown_requested", False)),
-        "shutdown_requested_at": str(getattr(app.state, "shutdown_requested_at", "") or ""),
-        "count": len(processes),
-        "processes": processes,
-    }
-
-
-def _cancel_running_index_jobs_sync() -> dict:
-    jobs: dict[str, dict] = app.state.index_jobs
-    tasks: dict[str, asyncio.Task] = app.state.index_tasks
-    lock: Lock = app.state.index_jobs_lock
-    cancelled_case_ids: set[str] = set()
-    now = _utc_now_iso()
-
-    with lock:
-        for raw_case_id, job in jobs.items():
-            if not isinstance(job, dict):
-                continue
-            case_id = str(raw_case_id or "").strip()
-            if not case_id:
-                continue
-            status = str(job.get("status") or "")
-            running = bool(job.get("running")) or status in {"queued", "running", "cancelling"}
-            if not running:
-                continue
-            job["cancel_requested"] = True
-            job["status"] = "cancelling"
-            job["running"] = False
-            job["updated_at"] = now
-            cancelled_case_ids.add(case_id)
-
-        for raw_case_id, task in list(tasks.items()):
-            case_id = str(raw_case_id or "").strip()
-            if not case_id or not isinstance(task, asyncio.Task):
-                continue
-            if task.done():
-                continue
-            task.cancel()
-            cancelled_case_ids.add(case_id)
-            job = jobs.get(case_id)
-            if isinstance(job, dict):
-                job["cancel_requested"] = True
-                job["status"] = "cancelling"
-                job["running"] = False
-                job["updated_at"] = now
-
-    return {
-        "cancelled_count": len(cancelled_case_ids),
-        "cancelled_case_ids": sorted(cancelled_case_ids),
-    }
-
-
-def _schedule_process_exit(delay_seconds: float = 1.0) -> None:
-    loop = asyncio.get_running_loop()
-
-    def _trigger_exit() -> None:
-        try:
-            signal.raise_signal(signal.SIGINT)
-        except Exception:
-            os._exit(0)
-
-    loop.call_later(max(0.2, float(delay_seconds)), _trigger_exit)
-
-
-@app.get("/processes")
-async def list_processes() -> dict:
-    try:
-        return await asyncio.to_thread(_list_active_processes_sync)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-
-
-@app.post("/shutdown")
-async def graceful_shutdown(request: ShutdownRequest) -> dict:
-    if not request.confirm:
-        raise HTTPException(status_code=400, detail="confirm=true is required for shutdown.")
-
-    try:
-        process_snapshot = await asyncio.to_thread(_list_active_processes_sync)
-        cancel_payload = await asyncio.to_thread(_cancel_running_index_jobs_sync)
-        app.state.shutdown_requested = True
-        app.state.shutdown_requested_at = _utc_now_iso()
-        _schedule_process_exit(1.0)
-
-        return {
-            "accepted": True,
-            "message": "Graceful shutdown scheduled.",
-            "active_process_count": int(process_snapshot.get("count", 0)),
-            "active_processes": process_snapshot.get("processes", []),
-            "cancelled_count": int(cancel_payload.get("cancelled_count", 0)),
-            "cancelled_case_ids": cancel_payload.get("cancelled_case_ids", []),
-            "shutdown_requested_at": str(app.state.shutdown_requested_at),
-        }
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+_process_control_service = ProcessControlService(
+    app=app,
+    utc_now_iso=_utc_now_iso,
+    index_job_snapshot=_index_job_snapshot,
+)
+app.include_router(
+    build_process_control_router(process_control_service=_process_control_service)
+)
 
 
 def _hydrate_crop_item(case_paths: CasePaths, item: dict) -> dict:
