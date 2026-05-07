@@ -10,8 +10,6 @@ import shutil
 import threading
 import time
 import webbrowser
-from datetime import datetime, timezone
-from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
 from urllib.parse import quote
@@ -28,6 +26,20 @@ from PIL import Image
 from backend.analysis import AnalysisSelection, VideoAnalyzer
 from backend.analysis_store import AnalysisCropStore
 from backend.embeddings import OpenCLIPEmbedder
+from backend.routers.cases import build_cases_router
+from backend.services.case_service import (
+    CasePaths,
+    build_case_paths as _build_case_paths_impl,
+    create_case_sync as _create_case_sync_impl,
+    delete_case_sync as _delete_case_sync_impl,
+    ensure_case_directories as _ensure_case_directories_impl,
+    get_case_paths_or_raise as _get_case_paths_or_raise_impl,
+    list_cases_sync as _list_cases_sync_impl,
+    normalize_case_id as _normalize_case_id_impl,
+    rename_case_sync as _rename_case_sync_impl,
+    resolve_case_id_or_default as _resolve_case_id_or_default_impl,
+    utc_now_iso as _utc_now_iso_impl,
+)
 from backend.temporal_store import TemporalWindowStore
 from backend.triage import build_video_triage_payload
 from backend.vector_store import VectorStore
@@ -114,35 +126,10 @@ for path in (FRONTEND_DIR, CASES_DIR):
     path.mkdir(parents=True, exist_ok=True)
 
 
-@dataclass(frozen=True)
-class CasePaths:
-    case_id: str
-    case_dir: Path
-    videos_dir: Path
-    thumbnails_dir: Path
-    data_dir: Path
-    index_path: Path
-    metadata_path: Path
-    temporal_index_path: Path
-    temporal_metadata_path: Path
-    face_people_index_path: Path
-    face_people_metadata_path: Path
-    vehicles_index_path: Path
-    vehicles_metadata_path: Path
-
-
 app = FastAPI(title="Local Video Semantic Search", version="1.0.0")
 
 app.mount("/media/cases", StaticFiles(directory=str(CASES_DIR)), name="media-cases")
 app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR)), name="static")
-
-
-class CaseCreateRequest(BaseModel):
-    name: str = Field(..., min_length=1, max_length=200)
-
-
-class CaseRenameRequest(BaseModel):
-    name: str = Field(..., min_length=1, max_length=200)
 
 
 class ProcessVideoRequest(BaseModel):
@@ -578,276 +565,73 @@ def _is_supported_video(filename: str) -> bool:
 
 
 def _normalize_case_id(case_id: str) -> str:
-    raw = str(case_id or "").strip()
-    if not raw:
-        raise ValueError("case_id is required")
-    safe = "".join(char if char.isalnum() or char in {"-", "_"} else "_" for char in raw)
-    if not safe:
-        raise ValueError("Invalid case_id")
-    return safe
+    return _normalize_case_id_impl(case_id)
 
 
 def _build_case_paths(case_id: str) -> CasePaths:
-    normalized = _normalize_case_id(case_id)
-    case_dir = CASES_DIR / normalized
-    videos_dir = case_dir / "videos"
-    thumbnails_dir = case_dir / "thumbnails"
-    data_dir = case_dir / "data"
-    return CasePaths(
-        case_id=normalized,
-        case_dir=case_dir,
-        videos_dir=videos_dir,
-        thumbnails_dir=thumbnails_dir,
-        data_dir=data_dir,
-        index_path=data_dir / "faiss.index",
-        metadata_path=data_dir / "metadata.json",
-        temporal_index_path=data_dir / "temporal_faiss.index",
-        temporal_metadata_path=data_dir / "temporal_metadata.json",
-        face_people_index_path=data_dir / "face_people.index",
-        face_people_metadata_path=data_dir / "face_people_metadata.json",
-        vehicles_index_path=data_dir / "vehicles.index",
-        vehicles_metadata_path=data_dir / "vehicles_metadata.json",
-    )
+    return _build_case_paths_impl(case_id, cases_dir=CASES_DIR)
 
 
 def _ensure_case_directories(case_paths: CasePaths) -> None:
-    for path in (
-        case_paths.case_dir,
-        case_paths.videos_dir,
-        case_paths.thumbnails_dir,
-        case_paths.data_dir,
-    ):
-        path.mkdir(parents=True, exist_ok=True)
-
-
-def _empty_cases_registry() -> dict:
-    return {"next_numeric_id": 1, "cases": []}
+    _ensure_case_directories_impl(case_paths)
 
 
 def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def _infer_case_created_at(case_id: str) -> str:
-    case_dir = CASES_DIR / case_id
-    if case_dir.exists() and case_dir.is_dir():
-        try:
-            created_at_ts = case_dir.stat().st_ctime
-            return datetime.fromtimestamp(created_at_ts, timezone.utc).isoformat()
-        except Exception:
-            return _utc_now_iso()
-    return _utc_now_iso()
-
-
-def _load_cases_registry_locked() -> dict:
-    if not CASES_REGISTRY_PATH.exists():
-        return _empty_cases_registry()
-
-    try:
-        payload = json.loads(CASES_REGISTRY_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        return _empty_cases_registry()
-
-    if not isinstance(payload, dict):
-        return _empty_cases_registry()
-
-    raw_cases = payload.get("cases", [])
-    if not isinstance(raw_cases, list):
-        raw_cases = []
-
-    cleaned_cases: list[dict[str, str]] = []
-    changed = False
-    for item in raw_cases:
-        if not isinstance(item, dict):
-            continue
-        case_id_raw = item.get("case_id")
-        name_raw = item.get("name")
-        if case_id_raw is None or name_raw is None:
-            continue
-        try:
-            cleaned_case_id = _normalize_case_id(str(case_id_raw))
-        except ValueError:
-            continue
-        cleaned_name = str(name_raw).strip() or cleaned_case_id
-        created_at_raw = item.get("created_at")
-        cleaned_created_at = (
-            str(created_at_raw).strip()
-            if isinstance(created_at_raw, str) and str(created_at_raw).strip()
-            else ""
-        )
-        if not cleaned_created_at:
-            cleaned_created_at = _infer_case_created_at(cleaned_case_id)
-            changed = True
-        cleaned_cases.append(
-            {
-                "case_id": cleaned_case_id,
-                "name": cleaned_name,
-                "created_at": cleaned_created_at,
-            }
-        )
-
-    next_numeric_id = payload.get("next_numeric_id", 1)
-    try:
-        next_numeric_id = int(next_numeric_id)
-    except Exception:
-        next_numeric_id = 1
-    next_numeric_id = max(1, next_numeric_id)
-
-    if changed:
-        payload["next_numeric_id"] = next_numeric_id
-        payload["cases"] = cleaned_cases
-        _save_cases_registry_locked(payload)
-
-    return {"next_numeric_id": next_numeric_id, "cases": cleaned_cases}
-
-
-def _save_cases_registry_locked(payload: dict) -> None:
-    CASES_DIR.mkdir(parents=True, exist_ok=True)
-    CASES_REGISTRY_PATH.write_text(
-        json.dumps(payload, indent=2),
-        encoding="utf-8",
-    )
-
-
-def _find_case_locked(payload: dict, case_id: str) -> dict | None:
-    for item in payload.get("cases", []):
-        if item.get("case_id") == case_id:
-            return item
-    return None
+    return _utc_now_iso_impl()
 
 
 def _list_cases_sync() -> list[dict[str, str]]:
-    with CASE_REGISTRY_LOCK:
-        payload = _load_cases_registry_locked()
-        cases = sorted(
-            payload["cases"],
-            key=lambda item: (
-                str(item.get("created_at", "")),
-                str(item.get("case_id", "")),
-            ),
-        )
-
-    for item in cases:
-        _ensure_case_directories(_build_case_paths(item["case_id"]))
-
-    return [
-        {
-            "case_id": item["case_id"],
-            "name": item["name"],
-            "created_at": str(item.get("created_at", "")),
-        }
-        for item in cases
-    ]
+    return _list_cases_sync_impl(
+        cases_registry_path=CASES_REGISTRY_PATH,
+        cases_dir=CASES_DIR,
+        case_registry_lock=CASE_REGISTRY_LOCK,
+    )
 
 
 def _create_case_sync(name: str) -> dict[str, str]:
-    clean_name = str(name or "").strip()
-    if not clean_name:
-        raise ValueError("Case name cannot be empty")
-
-    with CASE_REGISTRY_LOCK:
-        payload = _load_cases_registry_locked()
-        existing_ids = {
-            str(item.get("case_id"))
-            for item in payload.get("cases", [])
-            if item.get("case_id")
-        }
-
-        case_id = str(uuid4())
-        while case_id in existing_ids:
-            case_id = str(uuid4())
-
-        created_at = _utc_now_iso()
-        payload["cases"].append(
-            {
-                "case_id": case_id,
-                "name": clean_name,
-                "created_at": created_at,
-            }
-        )
-        _save_cases_registry_locked(payload)
-
-    _ensure_case_directories(_build_case_paths(case_id))
-    return {"case_id": case_id, "name": clean_name, "created_at": created_at}
+    return _create_case_sync_impl(
+        name,
+        cases_registry_path=CASES_REGISTRY_PATH,
+        cases_dir=CASES_DIR,
+        case_registry_lock=CASE_REGISTRY_LOCK,
+    )
 
 
 def _delete_case_sync(case_id: str) -> dict[str, str]:
-    normalized = _normalize_case_id(case_id)
-
-    with CASE_REGISTRY_LOCK:
-        payload = _load_cases_registry_locked()
-        existing_cases = payload.get("cases", [])
-        remaining_cases: list[dict[str, str]] = []
-        deleted_case: dict | None = None
-
-        for item in existing_cases:
-            if item.get("case_id") == normalized and deleted_case is None:
-                deleted_case = item
-            else:
-                remaining_cases.append(item)
-
-        if deleted_case is None:
-            raise KeyError(normalized)
-
-        payload["cases"] = remaining_cases
-        _save_cases_registry_locked(payload)
-
-    case_paths = _build_case_paths(normalized)
-    if case_paths.case_dir.exists():
-        shutil.rmtree(case_paths.case_dir)
-
-    deleted_name = str(deleted_case.get("name") or normalized)
-    deleted_created_at = str(deleted_case.get("created_at") or "")
-    return {
-        "case_id": normalized,
-        "name": deleted_name,
-        "created_at": deleted_created_at,
-    }
+    return _delete_case_sync_impl(
+        case_id,
+        cases_registry_path=CASES_REGISTRY_PATH,
+        cases_dir=CASES_DIR,
+        case_registry_lock=CASE_REGISTRY_LOCK,
+    )
 
 
 def _rename_case_sync(case_id: str, name: str) -> dict[str, str]:
-    normalized = _normalize_case_id(case_id)
-    clean_name = str(name or "").strip()
-    if not clean_name:
-        raise ValueError("Case name cannot be empty")
-
-    with CASE_REGISTRY_LOCK:
-        payload = _load_cases_registry_locked()
-        case = _find_case_locked(payload, normalized)
-        if case is None:
-            raise KeyError(normalized)
-        case["name"] = clean_name
-        _save_cases_registry_locked(payload)
-
-    return {
-        "case_id": normalized,
-        "name": clean_name,
-        "created_at": str(case.get("created_at") or ""),
-    }
+    return _rename_case_sync_impl(
+        case_id,
+        name,
+        cases_registry_path=CASES_REGISTRY_PATH,
+        cases_dir=CASES_DIR,
+        case_registry_lock=CASE_REGISTRY_LOCK,
+    )
 
 
 def _get_case_paths_or_raise(case_id: str) -> CasePaths:
-    normalized = _normalize_case_id(case_id)
-    with CASE_REGISTRY_LOCK:
-        payload = _load_cases_registry_locked()
-        case = _find_case_locked(payload, normalized)
-    if case is None:
-        raise KeyError(normalized)
-
-    case_paths = _build_case_paths(normalized)
-    _ensure_case_directories(case_paths)
-    return case_paths
+    return _get_case_paths_or_raise_impl(
+        case_id,
+        cases_registry_path=CASES_REGISTRY_PATH,
+        cases_dir=CASES_DIR,
+        case_registry_lock=CASE_REGISTRY_LOCK,
+    )
 
 
 def _resolve_case_id_or_default(case_id: str | None) -> str:
-    if case_id and str(case_id).strip():
-        return _normalize_case_id(case_id)
-
-    cases = _list_cases_sync()
-    if cases:
-        return _normalize_case_id(cases[0]["case_id"])
-
-    raise ValueError("No cases available. Create a case first.")
+    return _resolve_case_id_or_default_impl(
+        case_id,
+        cases_registry_path=CASES_REGISTRY_PATH,
+        cases_dir=CASES_DIR,
+        case_registry_lock=CASE_REGISTRY_LOCK,
+    )
 
 
 def _list_case_video_filenames(case_paths: CasePaths) -> list[str]:
@@ -2306,138 +2090,15 @@ def _delete_video_sync(case_id: str, filename: str) -> dict:
         "removed_vehicle_crops": int(crop_result.get("removed_vehicles", 0)),
     }
 
-
-@app.post("/cases")
-async def create_case(request: CaseCreateRequest) -> dict:
-    try:
-        created = await asyncio.to_thread(_create_case_sync, request.name)
-        try:
-            cases = await asyncio.to_thread(_list_cases_sync)
-        except Exception:
-            cases = []
-
-        if cases is None:
-            cases = []
-        if not isinstance(cases, list):
-            cases = []
-
-        return {
-            "case_id": created.get("case_id"),
-            "name": created.get("name"),
-            "created_at": created.get("created_at"),
-            "cases": cases,
-        }
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-
-
-@app.get("/cases")
-async def list_cases() -> dict:
-    try:
-        cases = await asyncio.to_thread(_list_cases_sync)
-    except Exception:
-        cases = []
-
-    if cases is None:
-        cases = []
-    if not isinstance(cases, list):
-        cases = []
-
-    return {"cases": cases}
-
-
-@app.patch("/cases/{case_id}")
-async def rename_case(case_id: str, request: CaseRenameRequest) -> dict:
-    try:
-        renamed = await asyncio.to_thread(_rename_case_sync, case_id, request.name)
-        try:
-            cases = await asyncio.to_thread(_list_cases_sync)
-        except Exception:
-            cases = []
-
-        if cases is None:
-            cases = []
-        if not isinstance(cases, list):
-            cases = []
-
-        return {
-            "case_id": renamed["case_id"],
-            "name": renamed["name"],
-            "created_at": renamed.get("created_at"),
-            "cases": cases,
-        }
-    except KeyError:
-        raise HTTPException(status_code=404, detail=f"Case not found: {case_id}")
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-
-
-@app.delete("/cases/{case_id}")
-async def delete_case(case_id: str) -> dict:
-    try:
-        normalized_case_id = _normalize_case_id(case_id)
-        index_jobs: dict[str, dict] = app.state.index_jobs
-        index_tasks: dict[str, asyncio.Task] = app.state.index_tasks
-        index_lock: Lock = app.state.index_jobs_lock
-        with index_lock:
-            existing_job = index_jobs.get(normalized_case_id)
-            if isinstance(existing_job, dict):
-                existing_status = str(existing_job.get("status") or "")
-                if bool(existing_job.get("running")) or existing_status in {"queued", "running"}:
-                    raise HTTPException(
-                        status_code=409,
-                        detail=(
-                            f"Background indexing is still running for case {normalized_case_id}. "
-                            "Wait for completion before deleting the case."
-                        ),
-                    )
-
-        deleted = await asyncio.to_thread(_delete_case_sync, case_id)
-        cache: dict[str, VectorStore] = app.state.vector_stores
-        cache_lock: Lock = app.state.vector_stores_lock
-        with cache_lock:
-            cache.pop(deleted["case_id"], None)
-        temporal_cache: dict[str, TemporalWindowStore] = app.state.temporal_stores
-        temporal_cache_lock: Lock = app.state.temporal_stores_lock
-        with temporal_cache_lock:
-            temporal_cache.pop(deleted["case_id"], None)
-        analysis_cache: dict[str, AnalysisCropStore] = app.state.analysis_stores
-        analysis_cache_lock: Lock = app.state.analysis_stores_lock
-        with analysis_cache_lock:
-            analysis_cache.pop(deleted["case_id"], None)
-        with index_lock:
-            index_jobs.pop(deleted["case_id"], None)
-            dangling_task = index_tasks.pop(deleted["case_id"], None)
-            if dangling_task and not dangling_task.done():
-                dangling_task.cancel()
-
-        try:
-            cases = await asyncio.to_thread(_list_cases_sync)
-        except Exception:
-            cases = []
-
-        if cases is None:
-            cases = []
-        if not isinstance(cases, list):
-            cases = []
-
-        return {
-            "deleted_case_id": deleted["case_id"],
-            "deleted_name": deleted.get("name"),
-            "deleted_created_at": deleted.get("created_at"),
-            "cases": cases,
-        }
-    except HTTPException:
-        raise
-    except KeyError:
-        raise HTTPException(status_code=404, detail=f"Case not found: {case_id}")
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-
+app.include_router(
+    build_cases_router(
+        create_case_sync=_create_case_sync,
+        list_cases_sync=_list_cases_sync,
+        rename_case_sync=_rename_case_sync,
+        delete_case_sync=_delete_case_sync,
+        normalize_case_id=_normalize_case_id,
+    )
+)
 
 @app.post("/upload")
 async def upload(case_id: str | None = None, files: list[UploadFile] = File(...)) -> dict:

@@ -1,11 +1,41 @@
-# Local-First Video Semantic Search
+# VisioX (Local-First Video Investigation)
 
-Offline-capable video semantic search app using FastAPI, OpenCV, OpenCLIP, and FAISS.
+Offline-capable FastAPI + vanilla JS application for:
+- case-based video ingestion
+- triage timelines (activity + audio)
+- semantic search
+- optional Face/People and Vehicle analysis
 
-Current UX workflow (top tabs):
-1. `Semantic Search`: ingest videos (auto-convert to browser-safe MP4), base semantic indexing, semantic search, player
-2. `Face & People`: select ingested videos to run analysis, search over detected crops, face wall + people wall, player
-3. `Vehicle`: select ingested videos to run analysis, search over detected crops, vehicle wall, player
+Everything runs locally (no external inference API calls).
+
+## Current Workflow
+
+1. **Case Repository**
+   - Create, rename, delete cases (case IDs are UUID-based).
+   - Open a case to enter workspace.
+
+2. **Workspace Utility Sidebar**
+   - `Back` (to repository)
+   - `Analysis` (main tabs)
+   - `Report` (placeholder)
+   - `Settings` (embedding engine settings)
+   - `Exit` (shows running processes, asks confirmation, then graceful shutdown)
+
+3. **Analysis Tabs**
+   - `Video Triage`
+     - Upload videos (auto conversion/remux for browser-compatible playback)
+     - Choose which selected files should be semantically indexed **before upload**
+     - Run semantic indexing for existing uploaded videos that are still unindexed
+     - View triage timelines (activity + audio), scrub timeline, jump to peaks
+   - `Semantic Search`
+     - Natural-language search with intent-aware backend mode selection (`object` / `action` / `scene`)
+     - Returns timestamped thumbnail hits and playback jump actions
+   - `Face & People`
+     - Run analysis on selected videos
+     - Search over detected crops, face wall + people wall
+   - `Vehicle`
+     - Run analysis on selected videos
+     - Search over detected crops, vehicle wall
 
 ## Project Structure
 
@@ -14,131 +44,190 @@ project/
   backend/
     main.py
     video_processing.py
+    triage.py
     embeddings.py
     vector_store.py
+    temporal_store.py
+    analysis.py
+    analysis_store.py
   frontend/
     index.html
     script.js
     styles.css
   cases/
     cases.json
-    8fbd20f2-04dd-4f02-bfb4-1f7fbb9b48c1/
+    app_settings.json
+    {case_id}/
       videos/
       thumbnails/
       data/
         faiss.index
         metadata.json
+        temporal_faiss.index
+        temporal_metadata.json
+        face_people.index
+        face_people_metadata.json
+        vehicles.index
+        vehicles_metadata.json
+        triage_cache/
 ```
 
 ## Run Locally
 
-1. Create and activate a virtual environment:
+1. Create and activate venv:
 
 ```powershell
 python -m venv .venv
 .venv\Scripts\activate
 ```
 
-2. Install dependencies:
+2. Install deps:
 
 ```powershell
 pip install -r requirements.txt
 ```
 
-This installs `imageio-ffmpeg` too, so AVI conversion works even if system `ffmpeg` is not installed.
-It also installs `ultralytics` for stronger local detector support in step 2.
-
-3. Start the app:
+3. Start app:
 
 ```powershell
 python -m backend.main
 ```
 
-The app runs at `http://127.0.0.1:8000` and opens in your browser automatically.
+App serves on `http://127.0.0.1:8000` and opens browser automatically.
 
-## Offline OpenCLIP Note
+## Offline Model Notes
 
-The app is fully local/offline at runtime, but OpenCLIP weights must be available on disk.
-
-Use a local cache directory (recommended):
+- Runtime is local/offline, but model weights must exist on disk.
+- OpenCLIP cache (recommended):
 
 ```powershell
-$env:OPENCLIP_CACHE_DIR = ".\\data\\openclip_cache"
-python -m backend.main
+$env:OPENCLIP_CACHE_DIR = ".\\cases\\model_cache\\openclip"
 ```
 
-If the selected model weights are not already in that cache, download them once while online, then reuse the same cache offline.
-
-## AVI Playback
-
-When you upload a video, the backend converts/remuxes to browser-compatible `.mp4` and stores it in the selected case's `videos/` folder.
-This keeps search/indexing local and makes playback reliable in HTML5 browsers.
-
-Current conversion strategy:
-- Try **remux** first (`-c copy`) with video + audio preserved (fastest, no recompression)
-- If remux is not possible, fallback to high-quality transcode:
-  - video: `libx264`, `crf=18`, `preset=fast`, `yuv420p`
-  - audio: `aac`, `192k`
-
-ffmpeg resolution order:
-1. `FFMPEG_PATH` environment variable
-2. `ffmpeg` in system `PATH`
-3. Bundled binary from `imageio-ffmpeg` (installed via `requirements.txt`)
-
-## Optional Analysis (Step 2)
-
-- Categories:
-  - `Face & People` (Haar face detection + YOLO person detection)
-  - `Vehicles` (YOLO vehicle classes from COCO)
-- Analysis can run:
-  - manually on selected ingested videos
-- Analysis stores detected crops and CLIP embeddings locally for crop-search and wall views.
-- Analysis is cached per video/interval and only re-runs when needed (or `force=true` is used).
-
-### Offline YOLO Weights
-
-For fully offline step-2 analysis, place YOLO weights locally and set:
+- Optional YOLO local weights:
 
 ```powershell
 $env:YOLO_MODEL_PATH = ".\\models\\yolov8s.pt"
 ```
 
-If unset, the app falls back to `models/yolov8s.pt` (if present) or `yolov8s.pt`.
+## Video Ingestion and Conversion
+
+Supported inputs: `.mp4`, `.mov`, `.avi`, `.mkv`, `.webm`, `.m4v`
+
+On upload:
+1. file is saved to temporary case data path
+2. ffmpeg tries **remux** to MP4 with audio preserved
+3. if remux fails, app falls back to high-quality transcode (`libx264` + `aac`)
+4. only completed output is moved into `cases/{case_id}/videos`
+
+ffmpeg resolution order:
+1. `FFMPEG_PATH`
+2. `ffmpeg` in system `PATH`
+3. bundled binary from `imageio-ffmpeg`
+
+## Semantic Indexing Behavior
+
+- Semantic indexing is separate from upload completion.
+- You can choose index targets:
+  - pre-upload file checklist (`Select All` supported)
+  - existing-unindexed video checklist (`Select All` supported)
+- Background indexing endpoint:
+  - `POST /index/start`
+- Progress endpoint:
+  - `GET /index/status?case_id=...`
+  - includes current file, overall job progress, and per-file progress estimate
+
+Current guardrail:
+- only one background semantic indexing job runs at a time across cases.
+
+## Triage Timelines
+
+Endpoint: `POST /triage_timeline`
+
+- Activity timeline combines motion + people detections + vehicle detections
+- Audio timeline computes RMS intensity from extracted audio
+- Timeline payload is cached per video/bucket in `data/triage_cache`
 
 ## API Endpoints
 
+### Case Management
 - `POST /cases`
 - `GET /cases`
+- `PATCH /cases/{case_id}`
+- `DELETE /cases/{case_id}`
+
+### Ingestion and Media
 - `POST /upload?case_id=...`
-- `POST /process_video` (body includes `case_id`)
-- `POST /analysis_gallery` (body includes `case_id`, category, optional query)
-- `POST /search` (body includes `case_id`)
 - `GET /videos?case_id=...`
+- `DELETE /videos?case_id=...&filename=...`
+
+### Processing and Search
+- `POST /process_video`
+- `POST /index/start`
+- `GET /index/status?case_id=...`
+- `POST /triage_timeline`
+- `POST /analysis_gallery`
+- `POST /search`
+
+### Settings and Process Control
 - `GET /settings/embedding`
 - `POST /settings/embedding`
+- `GET /processes`
+- `POST /shutdown`
 
-## Notes
+## Config
 
-- Each case has isolated storage in `cases/{case_id}/videos`, `cases/{case_id}/thumbnails`, and `cases/{case_id}/data`
-- Optional model overrides:
-  - `OPENCLIP_MODEL` (default: `ViT-L-14`)
-  - `OPENCLIP_PRETRAINED` (default: `openai`)
-  - `OPENCLIP_DEVICE` (default: `auto`, allowed: `auto`, `cuda`, `cpu`)
-  - `OPENCLIP_CACHE_DIR` (set this to a local cache path for offline model loading)
-  - `YOLO_MODEL_PATH` (optional local model path for step-2 analysis)
-  - `YOLO_CONFIDENCE` (default: `0.3`)
-  - `YOLO_IOU` (default: `0.45`)
-  - Semantic search tuning:
-    - `SEMANTIC_MIN_SCORE` (default: `0.22`)
-    - `SEMANTIC_DIVERSITY_SECONDS` (default: `6.0`)
-    - `SEMANTIC_OVERSAMPLE_FACTOR` (default: `10`)
-    - `SEMANTIC_MAX_CANDIDATES` (default: `2000`)
-    - `SEMANTIC_WINDOW_SECONDS` (default: `8.0`, used for action/scene temporal windows)
-    - `SEMANTIC_WINDOW_STRIDE_SECONDS` (default: `2.0`)
+### Embedding / Detector
+- `OPENCLIP_MODEL` (default `ViT-L-14`)
+- `OPENCLIP_PRETRAINED` (default `openai`)
+- `OPENCLIP_DEVICE` (`auto|cuda|cpu`, default `auto`)
+- `OPENCLIP_CACHE_DIR` (optional local model cache path)
+- `YOLO_MODEL_PATH` (optional local model path)
+- `YOLO_CONFIDENCE` (default `0.3`)
+- `YOLO_IOU` (default `0.45`)
 
-Changing `OPENCLIP_MODEL` or `OPENCLIP_PRETRAINED` requires re-indexing semantic embeddings for existing videos.
-You can also change model/device from the in-app selector (Semantic Search tab -> Embedding Engine) and restart the app to apply.
+### Semantic Search
+- `SEMANTIC_MIN_SCORE` (default `0.22`)
+- `SEMANTIC_DIVERSITY_SECONDS` (default `6.0`)
+- `SEMANTIC_OVERSAMPLE_FACTOR` (default `10`)
+- `SEMANTIC_MAX_CANDIDATES` (default `2000`)
+- `SEMANTIC_WINDOW_SECONDS` (default `8.0`)
+- `SEMANTIC_WINDOW_STRIDE_SECONDS` (default `2.0`)
 
-Semantic search now auto-detects query intent in backend:
-- `object` intent -> frame-level index
-- `action` / `scene` intents -> temporal window index (with fallback to frame search if needed)
+Changing OpenCLIP model/pretrained generally requires semantic re-indexing for existing cases.
+
+## Scalability and Maintainability Review (Current Codebase)
+
+Recommended next improvements:
+
+1. **Split `backend/main.py` into routers/services**
+   - `main.py` is large and mixes API + business logic.
+   - Move to modules: `cases`, `ingest`, `index`, `triage`, `analysis`, `settings`.
+
+2. **Introduce durable background job storage**
+   - Job state is currently in-memory.
+   - Store jobs in SQLite (or similar) so status survives restart/crash.
+
+3. **Use a real task queue for heavy work**
+   - Current approach uses in-process async + threads.
+   - Add a worker queue model for scale, cancellation, retries, and multiple concurrent workers.
+
+4. **Add schema/version migrations for JSON metadata**
+   - There are multiple metadata files per case.
+   - Version and migrate structures explicitly to keep backward compatibility stable.
+
+5. **Add automated tests**
+   - Add unit tests for conversion, indexing selection logic, triage cache validity, and endpoint contracts.
+   - Add a small integration suite for case lifecycle and indexing flow.
+
+6. **Improve observability**
+   - Switch to structured logs (JSON or key-value), with request/job IDs consistently.
+   - Add timing metrics for upload, conversion, indexing, and triage generation.
+
+7. **Harden concurrency and file operations**
+   - Continue isolating temp files per case.
+   - Add explicit safeguards around deletes vs active playback/indexing across all long-running paths.
+
+8. **Prepare API contracts for frontend evolution**
+   - Define response schemas in one place and validate them consistently.
+   - This reduces UI breakage from payload-shape drift.

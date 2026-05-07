@@ -3179,6 +3179,8 @@ function playInPlayer(
   };
 
   if (changedVideo) {
+    // Stop old audio immediately before switching sources.
+    player.pause();
     player.dataset.filename = filename;
     player.dataset.videoUrl = videoUrl;
     player.dataset.caseId = activeCaseId;
