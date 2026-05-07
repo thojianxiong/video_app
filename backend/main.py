@@ -13,11 +13,10 @@ import webbrowser
 from pathlib import Path
 from threading import Lock
 from urllib.parse import quote
-from uuid import uuid4
 
 import numpy as np
 import cv2
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -28,6 +27,7 @@ from backend.analysis_store import AnalysisCropStore
 from backend.embeddings import OpenCLIPEmbedder
 from backend.routers.cases import build_cases_router
 from backend.routers.embedding_settings import build_embedding_settings_router
+from backend.routers.media import build_media_router
 from backend.services.case_service import (
     CasePaths,
     build_case_paths as _build_case_paths_impl,
@@ -52,6 +52,7 @@ from backend.services.embedding_settings_service import (
     resolve_effective_embedding_settings_sync as _resolve_effective_embedding_settings_sync_impl,
     write_saved_embedding_settings_sync as _write_saved_embedding_settings_sync_impl,
 )
+from backend.services.media_service import MediaService
 from backend.temporal_store import TemporalWindowStore
 from backend.triage import build_video_triage_payload
 from backend.vector_store import VectorStore
@@ -122,25 +123,6 @@ app = FastAPI(title="Local Video Semantic Search", version="1.0.0")
 
 app.mount("/media/cases", StaticFiles(directory=str(CASES_DIR)), name="media-cases")
 app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR)), name="static")
-
-
-class ProcessVideoRequest(BaseModel):
-    case_id: str | None = None
-    filename: str
-    frame_interval_seconds: float = Field(default=1.0, gt=0)
-    batch_size: int = Field(default=32, ge=1, le=256)
-    force: bool = False
-    analysis_face_people: bool = False
-    analysis_vehicles: bool = False
-    analysis_only: bool = False
-
-
-class IndexStartRequest(BaseModel):
-    case_id: str | None = None
-    filenames: list[str] | None = None
-    frame_interval_seconds: float = Field(default=1.0, gt=0)
-    batch_size: int = Field(default=32, ge=1, le=256)
-    force: bool = False
 
 
 class SearchRequest(BaseModel):
@@ -1945,399 +1927,30 @@ app.include_router(
         build_settings_response_sync=_build_embedding_settings_response_sync,
     )
 )
-
-@app.post("/upload")
-async def upload(case_id: str | None = None, files: list[UploadFile] = File(...)) -> dict:
-    if not files:
-        raise HTTPException(status_code=400, detail="No files provided")
-
-    try:
-        resolved_case_id = await asyncio.to_thread(_resolve_case_id_or_default, case_id)
-        case_paths = await asyncio.to_thread(_get_case_paths_or_raise, resolved_case_id)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    except KeyError:
-        raise HTTPException(status_code=404, detail=f"Case not found: {case_id}")
-
-    uploaded: list[str] = []
-    errors: list[str] = []
-    transcoded: list[dict[str, str]] = []
-    uploaded_items: list[dict[str, str | int | bool]] = []
-
-    for source_index, upload_file in enumerate(files):
-        if not upload_file.filename:
-            errors.append("Encountered a file without a name")
-            continue
-        if not _is_supported_video(upload_file.filename):
-            errors.append(
-                f"{upload_file.filename}: unsupported format (allowed: "
-                + ", ".join(sorted(VIDEO_EXTENSIONS))
-                + ")"
-            )
-            await upload_file.close()
-            continue
-
-        source_extension = Path(upload_file.filename).suffix.lower() or ".mp4"
-        temp_upload_path = case_paths.data_dir / f"upload_{uuid4().hex}{source_extension}"
-        temp_converted_path = case_paths.data_dir / f"converted_{uuid4().hex}.mp4"
-        converted_name, converted_path = _unique_video_path(
-            case_paths.videos_dir,
-            upload_file.filename,
-            forced_suffix=".mp4",
-        )
-        try:
-            await asyncio.to_thread(_write_upload_file, upload_file, temp_upload_path)
-
-            print(
-                f"[upload][{case_paths.case_id}] convert input={upload_file.filename} "
-                f"output={converted_name}"
-            )
-            conversion_ok, conversion_error = await asyncio.to_thread(
-                convert_to_mp4,
-                temp_upload_path,
-                temp_converted_path,
-            )
-
-            if conversion_ok:
-                temp_upload_path.unlink(missing_ok=True)
-                await asyncio.to_thread(
-                    shutil.move,
-                    str(temp_converted_path),
-                    str(converted_path),
-                )
-                uploaded.append(converted_name)
-                transcoded.append(
-                    {
-                        "source_filename": upload_file.filename,
-                        "stored_filename": converted_name,
-                    }
-                )
-                uploaded_items.append(
-                    {
-                        "source_index": int(source_index),
-                        "source_filename": str(upload_file.filename),
-                        "stored_filename": str(converted_name),
-                        "converted": True,
-                    }
-                )
-                preview_path = _preview_thumbnail_path(case_paths, converted_name)
-                preview_ok = await asyncio.to_thread(
-                    generate_preview_thumbnail,
-                    converted_path,
-                    preview_path,
-                )
-                if not preview_ok:
-                    print(
-                        f"[upload][{case_paths.case_id}] preview generation failed "
-                        f"file={converted_name}"
-                    )
-                print(
-                    f"[upload][{case_paths.case_id}] convert success input={upload_file.filename} "
-                    f"output={converted_name}"
-                )
-            else:
-                temp_converted_path.unlink(missing_ok=True)
-                fallback_name, fallback_path = _unique_video_path(
-                    case_paths.videos_dir,
-                    upload_file.filename,
-                )
-                await asyncio.to_thread(shutil.move, str(temp_upload_path), str(fallback_path))
-                uploaded.append(fallback_name)
-                uploaded_items.append(
-                    {
-                        "source_index": int(source_index),
-                        "source_filename": str(upload_file.filename),
-                        "stored_filename": str(fallback_name),
-                        "converted": False,
-                    }
-                )
-                preview_path = _preview_thumbnail_path(case_paths, fallback_name)
-                preview_ok = await asyncio.to_thread(
-                    generate_preview_thumbnail,
-                    fallback_path,
-                    preview_path,
-                )
-                if not preview_ok:
-                    print(
-                        f"[upload][{case_paths.case_id}] preview generation failed "
-                        f"file={fallback_name}"
-                    )
-                short_error = _truncate_error(conversion_error)
-                errors.append(
-                    f"{upload_file.filename}: mp4 conversion failed ({short_error})"
-                )
-                print(
-                    f"[upload][{case_paths.case_id}] convert failure input={upload_file.filename} "
-                    f"output={converted_name}"
-                )
-                if conversion_error:
-                    print(f"[upload][{case_paths.case_id}] ffmpeg error: {conversion_error}")
-        except Exception as exc:
-            converted_path.unlink(missing_ok=True)
-            temp_converted_path.unlink(missing_ok=True)
-            temp_upload_path.unlink(missing_ok=True)
-            errors.append(f"{upload_file.filename}: {exc}")
-        finally:
-            await upload_file.close()
-
-    return {
-        "case_id": case_paths.case_id,
-        "uploaded": uploaded,
-        "uploaded_items": uploaded_items,
-        "errors": errors,
-        "transcoded": transcoded,
-    }
-
-
-@app.get("/videos")
-async def list_videos(case_id: str | None = None) -> dict:
-    try:
-        resolved_case_id = await asyncio.to_thread(_resolve_case_id_or_default, case_id)
-        case_paths, vector_store = await asyncio.to_thread(
-            _get_vector_store_for_case,
-            resolved_case_id,
-        )
-        _, temporal_store = await asyncio.to_thread(
-            _get_temporal_store_for_case,
-            resolved_case_id,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    except KeyError:
-        raise HTTPException(status_code=404, detail=f"Case not found: {case_id}")
-
-    indexed_counts = vector_store.indexed_counts_by_filename()
-    indexed_window_counts = temporal_store.indexed_counts_by_filename()
-    preview_thumbnails = vector_store.preview_thumbnails_by_filename()
-    analysis_summary = vector_store.analysis_summary_by_filename()
-    videos = []
-
-    for file_path in sorted(case_paths.videos_dir.iterdir()):
-        if not file_path.is_file():
-            continue
-        if file_path.suffix.lower() not in VIDEO_EXTENSIONS:
-            continue
-
-        file_stat = file_path.stat()
-        preview_url = str(preview_thumbnails.get(file_path.name, "")).strip()
-        if not preview_url:
-            preview_path = _preview_thumbnail_path(case_paths, file_path.name)
-            if not preview_path.exists():
-                try:
-                    await asyncio.to_thread(
-                        generate_preview_thumbnail,
-                        file_path,
-                        preview_path,
-                    )
-                except Exception:
-                    pass
-            if preview_path.exists():
-                preview_url = _media_url_for_case_path(preview_path)
-
-        videos.append(
-            {
-                "filename": file_path.name,
-                "size_bytes": file_stat.st_size,
-                "video_url": _media_url_for_case_path(file_path),
-                "preview_thumbnail_url": preview_url,
-                "indexed_frames": indexed_counts.get(file_path.name, 0),
-                "indexed_windows": indexed_window_counts.get(file_path.name, 0),
-                "analysis": analysis_summary.get(
-                    file_path.name,
-                    {
-                        "processed_frames": 0,
-                        "face_people": {
-                            "processed": False,
-                            "face_count": 0,
-                            "people_count": 0,
-                            "hit_frames": 0,
-                            "first_hit_seconds": None,
-                        },
-                        "vehicles": {
-                            "processed": False,
-                            "vehicle_count": 0,
-                            "hit_frames": 0,
-                            "first_hit_seconds": None,
-                        },
-                    },
-                ),
-            }
-        )
-
-    return {"case_id": case_paths.case_id, "videos": videos}
-
-
-@app.delete("/videos")
-async def delete_video(case_id: str | None = None, filename: str | None = None) -> dict:
-    if not filename or not str(filename).strip():
-        raise HTTPException(status_code=400, detail="filename is required")
-
-    try:
-        resolved_case_id = await asyncio.to_thread(_resolve_case_id_or_default, case_id)
-        safe_filename = Path(str(filename or "")).name.strip()
-        if not safe_filename:
-            raise HTTPException(status_code=400, detail="filename is required")
-
-        index_jobs: dict[str, dict] = app.state.index_jobs
-        index_lock: Lock = app.state.index_jobs_lock
-        with index_lock:
-            existing_job = index_jobs.get(resolved_case_id)
-            if isinstance(existing_job, dict):
-                existing_status = str(existing_job.get("status") or "")
-                if bool(existing_job.get("running")) or existing_status in {"queued", "running"}:
-                    current_filename = str(existing_job.get("current_filename") or "").strip()
-                    detail = (
-                        "Cannot delete videos while background semantic indexing is running "
-                        f"for case {resolved_case_id}."
-                    )
-                    if current_filename:
-                        detail += f" Currently processing: {current_filename}."
-                    detail += " Wait for indexing to complete, then retry."
-                    raise HTTPException(status_code=409, detail=detail)
-
-        return await asyncio.to_thread(_delete_video_sync, resolved_case_id, safe_filename)
-    except HTTPException:
-        raise
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail=f"Video not found: {filename}")
-    except PermissionError as exc:
-        raise HTTPException(status_code=409, detail=str(exc))
-    except KeyError:
-        raise HTTPException(status_code=404, detail=f"Case not found: {case_id}")
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-
-
-@app.post("/process_video")
-async def process_video(request: ProcessVideoRequest) -> dict:
-    try:
-        resolved_case_id = await asyncio.to_thread(
-            _resolve_case_id_or_default,
-            request.case_id,
-        )
-        return await asyncio.to_thread(
-            _process_video_sync,
-            case_id=resolved_case_id,
-            filename=request.filename,
-            frame_interval_seconds=request.frame_interval_seconds,
-            batch_size=request.batch_size,
-            force=request.force,
-            analysis_face_people=request.analysis_face_people,
-            analysis_vehicles=request.analysis_vehicles,
-            analysis_only=request.analysis_only,
-        )
-    except FileNotFoundError:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Video not found: {request.filename}",
-        )
-    except KeyError:
-        raise HTTPException(status_code=404, detail=f"Case not found: {request.case_id}")
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-
-
-@app.post("/index/start")
-async def start_background_index(request: IndexStartRequest) -> dict:
-    try:
-        resolved_case_id = await asyncio.to_thread(
-            _resolve_case_id_or_default,
-            request.case_id,
-        )
-        case_paths = await asyncio.to_thread(_get_case_paths_or_raise, resolved_case_id)
-        filenames = await asyncio.to_thread(
-            _resolve_index_filenames,
-            case_paths,
-            request.filenames,
-        )
-    except FileNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=f"Video not found: {exc}")
-    except KeyError:
-        raise HTTPException(status_code=404, detail=f"Case not found: {request.case_id}")
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-
-    jobs: dict[str, dict] = app.state.index_jobs
-    lock: Lock = app.state.index_jobs_lock
-
-    with lock:
-        running_case_id = _find_running_index_case_id_locked(jobs)
-        if running_case_id and running_case_id != resolved_case_id:
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    "Background indexing already running for case "
-                    f"{running_case_id}. Wait for it to finish first."
-                ),
-            )
-
-        existing = jobs.get(resolved_case_id)
-        if isinstance(existing, dict):
-            existing_status = str(existing.get("status") or "")
-            if bool(existing.get("running")) or existing_status in {"queued", "running"}:
-                snapshot = _index_job_snapshot(existing, case_id=resolved_case_id)
-                return {
-                    "started": False,
-                    "case_id": resolved_case_id,
-                    "job": snapshot,
-                    "message": "Background indexing already running for this case.",
-                }
-
-        job = _new_index_job_record(
-            case_id=resolved_case_id,
-            filenames=filenames,
-            frame_interval_seconds=request.frame_interval_seconds,
-            batch_size=request.batch_size,
-            force=request.force,
-        )
-        jobs[resolved_case_id] = job
-
-    task = asyncio.create_task(_run_index_job_async(resolved_case_id))
-    task.add_done_callback(lambda _task: None)
-
-    with lock:
-        tasks: dict[str, asyncio.Task] = app.state.index_tasks
-        tasks[resolved_case_id] = task
-        snapshot = _index_job_snapshot(jobs.get(resolved_case_id), case_id=resolved_case_id)
-
-    print(
-        f"[index-start][{resolved_case_id}] files={len(filenames)} "
-        f"frame_interval={request.frame_interval_seconds} batch_size={request.batch_size} force={request.force}"
-    )
-
-    return {
-        "started": True,
-        "case_id": resolved_case_id,
-        "job": snapshot,
-    }
-
-
-@app.get("/index/status")
-async def get_background_index_status(case_id: str | None = None) -> dict:
-    selected_case_id = ""
-    try:
-        selected_case_id = await asyncio.to_thread(_resolve_case_id_or_default, case_id)
-        await asyncio.to_thread(_get_case_paths_or_raise, selected_case_id)
-    except ValueError as exc:
-        if case_id and str(case_id).strip():
-            raise HTTPException(status_code=400, detail=str(exc))
-        return _index_job_snapshot(None, case_id="")
-    except KeyError:
-        raise HTTPException(status_code=404, detail=f"Case not found: {case_id}")
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-
-    jobs: dict[str, dict] = app.state.index_jobs
-    lock: Lock = app.state.index_jobs_lock
-    with lock:
-        job = jobs.get(selected_case_id)
-        return _index_job_snapshot(job, case_id=selected_case_id)
+_media_service = MediaService(
+    app=app,
+    video_extensions=VIDEO_EXTENSIONS,
+    convert_to_mp4=convert_to_mp4,
+    generate_preview_thumbnail=generate_preview_thumbnail,
+    resolve_case_id_or_default=_resolve_case_id_or_default,
+    get_case_paths_or_raise=_get_case_paths_or_raise,
+    is_supported_video=_is_supported_video,
+    unique_video_path=_unique_video_path,
+    write_upload_file=_write_upload_file,
+    truncate_error=_truncate_error,
+    preview_thumbnail_path=_preview_thumbnail_path,
+    media_url_for_case_path=_media_url_for_case_path,
+    get_vector_store_for_case=_get_vector_store_for_case,
+    get_temporal_store_for_case=_get_temporal_store_for_case,
+    delete_video_sync=_delete_video_sync,
+    process_video_sync=_process_video_sync,
+    resolve_index_filenames=_resolve_index_filenames,
+    find_running_index_case_id_locked=_find_running_index_case_id_locked,
+    new_index_job_record=_new_index_job_record,
+    run_index_job_async=_run_index_job_async,
+    index_job_snapshot=_index_job_snapshot,
+)
+app.include_router(build_media_router(media_service=_media_service))
 
 
 def _list_active_processes_sync() -> dict:
