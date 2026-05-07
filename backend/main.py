@@ -12,6 +12,7 @@ import time
 import webbrowser
 from pathlib import Path
 from threading import Lock
+from typing import Any
 from urllib.parse import quote
 
 import numpy as np
@@ -19,7 +20,7 @@ import cv2
 from fastapi import FastAPI, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from PIL import Image
 
 from backend.analysis import AnalysisSelection, VideoAnalyzer
@@ -27,6 +28,7 @@ from backend.analysis_store import AnalysisCropStore
 from backend.embeddings import OpenCLIPEmbedder
 from backend.routers.cases import build_cases_router
 from backend.routers.embedding_settings import build_embedding_settings_router
+from backend.routers.insights import build_insights_router
 from backend.routers.media import build_media_router
 from backend.services.case_service import (
     CasePaths,
@@ -52,6 +54,7 @@ from backend.services.embedding_settings_service import (
     resolve_effective_embedding_settings_sync as _resolve_effective_embedding_settings_sync_impl,
     write_saved_embedding_settings_sync as _write_saved_embedding_settings_sync_impl,
 )
+from backend.services.insights_service import InsightsService
 from backend.services.media_service import MediaService
 from backend.temporal_store import TemporalWindowStore
 from backend.triage import build_video_triage_payload
@@ -125,32 +128,8 @@ app.mount("/media/cases", StaticFiles(directory=str(CASES_DIR)), name="media-cas
 app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR)), name="static")
 
 
-class SearchRequest(BaseModel):
-    case_id: str | None = None
-    query: str
-    top_k: int = Field(default=10, ge=1, le=100)
-    min_score: float | None = Field(default=None, ge=-1.0, le=1.0)
-    diversity_seconds: float | None = Field(default=None, ge=0.0, le=120.0)
-    oversample_factor: int | None = Field(default=None, ge=1, le=50)
-
-
 class ShutdownRequest(BaseModel):
     confirm: bool = False
-
-
-class CropGalleryRequest(BaseModel):
-    case_id: str | None = None
-    category: str = Field(..., pattern="^(face_people|vehicles)$")
-    query: str = ""
-    top_k: int = Field(default=120, ge=1, le=500)
-    limit: int = Field(default=300, ge=1, le=2000)
-
-
-class TriageTimelineRequest(BaseModel):
-    case_id: str | None = None
-    filename: str
-    bucket_seconds: float = Field(default=1.0, ge=0.5, le=5.0)
-    force: bool = False
 
 
 def _read_saved_embedding_settings_sync() -> dict[str, str]:
@@ -2191,245 +2170,25 @@ def _build_video_triage_sync(
     return payload
 
 
-@app.post("/analysis_gallery")
-async def analysis_gallery(request: CropGalleryRequest) -> dict:
-    try:
-        selected_case_id = await asyncio.to_thread(
-            _resolve_case_id_or_default,
-            request.case_id,
-        )
-        case_paths, crop_store = await asyncio.to_thread(
-            _get_analysis_store_for_case,
-            selected_case_id,
-        )
-    except KeyError:
-        raise HTTPException(status_code=404, detail=f"Case not found: {request.case_id}")
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-
-    query = request.query.strip()
-    category = request.category
-
-    try:
-        if query:
-            query_embedding = await asyncio.to_thread(app.state.embedder.encode_text, query)
-            raw_items = await asyncio.to_thread(
-                crop_store.search,
-                category=category,
-                query_embedding=query_embedding,
-                top_k=request.top_k,
-            )
-        else:
-            raw_items = await asyncio.to_thread(
-                crop_store.list_items,
-                category=category,
-                limit=request.limit,
-            )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-
-    faces: list[dict] = []
-    people: list[dict] = []
-    vehicles: list[dict] = []
-    for item in raw_items:
-        hydrated = _hydrate_crop_item(case_paths, item)
-        kind = str(hydrated.get("kind") or "").lower()
-        if category == AnalysisCropStore.FACE_PEOPLE:
-            if kind == "face":
-                faces.append(hydrated)
-            else:
-                people.append(hydrated)
-        else:
-            vehicles.append(hydrated)
-
-    return {
-        "case_id": case_paths.case_id,
-        "category": category,
-        "query": query,
-        "faces": faces,
-        "people": people,
-        "vehicles": vehicles,
-        "count": len(raw_items),
-    }
-
-
-@app.post("/triage_timeline")
-async def triage_timeline(request: TriageTimelineRequest) -> dict:
-    try:
-        selected_case_id = await asyncio.to_thread(
-            _resolve_case_id_or_default,
-            request.case_id,
-        )
-        return await asyncio.to_thread(
-            _build_video_triage_sync,
-            case_id=selected_case_id,
-            filename=request.filename,
-            bucket_seconds=request.bucket_seconds,
-            force=request.force,
-        )
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail=f"Video not found: {request.filename}")
-    except KeyError:
-        raise HTTPException(status_code=404, detail=f"Case not found: {request.case_id}")
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-
-
-@app.post("/search")
-async def search(request: SearchRequest) -> dict:
-    query = request.query.strip()
-    if not query:
-        raise HTTPException(status_code=400, detail="Query cannot be empty")
-
-    min_score = (
-        float(request.min_score)
-        if request.min_score is not None
-        else _float_from_env("SEMANTIC_MIN_SCORE", 0.22)
-    )
-    diversity_seconds = (
-        float(request.diversity_seconds)
-        if request.diversity_seconds is not None
-        else _float_from_env("SEMANTIC_DIVERSITY_SECONDS", 6.0)
-    )
-    oversample_factor = (
-        int(request.oversample_factor)
-        if request.oversample_factor is not None
-        else _int_from_env("SEMANTIC_OVERSAMPLE_FACTOR", 10)
-    )
-    max_candidates = max(1, _int_from_env("SEMANTIC_MAX_CANDIDATES", 2000))
-    search_top_k = min(
-        max(int(request.top_k), int(request.top_k) * max(1, oversample_factor)),
-        max_candidates,
-    )
-
-    def _run_search(resolved_case_id: str) -> tuple[str, list[dict], dict[str, Any]]:
-        case_paths, vector_store = _get_vector_store_for_case(resolved_case_id)
-        _, temporal_store = _get_temporal_store_for_case(resolved_case_id)
-        query_embedding = app.state.embedder.encode_text(query)
-        intent_payload = _detect_semantic_intent(query, query_embedding)
-        intent = str(intent_payload.get("intent") or SEMANTIC_OBJECT)
-        mode = "frame"
-        fallback_used = False
-        active_min_score = float(min_score)
-        active_diversity = float(diversity_seconds)
-
-        if intent == SEMANTIC_ACTION:
-            mode = "temporal"
-            active_diversity = max(active_diversity, 8.0)
-            active_min_score = max(-1.0, active_min_score - 0.03)
-            raw_results = temporal_store.search(query_embedding, top_k=search_top_k)
-            if not raw_results:
-                fallback_used = True
-                mode = "frame_fallback"
-                raw_results = vector_store.search(query_embedding, top_k=search_top_k)
-        elif intent == SEMANTIC_SCENE:
-            mode = "temporal"
-            active_diversity = max(active_diversity, 10.0)
-            active_min_score = max(-1.0, active_min_score - 0.02)
-            raw_results = temporal_store.search(query_embedding, top_k=search_top_k)
-            if not raw_results:
-                fallback_used = True
-                mode = "frame_fallback"
-                raw_results = vector_store.search(query_embedding, top_k=search_top_k)
-        else:
-            raw_results = vector_store.search(query_embedding, top_k=search_top_k)
-
-        filtered_results = _apply_semantic_post_filters(
-            raw_results,
-            top_k=request.top_k,
-            min_score=active_min_score,
-            diversity_seconds=active_diversity,
-        )
-
-        if not filtered_results and mode == "temporal":
-            fallback_used = True
-            mode = "frame_fallback"
-            raw_results = vector_store.search(query_embedding, top_k=search_top_k)
-            filtered_results = _apply_semantic_post_filters(
-                raw_results,
-                top_k=request.top_k,
-                min_score=min_score,
-                diversity_seconds=diversity_seconds,
-            )
-
-        print(
-            f"[semantic][{case_paths.case_id}] query={query!r} "
-            f"intent={intent} mode={mode} fallback={fallback_used} "
-            f"top_k={request.top_k} searched={search_top_k} "
-            f"raw={len(raw_results)} filtered={len(filtered_results)} "
-            f"min_score={active_min_score:.3f} diversity_seconds={active_diversity:.2f}"
-        )
-
-        hydrated = []
-        for item in filtered_results:
-            payload = {
-                "video_filename": item["video_filename"],
-                "timestamp_seconds": item["timestamp_seconds"],
-                "similarity_score": item["similarity_score"],
-                "thumbnail_url": item["thumbnail_path"],
-                "video_url": _media_url_for_case_path(
-                    case_paths.videos_dir / item["video_filename"]
-                ),
-            }
-            if "start_seconds" in item:
-                payload["window_start_seconds"] = float(item.get("start_seconds", 0.0))
-            if "end_seconds" in item:
-                payload["window_end_seconds"] = float(item.get("end_seconds", 0.0))
-            hydrated.append(payload)
-
-        return case_paths.case_id, hydrated, {
-            "intent": intent,
-            "intent_scores": intent_payload.get("scores", {}),
-            "intent_margin": float(intent_payload.get("margin", 0.0)),
-            "intent_reasons": intent_payload.get("reasons", []),
-            "search_mode": mode,
-            "fallback_used": fallback_used,
-            "effective_min_score": float(active_min_score),
-            "effective_diversity_seconds": float(active_diversity),
-        }
-
-    try:
-        selected_case_id = await asyncio.to_thread(
-            _resolve_case_id_or_default,
-            request.case_id,
-        )
-        resolved_case_id, results, search_meta = await asyncio.to_thread(
-            _run_search,
-            selected_case_id,
-        )
-        return {
-            "case_id": resolved_case_id,
-            "query": query,
-            "results": results,
-            "count": len(results),
-            "intent": search_meta.get("intent"),
-            "search_mode": search_meta.get("search_mode"),
-            "fallback_used": bool(search_meta.get("fallback_used")),
-            "intent_scores": search_meta.get("intent_scores", {}),
-            "intent_margin": float(search_meta.get("intent_margin", 0.0)),
-            "intent_reasons": search_meta.get("intent_reasons", []),
-            "embedding_engine": _embedding_engine_info(),
-            "search_settings": {
-                "top_k": int(request.top_k),
-                "min_score": float(search_meta.get("effective_min_score", min_score)),
-                "diversity_seconds": float(
-                    search_meta.get("effective_diversity_seconds", diversity_seconds)
-                ),
-                "oversample_factor": int(oversample_factor),
-                "candidates_searched": int(search_top_k),
-                "intent_auto": True,
-            },
-        }
-    except KeyError:
-        raise HTTPException(status_code=404, detail=f"Case not found: {request.case_id}")
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+_insights_service = InsightsService(
+    app=app,
+    resolve_case_id_or_default=_resolve_case_id_or_default,
+    get_analysis_store_for_case=_get_analysis_store_for_case,
+    hydrate_crop_item=_hydrate_crop_item,
+    build_video_triage_sync=_build_video_triage_sync,
+    get_vector_store_for_case=_get_vector_store_for_case,
+    get_temporal_store_for_case=_get_temporal_store_for_case,
+    detect_semantic_intent=_detect_semantic_intent,
+    apply_semantic_post_filters=_apply_semantic_post_filters,
+    media_url_for_case_path=_media_url_for_case_path,
+    embedding_engine_info=_embedding_engine_info,
+    float_from_env=_float_from_env,
+    int_from_env=_int_from_env,
+    semantic_object=SEMANTIC_OBJECT,
+    semantic_action=SEMANTIC_ACTION,
+    semantic_scene=SEMANTIC_SCENE,
+)
+app.include_router(build_insights_router(insights_service=_insights_service))
 
 
 def _open_browser() -> None:
