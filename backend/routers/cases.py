@@ -132,6 +132,18 @@ def build_cases_router(
                         f"[index-persist][{deleted['case_id']}] delete_failed error={exc}"
                     )
 
+            video_pipeline_store = getattr(request.app.state, "video_pipeline_store", None)
+            if video_pipeline_store is not None:
+                try:
+                    await asyncio.to_thread(
+                        video_pipeline_store.delete_case,
+                        deleted["case_id"],
+                    )
+                except Exception as exc:
+                    print(
+                        f"[pipeline][{deleted['case_id']}] delete_case_failed error={exc}"
+                    )
+
             try:
                 cases = await asyncio.to_thread(list_cases_sync)
             except Exception:

@@ -48,4 +48,11 @@ def build_media_router(*, media_service: MediaService) -> APIRouter:
     async def get_background_index_status(case_id: str | None = None) -> dict:
         return await media_service.get_background_index_status(case_id)
 
+    @router.get("/pipeline/status")
+    async def get_pipeline_status(
+        case_id: str | None = None,
+        filename: str | None = None,
+    ) -> dict:
+        return await media_service.get_pipeline_status(case_id, filename)
+
     return router

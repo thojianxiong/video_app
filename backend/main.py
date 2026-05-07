@@ -58,6 +58,7 @@ from backend.services.insights_service import InsightsService
 from backend.services.media_service import MediaService
 from backend.services.process_control_service import ProcessControlService
 from backend.stores.index_job_store import IndexJobStore
+from backend.stores.video_pipeline_store import VideoPipelineStore
 from backend.temporal_store import TemporalWindowStore
 from backend.triage import build_video_triage_payload
 from backend.vector_store import VectorStore
@@ -75,6 +76,7 @@ CASES_DIR = BASE_DIR / "cases"
 CASES_REGISTRY_PATH = CASES_DIR / "cases.json"
 APP_SETTINGS_PATH = CASES_DIR / "app_settings.json"
 INDEX_JOBS_DB_PATH = CASES_DIR / "index_jobs.db"
+VIDEO_PIPELINE_DB_PATH = CASES_DIR / "video_pipeline.db"
 
 SEMANTIC_OBJECT = "object"
 SEMANTIC_ACTION = "action"
@@ -153,8 +155,11 @@ async def _startup_application(application: FastAPI) -> None:
     application.state.index_tasks = {}
     index_job_store = await asyncio.to_thread(IndexJobStore, INDEX_JOBS_DB_PATH)
     application.state.index_job_store = index_job_store
+    video_pipeline_store = await asyncio.to_thread(VideoPipelineStore, VIDEO_PIPELINE_DB_PATH)
+    application.state.video_pipeline_store = video_pipeline_store
 
     interrupted_jobs = await asyncio.to_thread(index_job_store.mark_incomplete_jobs_interrupted)
+    interrupted_pipeline = await asyncio.to_thread(video_pipeline_store.mark_running_as_interrupted)
     raw_snapshots = await asyncio.to_thread(index_job_store.load_all_snapshots)
     restored_jobs: dict[str, dict] = {}
     if isinstance(raw_snapshots, dict):
@@ -177,6 +182,8 @@ async def _startup_application(application: FastAPI) -> None:
     )
     if interrupted_jobs > 0:
         print(f"[startup] Marked {interrupted_jobs} incomplete index job(s) as interrupted.")
+    if interrupted_pipeline > 0:
+        print(f"[startup] Marked {interrupted_pipeline} running pipeline stage(s) as interrupted.")
     if restored_jobs:
         print(f"[startup] Restored {len(restored_jobs)} persisted index job snapshot(s).")
     await asyncio.to_thread(_list_cases_sync)
@@ -629,6 +636,83 @@ def _find_running_index_case_id_locked(jobs: dict[str, dict]) -> str | None:
     return None
 
 
+def _pipeline_store() -> VideoPipelineStore | None:
+    store = getattr(app.state, "video_pipeline_store", None)
+    if isinstance(store, VideoPipelineStore):
+        return store
+    return None
+
+
+def _pipeline_update_stage_sync(
+    *,
+    case_id: str,
+    filename: str,
+    stage: str,
+    status: str,
+    error: str = "",
+    details: dict | None = None,
+    increment_attempt: bool = False,
+    event: str = "",
+) -> None:
+    store = _pipeline_store()
+    if store is None:
+        return
+    store.update_stage(
+        case_id=case_id,
+        filename=filename,
+        stage=stage,
+        status=status,
+        error=error,
+        details=details,
+        increment_attempt=increment_attempt,
+        event=event,
+    )
+
+
+async def _pipeline_update_stage(
+    *,
+    case_id: str,
+    filename: str,
+    stage: str,
+    status: str,
+    error: str = "",
+    details: dict | None = None,
+    increment_attempt: bool = False,
+    event: str = "",
+) -> None:
+    try:
+        await asyncio.to_thread(
+            _pipeline_update_stage_sync,
+            case_id=case_id,
+            filename=filename,
+            stage=stage,
+            status=status,
+            error=error,
+            details=details,
+            increment_attempt=increment_attempt,
+            event=event,
+        )
+    except Exception as exc:
+        print(
+            f"[pipeline][{case_id}] update_stage_failed "
+            f"file={filename} stage={stage} status={status} error={exc}"
+        )
+
+
+def _pipeline_set_metadata_sync(case_id: str, filename: str, metadata: dict) -> None:
+    store = _pipeline_store()
+    if store is None:
+        return
+    store.set_metadata(case_id, filename, metadata)
+
+
+async def _pipeline_set_metadata(case_id: str, filename: str, metadata: dict) -> None:
+    try:
+        await asyncio.to_thread(_pipeline_set_metadata_sync, case_id, filename, metadata)
+    except Exception as exc:
+        print(f"[pipeline][{case_id}] metadata_failed file={filename} error={exc}")
+
+
 def _persist_index_job_snapshot_sync(case_id: str) -> None:
     index_job_store = getattr(app.state, "index_job_store", None)
     if not isinstance(index_job_store, IndexJobStore):
@@ -693,6 +777,20 @@ async def _run_index_job_async(case_id: str) -> None:
                 current["current_video_started_ts"] = float(time.time())
                 current["updated_at"] = _utc_now_iso()
 
+            await _pipeline_update_stage(
+                case_id=normalized_case_id,
+                filename=filename,
+                stage="base_index",
+                status="running",
+                increment_attempt=True,
+                event="background_index_started",
+                details={
+                    "source": "background_index",
+                    "frame_interval_seconds": frame_interval_seconds,
+                    "batch_size": batch_size,
+                    "force": force,
+                },
+            )
             await _persist_index_job_snapshot(normalized_case_id)
 
             try:
@@ -780,8 +878,37 @@ async def _run_index_job_async(case_id: str) -> None:
                             }
                         )
                     current["updated_at"] = _utc_now_iso()
+                pipeline_status = "completed"
+                if status in {"skipped", "analysis_only", "not_requested"}:
+                    pipeline_status = "skipped"
+                elif status not in {"processed", "completed"}:
+                    pipeline_status = "failed"
+                await _pipeline_update_stage(
+                    case_id=normalized_case_id,
+                    filename=filename,
+                    stage="base_index",
+                    status=pipeline_status,
+                    event=f"background_index_{pipeline_status}",
+                    details={
+                        "source": "background_index",
+                        "status": status,
+                        "indexed_frames": indexed_frames,
+                        "indexed_windows": indexed_windows,
+                        "processed_frames": processed_frames,
+                        "estimated_total_frames": estimated_total_frames,
+                    },
+                )
                 await _persist_index_job_snapshot(normalized_case_id)
             except asyncio.CancelledError:
+                await _pipeline_update_stage(
+                    case_id=normalized_case_id,
+                    filename=filename,
+                    stage="base_index",
+                    status="interrupted",
+                    event="background_index_cancelled",
+                    error="Background indexing cancelled.",
+                    details={"source": "background_index"},
+                )
                 raise
             except Exception as exc:
                 with lock:
@@ -795,6 +922,15 @@ async def _run_index_job_async(case_id: str) -> None:
                         errors.append(f"{filename}: {exc}")
                     current["current_video_eta_seconds"] = None
                     current["updated_at"] = _utc_now_iso()
+                await _pipeline_update_stage(
+                    case_id=normalized_case_id,
+                    filename=filename,
+                    stage="base_index",
+                    status="failed",
+                    event="background_index_failed",
+                    error=_truncate_error(str(exc)),
+                    details={"source": "background_index"},
+                )
                 await _persist_index_job_snapshot(normalized_case_id)
     except asyncio.CancelledError:
         with lock:
@@ -802,6 +938,19 @@ async def _run_index_job_async(case_id: str) -> None:
             if isinstance(current, dict):
                 current["cancel_requested"] = True
                 current["updated_at"] = _utc_now_iso()
+                current_filename = str(current.get("current_filename") or "").strip()
+            else:
+                current_filename = ""
+        if current_filename:
+            await _pipeline_update_stage(
+                case_id=normalized_case_id,
+                filename=current_filename,
+                stage="base_index",
+                status="interrupted",
+                event="background_index_interrupted",
+                error="Background indexing cancelled.",
+                details={"source": "background_index"},
+            )
         await _persist_index_job_snapshot(normalized_case_id)
     except Exception as exc:
         with lock:
@@ -2080,6 +2229,18 @@ def _build_video_triage_sync(
             vehicles_metadata_mtime_ns=vehicles_mtime_ns,
         )
         if isinstance(cached_payload, dict):
+            _pipeline_update_stage_sync(
+                case_id=case_paths.case_id,
+                filename=resolved_filename,
+                stage="triage",
+                status="skipped",
+                event="triage_cache_hit",
+                details={
+                    "bucket_seconds": safe_bucket_seconds,
+                    "cache_status": "hit",
+                    "force": force,
+                },
+            )
             cached_payload["case_id"] = case_paths.case_id
             cached_payload["video_url"] = _media_url_for_case_path(
                 case_paths.videos_dir / resolved_filename
@@ -2087,15 +2248,42 @@ def _build_video_triage_sync(
             cached_payload["cache_status"] = "hit"
             return cached_payload
 
-    payload = build_video_triage_payload(
-        video_path=video_path,
-        video_filename=resolved_filename,
-        bucket_seconds=safe_bucket_seconds,
-        face_people_metadata_path=case_paths.face_people_metadata_path,
-        vehicles_metadata_path=case_paths.vehicles_metadata_path,
-        face_people_processed=bool(face_people.get("processed")),
-        vehicles_processed=bool(vehicles.get("processed")),
+    _pipeline_update_stage_sync(
+        case_id=case_paths.case_id,
+        filename=resolved_filename,
+        stage="triage",
+        status="running",
+        increment_attempt=True,
+        event="triage_started",
+        details={
+            "bucket_seconds": safe_bucket_seconds,
+            "cache_status": "miss",
+            "force": force,
+        },
     )
+
+    try:
+        payload = build_video_triage_payload(
+            video_path=video_path,
+            video_filename=resolved_filename,
+            bucket_seconds=safe_bucket_seconds,
+            face_people_metadata_path=case_paths.face_people_metadata_path,
+            vehicles_metadata_path=case_paths.vehicles_metadata_path,
+            face_people_processed=bool(face_people.get("processed")),
+            vehicles_processed=bool(vehicles.get("processed")),
+        )
+    except Exception as exc:
+        _pipeline_update_stage_sync(
+            case_id=case_paths.case_id,
+            filename=resolved_filename,
+            stage="triage",
+            status="failed",
+            event="triage_failed",
+            error=_truncate_error(str(exc)),
+            details={"bucket_seconds": safe_bucket_seconds, "force": force},
+        )
+        raise
+
     try:
         _save_triage_cache_sync(
             cache_path=cache_path,
@@ -2110,6 +2298,18 @@ def _build_video_triage_sync(
         print(
             f"[triage-cache][{case_paths.case_id}] failed_save file={resolved_filename} error={exc}"
         )
+    _pipeline_update_stage_sync(
+        case_id=case_paths.case_id,
+        filename=resolved_filename,
+        stage="triage",
+        status="completed",
+        event="triage_completed",
+        details={
+            "bucket_seconds": safe_bucket_seconds,
+            "cache_status": "miss",
+            "force": force,
+        },
+    )
     payload["case_id"] = case_paths.case_id
     payload["video_url"] = _media_url_for_case_path(case_paths.videos_dir / resolved_filename)
     payload["cache_status"] = "miss"

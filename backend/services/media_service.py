@@ -11,6 +11,8 @@ from fastapi import HTTPException, UploadFile
 
 
 class MediaService:
+    PIPELINE_STAGES = ("ingest", "normalize", "triage", "base_index", "analysis")
+
     def __init__(
         self,
         *,
@@ -77,6 +79,147 @@ class MediaService:
             },
         }
 
+    @staticmethod
+    def _default_pipeline(case_id: str, filename: str) -> dict:
+        now = ""
+        return {
+            "case_id": str(case_id or ""),
+            "filename": str(filename or ""),
+            "overall_status": "pending",
+            "current_stage": "",
+            "created_at": now,
+            "updated_at": now,
+            "last_event": "",
+            "metadata": {},
+            "stages": {
+                "ingest": {"status": "pending"},
+                "normalize": {"status": "pending"},
+                "triage": {"status": "pending"},
+                "base_index": {"status": "pending"},
+                "analysis": {"status": "pending"},
+            },
+        }
+
+    @staticmethod
+    def _pipeline_status_from_base(base_status: str) -> str:
+        normalized = str(base_status or "").strip().lower()
+        if normalized in {"processed", "completed"}:
+            return "completed"
+        if normalized in {"skipped", "analysis_only", "not_requested"}:
+            return "skipped"
+        if normalized in {"failed", "error"}:
+            return "failed"
+        return "completed"
+
+    @staticmethod
+    def _pipeline_status_from_analysis(analysis_status: str) -> str:
+        normalized = str(analysis_status or "").strip().lower()
+        if normalized in {"processed", "completed"}:
+            return "completed"
+        if normalized in {"skipped", "not_requested"}:
+            return "skipped"
+        if normalized in {"failed", "unavailable", "error"}:
+            return "failed"
+        return "skipped"
+
+    def _pipeline_store(self):
+        return getattr(self.app.state, "video_pipeline_store", None)
+
+    async def _pipeline_update_stage(
+        self,
+        *,
+        case_id: str,
+        filename: str,
+        stage: str,
+        status: str,
+        error: str = "",
+        details: dict | None = None,
+        increment_attempt: bool = False,
+        event: str = "",
+    ) -> dict | None:
+        store = self._pipeline_store()
+        if store is None:
+            return None
+        try:
+            return await asyncio.to_thread(
+                store.update_stage,
+                case_id=case_id,
+                filename=filename,
+                stage=stage,
+                status=status,
+                error=error,
+                details=details,
+                increment_attempt=increment_attempt,
+                event=event,
+            )
+        except Exception as exc:
+            print(
+                f"[pipeline][{case_id}] update_stage_failed file={filename} "
+                f"stage={stage} status={status} error={exc}"
+            )
+            return None
+
+    async def _pipeline_set_metadata(
+        self,
+        *,
+        case_id: str,
+        filename: str,
+        metadata: dict,
+    ) -> dict | None:
+        store = self._pipeline_store()
+        if store is None:
+            return None
+        try:
+            return await asyncio.to_thread(
+                store.set_metadata,
+                case_id,
+                filename,
+                metadata,
+            )
+        except Exception as exc:
+            print(f"[pipeline][{case_id}] metadata_failed file={filename} error={exc}")
+            return None
+
+    async def _pipeline_ensure_snapshot(self, *, case_id: str, filename: str) -> dict | None:
+        store = self._pipeline_store()
+        if store is None:
+            return None
+        try:
+            return await asyncio.to_thread(store.ensure_snapshot, case_id, filename)
+        except Exception as exc:
+            print(f"[pipeline][{case_id}] ensure_snapshot_failed file={filename} error={exc}")
+            return None
+
+    async def _pipeline_get_video_snapshot(self, *, case_id: str, filename: str) -> dict | None:
+        store = self._pipeline_store()
+        if store is None:
+            return None
+        try:
+            return await asyncio.to_thread(store.get_video_snapshot, case_id, filename)
+        except Exception as exc:
+            print(f"[pipeline][{case_id}] get_snapshot_failed file={filename} error={exc}")
+            return None
+
+    async def _pipeline_list_case_snapshots(self, *, case_id: str) -> list[dict]:
+        store = self._pipeline_store()
+        if store is None:
+            return []
+        try:
+            payload = await asyncio.to_thread(store.list_case_snapshots, case_id)
+        except Exception as exc:
+            print(f"[pipeline][{case_id}] list_snapshots_failed error={exc}")
+            return []
+        return payload if isinstance(payload, list) else []
+
+    async def _pipeline_delete_video(self, *, case_id: str, filename: str) -> None:
+        store = self._pipeline_store()
+        if store is None:
+            return
+        try:
+            await asyncio.to_thread(store.delete_video, case_id, filename)
+        except Exception as exc:
+            print(f"[pipeline][{case_id}] delete_video_failed file={filename} error={exc}")
+
     async def _persist_index_snapshot(self, snapshot: dict) -> None:
         index_job_store = getattr(self.app.state, "index_job_store", None)
         if index_job_store is None:
@@ -137,12 +280,49 @@ class MediaService:
                 upload_file.filename,
                 forced_suffix=".mp4",
             )
+            pipeline_filename = str(converted_name)
+            current_stage = "ingest"
             try:
+                await self._pipeline_ensure_snapshot(
+                    case_id=case_paths.case_id,
+                    filename=pipeline_filename,
+                )
+                await self._pipeline_update_stage(
+                    case_id=case_paths.case_id,
+                    filename=pipeline_filename,
+                    stage="ingest",
+                    status="running",
+                    increment_attempt=True,
+                    event="upload_ingest_started",
+                    details={
+                        "source_index": int(source_index),
+                        "source_filename": str(upload_file.filename),
+                    },
+                )
                 await asyncio.to_thread(self.write_upload_file, upload_file, temp_upload_path)
+                uploaded_size = int(temp_upload_path.stat().st_size) if temp_upload_path.exists() else 0
+                await self._pipeline_update_stage(
+                    case_id=case_paths.case_id,
+                    filename=pipeline_filename,
+                    stage="ingest",
+                    status="completed",
+                    event="upload_ingest_completed",
+                    details={"uploaded_size_bytes": uploaded_size},
+                )
 
                 print(
                     f"[upload][{case_paths.case_id}] convert input={upload_file.filename} "
                     f"output={converted_name}"
+                )
+                current_stage = "normalize"
+                await self._pipeline_update_stage(
+                    case_id=case_paths.case_id,
+                    filename=pipeline_filename,
+                    stage="normalize",
+                    status="running",
+                    increment_attempt=True,
+                    event="upload_normalize_started",
+                    details={"target_extension": ".mp4"},
                 )
                 conversion_ok, conversion_error = await asyncio.to_thread(
                     self.convert_to_mp4,
@@ -187,12 +367,51 @@ class MediaService:
                         f"[upload][{case_paths.case_id}] convert success input={upload_file.filename} "
                         f"output={converted_name}"
                     )
+                    await self._pipeline_update_stage(
+                        case_id=case_paths.case_id,
+                        filename=pipeline_filename,
+                        stage="normalize",
+                        status="completed",
+                        event="upload_normalize_completed",
+                        details={"converted": True, "stored_filename": converted_name},
+                    )
+                    await self._pipeline_set_metadata(
+                        case_id=case_paths.case_id,
+                        filename=pipeline_filename,
+                        metadata={
+                            "source_filename": str(upload_file.filename),
+                            "stored_filename": str(converted_name),
+                            "converted_to_mp4": True,
+                            "source_index": int(source_index),
+                        },
+                    )
                 else:
                     temp_converted_path.unlink(missing_ok=True)
                     fallback_name, fallback_path = self.unique_video_path(
                         case_paths.videos_dir,
                         upload_file.filename,
                     )
+                    if fallback_name != pipeline_filename:
+                        await self._pipeline_delete_video(
+                            case_id=case_paths.case_id,
+                            filename=pipeline_filename,
+                        )
+                        pipeline_filename = str(fallback_name)
+                        await self._pipeline_ensure_snapshot(
+                            case_id=case_paths.case_id,
+                            filename=pipeline_filename,
+                        )
+                        await self._pipeline_update_stage(
+                            case_id=case_paths.case_id,
+                            filename=pipeline_filename,
+                            stage="ingest",
+                            status="completed",
+                            event="upload_ingest_completed_fallback",
+                            details={
+                                "source_index": int(source_index),
+                                "source_filename": str(upload_file.filename),
+                            },
+                        )
                     await asyncio.to_thread(shutil.move, str(temp_upload_path), str(fallback_path))
                     uploaded.append(fallback_name)
                     uploaded_items.append(
@@ -218,6 +437,28 @@ class MediaService:
                     errors.append(
                         f"{upload_file.filename}: mp4 conversion failed ({short_error})"
                     )
+                    await self._pipeline_update_stage(
+                        case_id=case_paths.case_id,
+                        filename=pipeline_filename,
+                        stage="normalize",
+                        status="skipped",
+                        event="upload_normalize_fallback",
+                        details={
+                            "converted": False,
+                            "stored_filename": fallback_name,
+                            "warning": short_error,
+                        },
+                    )
+                    await self._pipeline_set_metadata(
+                        case_id=case_paths.case_id,
+                        filename=pipeline_filename,
+                        metadata={
+                            "source_filename": str(upload_file.filename),
+                            "stored_filename": str(fallback_name),
+                            "converted_to_mp4": False,
+                            "source_index": int(source_index),
+                        },
+                    )
                     print(
                         f"[upload][{case_paths.case_id}] convert failure input={upload_file.filename} "
                         f"output={converted_name}"
@@ -229,6 +470,15 @@ class MediaService:
                 temp_converted_path.unlink(missing_ok=True)
                 temp_upload_path.unlink(missing_ok=True)
                 errors.append(f"{upload_file.filename}: {exc}")
+                await self._pipeline_update_stage(
+                    case_id=case_paths.case_id,
+                    filename=pipeline_filename,
+                    stage=current_stage,
+                    status="failed",
+                    error=self.truncate_error(str(exc)),
+                    event="upload_stage_failed",
+                    details={"source_filename": str(upload_file.filename)},
+                )
             finally:
                 await upload_file.close()
 
@@ -260,6 +510,15 @@ class MediaService:
         indexed_window_counts = temporal_store.indexed_counts_by_filename()
         preview_thumbnails = vector_store.preview_thumbnails_by_filename()
         analysis_summary = vector_store.analysis_summary_by_filename()
+        pipeline_snapshots = await self._pipeline_list_case_snapshots(case_id=case_paths.case_id)
+        pipeline_by_filename = {}
+        for item in pipeline_snapshots:
+            if not isinstance(item, dict):
+                continue
+            filename_key = str(item.get("filename") or "").strip()
+            if not filename_key:
+                continue
+            pipeline_by_filename[filename_key] = item
         videos = []
 
         for file_path in sorted(case_paths.videos_dir.iterdir()):
@@ -296,6 +555,10 @@ class MediaService:
                         file_path.name,
                         self._default_analysis_summary(),
                     ),
+                    "pipeline": pipeline_by_filename.get(
+                        file_path.name,
+                        self._default_pipeline(case_paths.case_id, file_path.name),
+                    ),
                 }
             )
 
@@ -328,7 +591,9 @@ class MediaService:
                         detail += " Wait for indexing to complete, then retry."
                         raise HTTPException(status_code=409, detail=detail)
 
-            return await asyncio.to_thread(self.delete_video_sync, resolved_case_id, safe_filename)
+            payload = await asyncio.to_thread(self.delete_video_sync, resolved_case_id, safe_filename)
+            await self._pipeline_delete_video(case_id=resolved_case_id, filename=safe_filename)
+            return payload
         except HTTPException:
             raise
         except FileNotFoundError:
@@ -354,12 +619,80 @@ class MediaService:
         analysis_vehicles: bool,
         analysis_only: bool,
     ) -> dict:
+        resolved_case_id = ""
+        base_stage_started = False
+        analysis_stage_started = False
+        pipeline_filename = Path(str(filename or "")).name.strip() or str(filename or "").strip()
         try:
             resolved_case_id = await asyncio.to_thread(
                 self.resolve_case_id_or_default,
                 case_id,
             )
-            return await asyncio.to_thread(
+            if not pipeline_filename:
+                raise ValueError("filename is required")
+
+            await self._pipeline_ensure_snapshot(
+                case_id=resolved_case_id,
+                filename=pipeline_filename,
+            )
+            await self._pipeline_set_metadata(
+                case_id=resolved_case_id,
+                filename=pipeline_filename,
+                metadata={
+                    "requested_filename": str(filename),
+                    "frame_interval_seconds": float(frame_interval_seconds),
+                    "batch_size": int(batch_size),
+                    "force": bool(force),
+                    "analysis_only": bool(analysis_only),
+                },
+            )
+
+            if analysis_only:
+                await self._pipeline_update_stage(
+                    case_id=resolved_case_id,
+                    filename=pipeline_filename,
+                    stage="base_index",
+                    status="skipped",
+                    event="manual_process_analysis_only",
+                    details={"reason": "analysis_only"},
+                )
+            else:
+                await self._pipeline_update_stage(
+                    case_id=resolved_case_id,
+                    filename=pipeline_filename,
+                    stage="base_index",
+                    status="running",
+                    increment_attempt=True,
+                    event="manual_process_base_index_started",
+                    details={"force": bool(force)},
+                )
+                base_stage_started = True
+
+            if analysis_face_people or analysis_vehicles:
+                await self._pipeline_update_stage(
+                    case_id=resolved_case_id,
+                    filename=pipeline_filename,
+                    stage="analysis",
+                    status="running",
+                    increment_attempt=True,
+                    event="manual_process_analysis_started",
+                    details={
+                        "face_people": bool(analysis_face_people),
+                        "vehicles": bool(analysis_vehicles),
+                    },
+                )
+                analysis_stage_started = True
+            else:
+                await self._pipeline_update_stage(
+                    case_id=resolved_case_id,
+                    filename=pipeline_filename,
+                    stage="analysis",
+                    status="skipped",
+                    event="manual_process_analysis_not_requested",
+                    details={"reason": "analysis not requested"},
+                )
+
+            payload = await asyncio.to_thread(
                 self.process_video_sync,
                 case_id=resolved_case_id,
                 filename=filename,
@@ -370,7 +703,76 @@ class MediaService:
                 analysis_vehicles=analysis_vehicles,
                 analysis_only=analysis_only,
             )
+            resolved_output_filename = (
+                Path(str(payload.get("video_filename") or pipeline_filename)).name.strip()
+                or pipeline_filename
+            )
+            if resolved_output_filename != pipeline_filename:
+                await self._pipeline_delete_video(
+                    case_id=resolved_case_id,
+                    filename=pipeline_filename,
+                )
+                pipeline_filename = resolved_output_filename
+                await self._pipeline_ensure_snapshot(
+                    case_id=resolved_case_id,
+                    filename=pipeline_filename,
+                )
+
+            base_status = self._pipeline_status_from_base(str(payload.get("status") or ""))
+            if analysis_only and base_status == "completed":
+                base_status = "skipped"
+            await self._pipeline_update_stage(
+                case_id=resolved_case_id,
+                filename=pipeline_filename,
+                stage="base_index",
+                status=base_status,
+                event=f"manual_process_base_index_{base_status}",
+                details={
+                    "result_status": str(payload.get("status") or ""),
+                    "indexed_frames": int(payload.get("indexed_frames", 0)),
+                    "indexed_windows": int(payload.get("indexed_windows", 0)),
+                    "processed_frames": int(payload.get("processed_frames", 0)),
+                },
+            )
+
+            analysis_payload = payload.get("analysis")
+            if isinstance(analysis_payload, dict):
+                analysis_status = self._pipeline_status_from_analysis(
+                    str(analysis_payload.get("status") or "not_requested")
+                )
+                await self._pipeline_update_stage(
+                    case_id=resolved_case_id,
+                    filename=pipeline_filename,
+                    stage="analysis",
+                    status=analysis_status,
+                    event=f"manual_process_analysis_{analysis_status}",
+                    details={
+                        "result_status": str(analysis_payload.get("status") or ""),
+                        "ran": bool(analysis_payload.get("ran", False)),
+                        "pending": dict(analysis_payload.get("pending") or {}),
+                        "requested": dict(analysis_payload.get("requested") or {}),
+                    },
+                )
+
+            await self._pipeline_set_metadata(
+                case_id=resolved_case_id,
+                filename=pipeline_filename,
+                metadata={
+                    "stored_filename": str(payload.get("video_filename") or pipeline_filename),
+                    "last_process_at": str(payload.get("updated_at") or ""),
+                },
+            )
+            return payload
         except FileNotFoundError:
+            if resolved_case_id and base_stage_started:
+                await self._pipeline_update_stage(
+                    case_id=resolved_case_id,
+                    filename=pipeline_filename,
+                    stage="base_index",
+                    status="failed",
+                    error="Video file not found",
+                    event="manual_process_base_index_failed",
+                )
             raise HTTPException(
                 status_code=404,
                 detail=f"Video not found: {filename}",
@@ -380,6 +782,25 @@ class MediaService:
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
         except Exception as exc:
+            fallback_case_id = resolved_case_id or str(case_id or "").strip()
+            if fallback_case_id and base_stage_started:
+                await self._pipeline_update_stage(
+                    case_id=fallback_case_id,
+                    filename=pipeline_filename,
+                    stage="base_index",
+                    status="failed",
+                    error=self.truncate_error(str(exc)),
+                    event="manual_process_base_index_failed",
+                )
+            if fallback_case_id and analysis_stage_started:
+                await self._pipeline_update_stage(
+                    case_id=fallback_case_id,
+                    filename=pipeline_filename,
+                    stage="analysis",
+                    status="failed",
+                    error=self.truncate_error(str(exc)),
+                    event="manual_process_analysis_failed",
+                )
             raise HTTPException(status_code=500, detail=str(exc))
 
     async def start_background_index(
@@ -410,6 +831,27 @@ class MediaService:
             raise HTTPException(status_code=400, detail=str(exc))
         except Exception as exc:
             raise HTTPException(status_code=500, detail=str(exc))
+
+        for item in resolved_filenames:
+            safe_name = Path(str(item or "")).name.strip()
+            if not safe_name:
+                continue
+            await self._pipeline_ensure_snapshot(
+                case_id=resolved_case_id,
+                filename=safe_name,
+            )
+            await self._pipeline_update_stage(
+                case_id=resolved_case_id,
+                filename=safe_name,
+                stage="base_index",
+                status="pending",
+                event="background_index_queued",
+                details={
+                    "frame_interval_seconds": float(frame_interval_seconds),
+                    "batch_size": int(batch_size),
+                    "force": bool(force),
+                },
+            )
 
         jobs: dict[str, dict] = self.app.state.index_jobs
         lock: Lock = self.app.state.index_jobs_lock
@@ -495,3 +937,70 @@ class MediaService:
             return self.index_job_snapshot(persisted, case_id=selected_case_id)
 
         return self.index_job_snapshot(None, case_id=selected_case_id)
+
+    async def get_pipeline_status(self, case_id: str | None, filename: str | None) -> dict:
+        selected_case_id = ""
+        try:
+            selected_case_id = await asyncio.to_thread(self.resolve_case_id_or_default, case_id)
+            case_paths = await asyncio.to_thread(self.get_case_paths_or_raise, selected_case_id)
+        except ValueError as exc:
+            if case_id and str(case_id).strip():
+                raise HTTPException(status_code=400, detail=str(exc))
+            return {"case_id": "", "count": 0, "pipelines": []}
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"Case not found: {case_id}")
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc))
+
+        snapshots = await self._pipeline_list_case_snapshots(case_id=selected_case_id)
+        by_filename = {}
+        for item in snapshots:
+            if not isinstance(item, dict):
+                continue
+            key = str(item.get("filename") or "").strip()
+            if not key:
+                continue
+            by_filename[key] = item
+
+        if filename and str(filename).strip():
+            safe_filename = Path(str(filename or "")).name.strip()
+            if not safe_filename:
+                raise HTTPException(status_code=400, detail="filename is required")
+            target = by_filename.get(safe_filename)
+            if target is None:
+                video_path = case_paths.videos_dir / safe_filename
+                if not video_path.exists() or not video_path.is_file():
+                    raise HTTPException(status_code=404, detail=f"Video not found: {filename}")
+                target = await self._pipeline_ensure_snapshot(
+                    case_id=selected_case_id,
+                    filename=safe_filename,
+                )
+            if target is None:
+                target = self._default_pipeline(selected_case_id, safe_filename)
+            return {
+                "case_id": selected_case_id,
+                "filename": safe_filename,
+                "pipeline": target,
+            }
+
+        payload: list[dict] = []
+        for file_path in sorted(case_paths.videos_dir.iterdir()):
+            if not file_path.is_file():
+                continue
+            if file_path.suffix.lower() not in self.video_extensions:
+                continue
+            item = by_filename.get(file_path.name)
+            if item is None:
+                item = await self._pipeline_ensure_snapshot(
+                    case_id=selected_case_id,
+                    filename=file_path.name,
+                )
+            if item is None:
+                item = self._default_pipeline(selected_case_id, file_path.name)
+            payload.append(item)
+
+        return {
+            "case_id": selected_case_id,
+            "count": len(payload),
+            "pipelines": payload,
+        }
