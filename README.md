@@ -42,7 +42,25 @@ Everything runs locally (no external inference API calls).
 ```text
 project/
   backend/
-    main.py
+    main.py                  # app wiring + shared helpers + lifespan startup
+    routers/
+      cases.py
+      embedding_settings.py
+      media.py
+      insights.py
+      process_control.py
+    services/
+      case_service.py
+      embedding_settings_service.py
+      media_service.py
+      insights_service.py
+      process_control_service.py
+    schemas/
+      cases.py
+      embedding_settings.py
+      media.py
+      insights.py
+      process_control.py
     video_processing.py
     triage.py
     embeddings.py
@@ -50,6 +68,10 @@ project/
     temporal_store.py
     analysis.py
     analysis_store.py
+  tests/
+    services/
+      test_case_service.py
+      test_process_control_service.py
   frontend/
     index.html
     script.js
@@ -94,6 +116,12 @@ python -m backend.main
 ```
 
 App serves on `http://127.0.0.1:8000` and opens browser automatically.
+
+4. Optional: run lightweight unit tests:
+
+```powershell
+python -m unittest discover -s tests -v
+```
 
 ## Offline Model Notes
 
@@ -198,36 +226,31 @@ Changing OpenCLIP model/pretrained generally requires semantic re-indexing for e
 
 ## Scalability and Maintainability Review (Current Codebase)
 
-Recommended next improvements:
+Completed in the refactor phases so far:
 
-1. **Split `backend/main.py` into routers/services**
-   - `main.py` is large and mixes API + business logic.
-   - Move to modules: `cases`, `ingest`, `index`, `triage`, `analysis`, `settings`.
+1. **Router/service extraction**
+   - Case, settings, media, insights, and process-control domains are split into dedicated routers/services.
 
-2. **Introduce durable background job storage**
+2. **Shared request schemas**
+   - API request models are centralized in `backend/schemas`, reducing payload-shape drift.
+
+3. **Lifespan startup**
+   - Startup moved from deprecated `on_event("startup")` to FastAPI lifespan.
+
+Still recommended next:
+
+1. **Durable background job storage**
    - Job state is currently in-memory.
-   - Store jobs in SQLite (or similar) so status survives restart/crash.
+   - Persist in SQLite (or similar) so status survives restart/crash.
 
-3. **Use a real task queue for heavy work**
-   - Current approach uses in-process async + threads.
-   - Add a worker queue model for scale, cancellation, retries, and multiple concurrent workers.
+2. **Queue-based workers for heavy processing**
+   - Move long-running indexing/analysis to a worker queue model for retries/cancellation/isolation.
 
-4. **Add schema/version migrations for JSON metadata**
-   - There are multiple metadata files per case.
-   - Version and migrate structures explicitly to keep backward compatibility stable.
+3. **Metadata schema versioning + migrations**
+   - Version case metadata files and add migrations for backward compatibility.
 
-5. **Add automated tests**
-   - Add unit tests for conversion, indexing selection logic, triage cache validity, and endpoint contracts.
-   - Add a small integration suite for case lifecycle and indexing flow.
+4. **Expand automated tests**
+   - Add endpoint integration tests and coverage for indexing/triage/search edge cases.
 
-6. **Improve observability**
-   - Switch to structured logs (JSON or key-value), with request/job IDs consistently.
-   - Add timing metrics for upload, conversion, indexing, and triage generation.
-
-7. **Harden concurrency and file operations**
-   - Continue isolating temp files per case.
-   - Add explicit safeguards around deletes vs active playback/indexing across all long-running paths.
-
-8. **Prepare API contracts for frontend evolution**
-   - Define response schemas in one place and validate them consistently.
-   - This reduces UI breakage from payload-shape drift.
+5. **Improve observability**
+   - Structured logs + request/job correlation IDs + timing metrics.

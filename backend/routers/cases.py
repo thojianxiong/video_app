@@ -4,15 +4,7 @@ import asyncio
 from collections.abc import Callable
 
 from fastapi import APIRouter, HTTPException, Request
-from pydantic import BaseModel, Field
-
-
-class CaseCreateRequest(BaseModel):
-    name: str = Field(..., min_length=1, max_length=200)
-
-
-class CaseRenameRequest(BaseModel):
-    name: str = Field(..., min_length=1, max_length=200)
+from backend.schemas.cases import CaseCreateRequest, CaseRenameRequest
 
 
 def build_cases_router(

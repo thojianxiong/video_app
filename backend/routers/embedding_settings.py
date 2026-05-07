@@ -4,13 +4,7 @@ import asyncio
 from collections.abc import Callable
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, Field
-
-
-class EmbeddingSettingsUpdateRequest(BaseModel):
-    model_name: str | None = Field(default=None, min_length=1, max_length=120)
-    pretrained: str | None = Field(default=None, min_length=1, max_length=160)
-    device_preference: str | None = Field(default=None, min_length=1, max_length=16)
+from backend.schemas.embedding_settings import EmbeddingSettingsUpdateRequest
 
 
 def build_embedding_settings_router(
@@ -62,4 +56,3 @@ def build_embedding_settings_router(
             raise HTTPException(status_code=500, detail=str(exc))
 
     return router
-

@@ -1,13 +1,9 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
 
+from backend.schemas.process_control import ShutdownRequest
 from backend.services.process_control_service import ProcessControlService
-
-
-class ShutdownRequest(BaseModel):
-    confirm: bool = False
 
 
 def build_process_control_router(
@@ -33,4 +29,3 @@ def build_process_control_router(
             raise HTTPException(status_code=500, detail=str(exc))
 
     return router
-

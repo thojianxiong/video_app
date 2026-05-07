@@ -7,3 +7,6 @@ cases/*
 
 # Optional local model cache (if OPENCLIP_CACHE_DIR points here)
 data/
+
+# Local test temp directories
+.tmp_test/
