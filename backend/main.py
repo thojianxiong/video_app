@@ -27,6 +27,7 @@ from backend.analysis import AnalysisSelection, VideoAnalyzer
 from backend.analysis_store import AnalysisCropStore
 from backend.embeddings import OpenCLIPEmbedder
 from backend.routers.cases import build_cases_router
+from backend.routers.embedding_settings import build_embedding_settings_router
 from backend.services.case_service import (
     CasePaths,
     build_case_paths as _build_case_paths_impl,
@@ -39,6 +40,17 @@ from backend.services.case_service import (
     rename_case_sync as _rename_case_sync_impl,
     resolve_case_id_or_default as _resolve_case_id_or_default_impl,
     utc_now_iso as _utc_now_iso_impl,
+)
+from backend.services.embedding_settings_service import (
+    DEFAULT_OPENCLIP_DEVICE,
+    DEFAULT_OPENCLIP_MODEL,
+    DEFAULT_OPENCLIP_PRETRAINED,
+    EMBEDDING_DEVICE_OPTIONS,
+    EMBEDDING_MODEL_PROFILES,
+    build_embedding_settings_response_sync as _build_embedding_settings_response_sync_impl,
+    read_saved_embedding_settings_sync as _read_saved_embedding_settings_sync_impl,
+    resolve_effective_embedding_settings_sync as _resolve_effective_embedding_settings_sync_impl,
+    write_saved_embedding_settings_sync as _write_saved_embedding_settings_sync_impl,
 )
 from backend.temporal_store import TemporalWindowStore
 from backend.triage import build_video_triage_payload
@@ -56,26 +68,6 @@ FRONTEND_DIR = BASE_DIR / "frontend"
 CASES_DIR = BASE_DIR / "cases"
 CASES_REGISTRY_PATH = CASES_DIR / "cases.json"
 APP_SETTINGS_PATH = CASES_DIR / "app_settings.json"
-
-DEFAULT_OPENCLIP_MODEL = "ViT-L-14"
-DEFAULT_OPENCLIP_PRETRAINED = "openai"
-DEFAULT_OPENCLIP_DEVICE = "auto"
-
-EMBEDDING_MODEL_PROFILES = [
-    {
-        "id": "balanced_vit_b32_laion2b",
-        "label": "Balanced (ViT-B-32 / LAION2B)",
-        "model_name": "ViT-B-32",
-        "pretrained": "laion2b_s34b_b79k",
-    },
-    {
-        "id": "high_vit_l14_openai",
-        "label": "High Accuracy (ViT-L-14 / OpenAI)",
-        "model_name": "ViT-L-14",
-        "pretrained": "openai",
-    },
-]
-EMBEDDING_DEVICE_OPTIONS = ["auto", "cuda", "cpu"]
 
 SEMANTIC_OBJECT = "object"
 SEMANTIC_ACTION = "action"
@@ -160,12 +152,6 @@ class SearchRequest(BaseModel):
     oversample_factor: int | None = Field(default=None, ge=1, le=50)
 
 
-class EmbeddingSettingsUpdateRequest(BaseModel):
-    model_name: str | None = Field(default=None, min_length=1, max_length=120)
-    pretrained: str | None = Field(default=None, min_length=1, max_length=160)
-    device_preference: str | None = Field(default=None, min_length=1, max_length=16)
-
-
 class ShutdownRequest(BaseModel):
     confirm: bool = False
 
@@ -185,68 +171,15 @@ class TriageTimelineRequest(BaseModel):
     force: bool = False
 
 
-def _non_empty_env(name: str) -> str | None:
-    raw = os.getenv(name)
-    if raw is None:
-        return None
-    cleaned = str(raw).strip()
-    return cleaned or None
-
-
-def _normalize_device_preference(value: str | None) -> str:
-    normalized = str(value or DEFAULT_OPENCLIP_DEVICE).strip().lower()
-    if normalized not in EMBEDDING_DEVICE_OPTIONS:
-        raise ValueError(
-            "Invalid device_preference. Allowed values: auto, cuda, cpu."
-        )
-    return normalized
-
-
-def _default_embedding_settings() -> dict[str, str]:
-    return {
-        "model_name": DEFAULT_OPENCLIP_MODEL,
-        "pretrained": DEFAULT_OPENCLIP_PRETRAINED,
-        "device_preference": DEFAULT_OPENCLIP_DEVICE,
-    }
-
-
-def _load_app_settings_locked() -> dict:
-    default_payload = {"embedding": _default_embedding_settings()}
-    if not APP_SETTINGS_PATH.exists():
-        return default_payload
-    try:
-        payload = json.loads(APP_SETTINGS_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        return default_payload
-    if not isinstance(payload, dict):
-        return default_payload
-    return payload
-
-
-def _save_app_settings_locked(payload: dict) -> None:
-    APP_SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    APP_SETTINGS_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-
-
-def _sanitize_embedding_settings(raw_embedding: dict | None) -> dict[str, str]:
-    raw = raw_embedding if isinstance(raw_embedding, dict) else {}
-    model_name = str(raw.get("model_name") or DEFAULT_OPENCLIP_MODEL).strip()
-    pretrained = str(raw.get("pretrained") or DEFAULT_OPENCLIP_PRETRAINED).strip()
-    try:
-        device_preference = _normalize_device_preference(raw.get("device_preference"))
-    except ValueError:
-        device_preference = DEFAULT_OPENCLIP_DEVICE
-    return {
-        "model_name": model_name or DEFAULT_OPENCLIP_MODEL,
-        "pretrained": pretrained or DEFAULT_OPENCLIP_PRETRAINED,
-        "device_preference": device_preference,
-    }
-
-
 def _read_saved_embedding_settings_sync() -> dict[str, str]:
-    with APP_SETTINGS_LOCK:
-        payload = _load_app_settings_locked()
-        return _sanitize_embedding_settings(payload.get("embedding"))
+    return _read_saved_embedding_settings_sync_impl(
+        app_settings_path=APP_SETTINGS_PATH,
+        app_settings_lock=APP_SETTINGS_LOCK,
+        default_model=DEFAULT_OPENCLIP_MODEL,
+        default_pretrained=DEFAULT_OPENCLIP_PRETRAINED,
+        default_device=DEFAULT_OPENCLIP_DEVICE,
+        device_options=EMBEDDING_DEVICE_OPTIONS,
+    )
 
 
 def _write_saved_embedding_settings_sync(
@@ -255,105 +188,53 @@ def _write_saved_embedding_settings_sync(
     pretrained: str,
     device_preference: str,
 ) -> dict[str, str]:
-    clean_model = str(model_name or "").strip()
-    clean_pretrained = str(pretrained or "").strip()
-    clean_device = _normalize_device_preference(device_preference)
-    if not clean_model:
-        raise ValueError("model_name cannot be empty")
-    if not clean_pretrained:
-        raise ValueError("pretrained cannot be empty")
-
-    with APP_SETTINGS_LOCK:
-        payload = _load_app_settings_locked()
-        payload["embedding"] = {
-            "model_name": clean_model,
-            "pretrained": clean_pretrained,
-            "device_preference": clean_device,
-        }
-        _save_app_settings_locked(payload)
-    return dict(payload["embedding"])
-
-
-def _embedding_env_overrides() -> dict[str, bool]:
-    return {
-        "OPENCLIP_MODEL": _non_empty_env("OPENCLIP_MODEL") is not None,
-        "OPENCLIP_PRETRAINED": _non_empty_env("OPENCLIP_PRETRAINED") is not None,
-        "OPENCLIP_DEVICE": _non_empty_env("OPENCLIP_DEVICE") is not None,
-    }
+    return _write_saved_embedding_settings_sync_impl(
+        app_settings_path=APP_SETTINGS_PATH,
+        app_settings_lock=APP_SETTINGS_LOCK,
+        model_name=model_name,
+        pretrained=pretrained,
+        device_preference=device_preference,
+        default_model=DEFAULT_OPENCLIP_MODEL,
+        default_pretrained=DEFAULT_OPENCLIP_PRETRAINED,
+        default_device=DEFAULT_OPENCLIP_DEVICE,
+        device_options=EMBEDDING_DEVICE_OPTIONS,
+    )
 
 
 def _resolve_effective_embedding_settings_sync(
     saved_settings: dict[str, str] | None = None,
 ) -> dict[str, str]:
-    saved = saved_settings or _read_saved_embedding_settings_sync()
-    model_name = _non_empty_env("OPENCLIP_MODEL") or saved["model_name"]
-    pretrained = _non_empty_env("OPENCLIP_PRETRAINED") or saved["pretrained"]
-    env_device = _non_empty_env("OPENCLIP_DEVICE")
-    if env_device is None:
-        device_preference = saved["device_preference"]
-    else:
-        device_preference = _normalize_device_preference(env_device)
-
-    return {
-        "model_name": str(model_name).strip() or DEFAULT_OPENCLIP_MODEL,
-        "pretrained": str(pretrained).strip() or DEFAULT_OPENCLIP_PRETRAINED,
-        "device_preference": device_preference,
-    }
-
-
-def _find_embedding_profile_id(model_name: str, pretrained: str) -> str | None:
-    for profile in EMBEDDING_MODEL_PROFILES:
-        if (
-            str(profile.get("model_name")) == str(model_name)
-            and str(profile.get("pretrained")) == str(pretrained)
-        ):
-            return str(profile.get("id"))
-    return None
+    return _resolve_effective_embedding_settings_sync_impl(
+        app_settings_path=APP_SETTINGS_PATH,
+        app_settings_lock=APP_SETTINGS_LOCK,
+        saved_settings=saved_settings,
+        default_model=DEFAULT_OPENCLIP_MODEL,
+        default_pretrained=DEFAULT_OPENCLIP_PRETRAINED,
+        default_device=DEFAULT_OPENCLIP_DEVICE,
+        device_options=EMBEDDING_DEVICE_OPTIONS,
+    )
 
 
 def _build_embedding_settings_response_sync() -> dict:
-    saved = _read_saved_embedding_settings_sync()
-    effective = _resolve_effective_embedding_settings_sync(saved)
-    env_overrides = _embedding_env_overrides()
-
     embedder = getattr(app.state, "embedder", None)
-    loaded = {
-        "model_name": str(getattr(embedder, "model_name", effective["model_name"])),
-        "pretrained": str(getattr(embedder, "pretrained", effective["pretrained"])),
+    loaded_embedding = {
+        "model_name": str(getattr(embedder, "model_name", "")),
+        "pretrained": str(getattr(embedder, "pretrained", "")),
         "device_preference": str(
-            getattr(embedder, "device_preference", effective["device_preference"])
+            getattr(embedder, "device_preference", "")
         ),
         "device": str(getattr(embedder, "device", "")),
     }
-    restart_required = (
-        loaded["model_name"] != effective["model_name"]
-        or loaded["pretrained"] != effective["pretrained"]
-        or loaded["device_preference"] != effective["device_preference"]
+    return _build_embedding_settings_response_sync_impl(
+        app_settings_path=APP_SETTINGS_PATH,
+        app_settings_lock=APP_SETTINGS_LOCK,
+        loaded_embedding=loaded_embedding,
+        profiles=EMBEDDING_MODEL_PROFILES,
+        device_options=EMBEDDING_DEVICE_OPTIONS,
+        default_model=DEFAULT_OPENCLIP_MODEL,
+        default_pretrained=DEFAULT_OPENCLIP_PRETRAINED,
+        default_device=DEFAULT_OPENCLIP_DEVICE,
     )
-
-    profiles = [dict(profile) for profile in EMBEDDING_MODEL_PROFILES]
-    return {
-        "loaded": loaded,
-        "saved": saved,
-        "effective_next_startup": effective,
-        "profiles": profiles,
-        "device_options": list(EMBEDDING_DEVICE_OPTIONS),
-        "loaded_profile_id": _find_embedding_profile_id(
-            loaded["model_name"],
-            loaded["pretrained"],
-        ),
-        "saved_profile_id": _find_embedding_profile_id(
-            saved["model_name"],
-            saved["pretrained"],
-        ),
-        "effective_profile_id": _find_embedding_profile_id(
-            effective["model_name"],
-            effective["pretrained"],
-        ),
-        "env_overrides": env_overrides,
-        "restart_required": restart_required,
-        "reindex_required_if_model_changes": True,
-    }
 
 
 def _normalize_embedding_vector(vector: np.ndarray) -> np.ndarray:
@@ -505,48 +386,6 @@ async def root() -> FileResponse:
     if not index_html.exists():
         raise HTTPException(status_code=500, detail="frontend/index.html not found")
     return FileResponse(str(index_html))
-
-
-@app.get("/settings/embedding")
-async def get_embedding_settings() -> dict:
-    try:
-        return await asyncio.to_thread(_build_embedding_settings_response_sync)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-
-
-@app.post("/settings/embedding")
-async def update_embedding_settings(request: EmbeddingSettingsUpdateRequest) -> dict:
-    try:
-        saved = await asyncio.to_thread(_read_saved_embedding_settings_sync)
-        model_name = (
-            request.model_name.strip()
-            if isinstance(request.model_name, str)
-            else saved["model_name"]
-        )
-        pretrained = (
-            request.pretrained.strip()
-            if isinstance(request.pretrained, str)
-            else saved["pretrained"]
-        )
-        device_preference = (
-            request.device_preference.strip()
-            if isinstance(request.device_preference, str)
-            else saved["device_preference"]
-        )
-        await asyncio.to_thread(
-            _write_saved_embedding_settings_sync,
-            model_name=model_name,
-            pretrained=pretrained,
-            device_preference=device_preference,
-        )
-        return await asyncio.to_thread(_build_embedding_settings_response_sync)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
 
 
 def _safe_upload_filename(filename: str) -> str:
@@ -2097,6 +1936,13 @@ app.include_router(
         rename_case_sync=_rename_case_sync,
         delete_case_sync=_delete_case_sync,
         normalize_case_id=_normalize_case_id,
+    )
+)
+app.include_router(
+    build_embedding_settings_router(
+        read_saved_settings_sync=_read_saved_embedding_settings_sync,
+        write_saved_settings_sync=_write_saved_embedding_settings_sync,
+        build_settings_response_sync=_build_embedding_settings_response_sync,
     )
 )
 
