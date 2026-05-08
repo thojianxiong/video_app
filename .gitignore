@@ -12,3 +12,4 @@ data/
 .tmp_test/
 tests/.tmp_index_job_store/
 tests/.tmp_video_pipeline_store/
+tests/.tmp_index_queue_store/

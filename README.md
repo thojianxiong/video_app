@@ -140,7 +140,7 @@ $env:YOLO_MODEL_PATH = ".\\models\\yolov8s.pt"
 
 ## Video Ingestion and Conversion
 
-Supported inputs: `.mp4`, `.mov`, `.avi`, `.mkv`, `.webm`, `.m4v`
+Supported inputs: `.mp4`, `.mov`, `.avi`, `.mkv`, `.webm`, `.m4v`, `.wmv`
 
 On upload:
 1. file is saved to temporary case data path
