@@ -128,6 +128,23 @@ class IndexQueueStore:
         return normalized
 
     @classmethod
+    def _normalize_job_kinds(
+        cls,
+        job_kinds: list[str] | tuple[str, ...] | set[str] | None,
+    ) -> list[str]:
+        if not job_kinds:
+            return []
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for item in job_kinds:
+            kind = cls._normalize_job_kind(str(item or ""))
+            if not kind or kind in seen:
+                continue
+            seen.add(kind)
+            normalized.append(kind)
+        return normalized
+
+    @classmethod
     def _normalize_priority(cls, priority: int) -> int:
         try:
             value = int(priority)
@@ -277,14 +294,16 @@ class IndexQueueStore:
                 job["queue_position"] = self.queue_position(job["job_id"], _conn=conn)
                 return job
 
-            # Only one active (queued/running) job per case to keep case status unambiguous.
+            # Prefer appending into an already queued job for the same case/kind.
+            # We intentionally do not append into a running job because the worker
+            # may be processing one file at a time (interleaving mode).
             case_active = conn.execute(
                 """
                 SELECT *
                 FROM index_job_queue
                 WHERE case_id = ?
                   AND job_kind = ?
-                  AND status IN ('queued', 'running')
+                  AND status = 'queued'
                 ORDER BY priority ASC, id ASC
                 LIMIT 1
                 """,
@@ -470,18 +489,37 @@ class IndexQueueStore:
             if own_connection:
                 conn.close()
 
-    def claim_next_queued(self) -> dict[str, Any] | None:
+    def claim_next_queued(
+        self,
+        *,
+        job_kinds: list[str] | tuple[str, ...] | set[str] | None = None,
+    ) -> dict[str, Any] | None:
         now = self._utc_now_iso()
+        normalized_job_kinds = self._normalize_job_kinds(job_kinds)
         with self._lock, self._managed_connection() as conn:
-            row = conn.execute(
-                """
-                SELECT *
-                FROM index_job_queue
-                WHERE status = 'queued'
-                ORDER BY priority ASC, id ASC
-                LIMIT 1
-                """
-            ).fetchone()
+            if normalized_job_kinds:
+                placeholders = ",".join(["?"] * len(normalized_job_kinds))
+                row = conn.execute(
+                    f"""
+                    SELECT *
+                    FROM index_job_queue
+                    WHERE status = 'queued'
+                      AND job_kind IN ({placeholders})
+                    ORDER BY priority ASC, id ASC
+                    LIMIT 1
+                    """,
+                    tuple(normalized_job_kinds),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    """
+                    SELECT *
+                    FROM index_job_queue
+                    WHERE status = 'queued'
+                    ORDER BY priority ASC, id ASC
+                    LIMIT 1
+                    """
+                ).fetchone()
             if row is None:
                 return None
 
@@ -559,7 +597,10 @@ class IndexQueueStore:
                     WHERE case_id = ?
                       AND job_kind = ?
                       AND status IN ('queued', 'running')
-                    ORDER BY priority ASC, id ASC
+                    ORDER BY
+                      CASE status WHEN 'running' THEN 0 ELSE 1 END ASC,
+                      priority ASC,
+                      id ASC
                     LIMIT 1
                     """,
                     (normalized_case_id, normalized_job_kind),
@@ -571,7 +612,10 @@ class IndexQueueStore:
                     FROM index_job_queue
                     WHERE case_id = ?
                       AND status IN ('queued', 'running')
-                    ORDER BY priority ASC, id ASC
+                    ORDER BY
+                      CASE status WHEN 'running' THEN 0 ELSE 1 END ASC,
+                      priority ASC,
+                      id ASC
                     LIMIT 1
                     """,
                     (normalized_case_id,),
@@ -658,6 +702,29 @@ class IndexQueueStore:
                 WHERE status = 'running'
                 """,
                 (now, now),
+            )
+            changed = int(conn.total_changes)
+            conn.commit()
+            return changed
+
+    def recover_running_jobs_to_queued(self) -> int:
+        """Re-queue in-flight jobs on startup after an unclean shutdown."""
+        now = self._utc_now_iso()
+        with self._lock, self._managed_connection() as conn:
+            conn.execute(
+                """
+                UPDATE index_job_queue
+                SET status = 'queued',
+                    error = CASE
+                        WHEN error = '' THEN 'Recovered and re-queued on startup after unclean shutdown.'
+                        ELSE error
+                    END,
+                    started_at = '',
+                    finished_at = '',
+                    updated_at = ?
+                WHERE status = 'running'
+                """,
+                (now,),
             )
             changed = int(conn.total_changes)
             conn.commit()
@@ -763,3 +830,115 @@ class IndexQueueStore:
             for job in jobs:
                 job["queue_position"] = self.queue_position(int(job.get("job_id", 0)), _conn=conn)
             return jobs
+
+    def delete_jobs(
+        self,
+        job_ids: list[int] | tuple[int, ...] | set[int],
+        *,
+        cancel_running: bool = True,
+        reason: str = "Removed from queue by user request.",
+    ) -> dict[str, Any]:
+        unique_job_ids: list[int] = []
+        seen: set[int] = set()
+        for raw in job_ids:
+            try:
+                parsed = int(raw)
+            except Exception:
+                continue
+            if parsed <= 0 or parsed in seen:
+                continue
+            seen.add(parsed)
+            unique_job_ids.append(parsed)
+
+        if not unique_job_ids:
+            return {
+                "requested_count": 0,
+                "found_count": 0,
+                "removed_count": 0,
+                "cancelled_running_count": 0,
+                "skipped_running_count": 0,
+                "not_found_ids": [],
+                "removed_job_ids": [],
+                "cancelled_running_job_ids": [],
+                "skipped_running_job_ids": [],
+                "affected_case_ids": [],
+            }
+
+        safe_reason = str(reason or "").strip() or "Removed from queue by user request."
+        now = self._utc_now_iso()
+        placeholders = ",".join(["?"] * len(unique_job_ids))
+
+        with self._lock, self._managed_connection() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT id, case_id, status
+                FROM index_job_queue
+                WHERE id IN ({placeholders})
+                """,
+                tuple(unique_job_ids),
+            ).fetchall()
+
+            by_id = {int(row["id"]): row for row in rows}
+            not_found_ids = [job_id for job_id in unique_job_ids if job_id not in by_id]
+
+            removed_job_ids: list[int] = []
+            cancelled_running_job_ids: list[int] = []
+            skipped_running_job_ids: list[int] = []
+            affected_case_ids: set[str] = set()
+
+            for job_id in unique_job_ids:
+                row = by_id.get(job_id)
+                if row is None:
+                    continue
+                status = str(row["status"] or "").strip().lower()
+                case_id = str(row["case_id"] or "").strip()
+                if case_id:
+                    affected_case_ids.add(case_id)
+
+                if status == "running":
+                    if not bool(cancel_running):
+                        skipped_running_job_ids.append(job_id)
+                        continue
+                    conn.execute(
+                        """
+                        UPDATE index_job_queue
+                        SET status = 'cancelled',
+                            error = CASE
+                                WHEN error = '' THEN ?
+                                ELSE error
+                            END,
+                            finished_at = CASE
+                                WHEN finished_at = '' THEN ?
+                                ELSE finished_at
+                            END,
+                            updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (safe_reason, now, now, int(job_id)),
+                    )
+                    cancelled_running_job_ids.append(job_id)
+                    continue
+
+                conn.execute(
+                    """
+                    DELETE FROM index_job_queue
+                    WHERE id = ?
+                    """,
+                    (int(job_id),),
+                )
+                removed_job_ids.append(job_id)
+
+            conn.commit()
+
+        return {
+            "requested_count": len(unique_job_ids),
+            "found_count": len(rows),
+            "removed_count": len(removed_job_ids),
+            "cancelled_running_count": len(cancelled_running_job_ids),
+            "skipped_running_count": len(skipped_running_job_ids),
+            "not_found_ids": not_found_ids,
+            "removed_job_ids": removed_job_ids,
+            "cancelled_running_job_ids": cancelled_running_job_ids,
+            "skipped_running_job_ids": skipped_running_job_ids,
+            "affected_case_ids": sorted(affected_case_ids),
+        }

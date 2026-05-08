@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+from io import BytesIO
 from pathlib import Path
 from threading import Lock
 from typing import Any
 
+import numpy as np
 from fastapi import HTTPException
+from PIL import Image, UnidentifiedImageError
 
 from backend.analysis_store import AnalysisCropStore
 
@@ -13,6 +16,9 @@ from backend.analysis_store import AnalysisCropStore
 class InsightsService:
     QUEUE_KIND_TRIAGE_TIMELINE = "triage_timeline"
     QUEUE_PRIORITY_TRIAGE_TIMELINE = 20
+    SUSPECT_MODE_AUTO = "auto"
+    SUSPECT_MODE_FACE = "face"
+    SUSPECT_MODE_PERSON = "person"
 
     def __init__(
         self,
@@ -56,6 +62,198 @@ class InsightsService:
         self.semantic_object = semantic_object
         self.semantic_action = semantic_action
         self.semantic_scene = semantic_scene
+
+    @classmethod
+    def _normalize_suspect_mode(cls, mode: str | None) -> str:
+        normalized = str(mode or cls.SUSPECT_MODE_AUTO).strip().lower()
+        if normalized in {
+            cls.SUSPECT_MODE_AUTO,
+            cls.SUSPECT_MODE_FACE,
+            cls.SUSPECT_MODE_PERSON,
+        }:
+            return normalized
+        raise ValueError("mode must be one of: auto, face, person")
+
+    @staticmethod
+    def _decode_probe_image(image_bytes: bytes) -> Image.Image:
+        if not image_bytes:
+            raise ValueError("probe_image is required")
+        try:
+            with Image.open(BytesIO(image_bytes)) as image:
+                return image.convert("RGB")
+        except UnidentifiedImageError as exc:
+            raise ValueError("probe_image is not a valid image file") from exc
+
+    @staticmethod
+    def _select_largest_face_box(face_boxes: list[tuple[int, int, int, int]]) -> tuple[int, int, int, int] | None:
+        if not isinstance(face_boxes, list) or not face_boxes:
+            return None
+        best_box = None
+        best_area = -1
+        for box in face_boxes:
+            if not isinstance(box, tuple) or len(box) != 4:
+                continue
+            x1, y1, x2, y2 = [int(value) for value in box]
+            width = max(0, x2 - x1)
+            height = max(0, y2 - y1)
+            area = width * height
+            if area > best_area:
+                best_area = area
+                best_box = (x1, y1, x2, y2)
+        return best_box
+
+    @staticmethod
+    def _crop_to_box(image: Image.Image, box: tuple[int, int, int, int]) -> Image.Image:
+        width, height = image.size
+        x1, y1, x2, y2 = box
+        left = max(0, min(width - 1, int(x1)))
+        top = max(0, min(height - 1, int(y1)))
+        right = max(left + 1, min(width, int(x2)))
+        bottom = max(top + 1, min(height, int(y2)))
+        return image.crop((left, top, right, bottom))
+
+    async def suspect_photo_search(
+        self,
+        *,
+        case_id: str | None,
+        probe_image_bytes: bytes,
+        mode: str,
+        top_k: int,
+        min_score: float | None,
+    ) -> dict:
+        try:
+            selected_case_id = await asyncio.to_thread(
+                self.resolve_case_id_or_default,
+                case_id,
+            )
+            case_paths, crop_store = await asyncio.to_thread(
+                self.get_analysis_store_for_case,
+                selected_case_id,
+            )
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"Case not found: {case_id}")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+        try:
+            requested_mode = self._normalize_suspect_mode(mode)
+            safe_top_k = max(1, min(500, int(top_k)))
+            safe_min_score = None if min_score is None else float(min_score)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+        try:
+            probe_image = await asyncio.to_thread(
+                self._decode_probe_image,
+                bytes(probe_image_bytes or b""),
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc))
+
+        face_boxes: list[tuple[int, int, int, int]] = []
+        analyzer = getattr(self.app.state, "analyzer", None)
+        if analyzer is not None and hasattr(analyzer, "detect_faces"):
+            try:
+                frame_rgb = np.asarray(probe_image.convert("RGB"))
+                detected = await asyncio.to_thread(analyzer.detect_faces, frame_rgb)
+                if isinstance(detected, list):
+                    face_boxes = [box for box in detected if isinstance(box, tuple) and len(box) == 4]
+            except Exception:
+                face_boxes = []
+
+        selected_face_box = self._select_largest_face_box(face_boxes)
+        mode_used = requested_mode
+        query_image = probe_image
+        search_kind = "person"
+
+        if requested_mode == self.SUSPECT_MODE_FACE:
+            if selected_face_box is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="No face detected in probe image. Try mode=person or a clearer face image.",
+                )
+            query_image = self._crop_to_box(probe_image, selected_face_box)
+            search_kind = "face"
+        elif requested_mode == self.SUSPECT_MODE_AUTO:
+            if selected_face_box is not None:
+                query_image = self._crop_to_box(probe_image, selected_face_box)
+                mode_used = self.SUSPECT_MODE_FACE
+                search_kind = "face"
+            else:
+                mode_used = self.SUSPECT_MODE_PERSON
+                search_kind = "person"
+        else:
+            search_kind = "person"
+
+        try:
+            query_embedding_batch = await asyncio.to_thread(
+                self.app.state.embedder.encode_images,
+                [query_image],
+                1,
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Failed to embed probe image: {exc}")
+
+        if not isinstance(query_embedding_batch, np.ndarray) or query_embedding_batch.size == 0:
+            raise HTTPException(status_code=500, detail="Failed to produce probe embedding")
+        query_embedding = np.asarray(query_embedding_batch[0], dtype=np.float32)
+
+        raw_items: list[dict[str, Any]] = []
+        try:
+            raw_items = await asyncio.to_thread(
+                crop_store.search,
+                category=AnalysisCropStore.FACE_PEOPLE,
+                query_embedding=query_embedding,
+                top_k=max(safe_top_k * 4, safe_top_k),
+                kind=search_kind,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc))
+
+        results: list[dict[str, Any]] = []
+        seen: set[tuple[str, int, str]] = set()
+        for item in raw_items:
+            score = float(item.get("similarity_score", -1.0))
+            if safe_min_score is not None and score < safe_min_score:
+                continue
+
+            hydrated = self.hydrate_crop_item(case_paths, item)
+            video_filename = str(hydrated.get("video_filename") or "").strip()
+            timestamp_seconds = float(hydrated.get("timestamp_seconds", 0.0))
+            item_kind = str(hydrated.get("kind") or "").strip().lower() or search_kind
+            dedupe_key = (
+                video_filename,
+                int(round(max(0.0, timestamp_seconds) * 2.0)),  # 0.5s bucket
+                item_kind,
+            )
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+
+            results.append(hydrated)
+            if len(results) >= safe_top_k:
+                break
+
+        return {
+            "case_id": case_paths.case_id,
+            "mode_requested": requested_mode,
+            "mode_used": mode_used,
+            "search_kind": search_kind,
+            "face_detected": bool(selected_face_box is not None),
+            "probe_face_box": (
+                [int(selected_face_box[0]), int(selected_face_box[1]), int(selected_face_box[2]), int(selected_face_box[3])]
+                if selected_face_box is not None
+                else None
+            ),
+            "top_k": int(safe_top_k),
+            "min_score": safe_min_score,
+            "count": len(results),
+            "results": results,
+        }
 
     def _video_delete_registry(self) -> tuple[Lock, set[str]]:
         state = self.app.state
@@ -290,13 +488,40 @@ class InsightsService:
         if not clean_query:
             raise HTTPException(status_code=400, detail="Query cannot be empty")
 
+        def _safe_float(value: Any, default: float) -> float:
+            try:
+                if value is None:
+                    return float(default)
+                return float(value)
+            except Exception:
+                return float(default)
+
+        def _safe_int(value: Any, default: int) -> int:
+            try:
+                if value is None:
+                    return int(default)
+                return int(value)
+            except Exception:
+                return int(default)
+
+        def _safe_optional_float(value: Any) -> float | None:
+            if value is None:
+                return None
+            try:
+                return float(value)
+            except Exception:
+                return None
+
         saved_search_settings = await asyncio.to_thread(self.read_search_settings_sync)
         if not isinstance(saved_search_settings, dict):
             saved_search_settings = {}
 
-        saved_threshold = float(saved_search_settings.get("score_threshold", 0.22))
-        saved_result_limit = int(saved_search_settings.get("result_limit", 120))
-        saved_dedupe_aggressiveness = float(saved_search_settings.get("dedupe_aggressiveness", 55.0))
+        saved_threshold = _safe_float(saved_search_settings.get("score_threshold"), 0.22)
+        saved_result_limit = _safe_int(saved_search_settings.get("result_limit"), 120)
+        saved_dedupe_aggressiveness = _safe_float(
+            saved_search_settings.get("dedupe_aggressiveness"),
+            55.0,
+        )
         runtime_search_settings = await asyncio.to_thread(
             self.derive_search_runtime_settings,
             saved_dedupe_aggressiveness,
@@ -304,18 +529,18 @@ class InsightsService:
         if not isinstance(runtime_search_settings, dict):
             runtime_search_settings = {}
 
-        resolved_min_score = float(min_score) if min_score is not None else float(saved_threshold)
-        resolved_top_k = int(top_k) if int(top_k) > 0 else int(saved_result_limit)
+        resolved_min_score = _safe_float(min_score, saved_threshold) if min_score is not None else float(saved_threshold)
+        resolved_top_k = _safe_int(top_k, saved_result_limit) if _safe_int(top_k, 0) > 0 else int(saved_result_limit)
         resolved_top_k = max(1, min(500, resolved_top_k))
         resolved_diversity = (
-            float(diversity_seconds)
+            _safe_float(diversity_seconds, 6.0)
             if diversity_seconds is not None
-            else float(runtime_search_settings.get("diversity_seconds", 6.0))
+            else _safe_float(runtime_search_settings.get("diversity_seconds"), 6.0)
         )
-        resolved_near_duplicate = float(runtime_search_settings.get("near_duplicate_seconds", 2.0))
-        resolved_per_video_cap = int(runtime_search_settings.get("per_video_cap", 6))
+        resolved_near_duplicate = _safe_float(runtime_search_settings.get("near_duplicate_seconds"), 2.0)
+        resolved_per_video_cap = _safe_int(runtime_search_settings.get("per_video_cap"), 6)
         resolved_oversample = (
-            int(oversample_factor)
+            _safe_int(oversample_factor, 10)
             if oversample_factor is not None
             else self.int_from_env("SEMANTIC_OVERSAMPLE_FACTOR", 10)
         )
@@ -379,10 +604,14 @@ class InsightsService:
                     prev = candidate.get("temporal_similarity_score")
                     if prev is None or score > float(prev):
                         candidate["temporal_similarity_score"] = float(score)
-                    if candidate.get("start_seconds") is None and item.get("start_seconds") is not None:
-                        candidate["start_seconds"] = float(item.get("start_seconds"))
-                    if candidate.get("end_seconds") is None and item.get("end_seconds") is not None:
-                        candidate["end_seconds"] = float(item.get("end_seconds"))
+                    if candidate.get("start_seconds") is None:
+                        start_seconds = _safe_optional_float(item.get("start_seconds"))
+                        if start_seconds is not None:
+                            candidate["start_seconds"] = start_seconds
+                    if candidate.get("end_seconds") is None:
+                        end_seconds = _safe_optional_float(item.get("end_seconds"))
+                        if end_seconds is not None:
+                            candidate["end_seconds"] = end_seconds
                 if not candidate.get("thumbnail_path"):
                     candidate["thumbnail_path"] = str(item.get("thumbnail_path") or "")
                 modes = candidate.setdefault("source_modes", [])
@@ -486,9 +715,13 @@ class InsightsService:
                     ),
                 }
                 if "start_seconds" in item:
-                    payload["window_start_seconds"] = float(item.get("start_seconds", 0.0))
+                    start_seconds = _safe_optional_float(item.get("start_seconds"))
+                    if start_seconds is not None:
+                        payload["window_start_seconds"] = start_seconds
                 if "end_seconds" in item:
-                    payload["window_end_seconds"] = float(item.get("end_seconds", 0.0))
+                    end_seconds = _safe_optional_float(item.get("end_seconds"))
+                    if end_seconds is not None:
+                        payload["window_end_seconds"] = end_seconds
                 source_modes = item.get("source_modes")
                 if isinstance(source_modes, list):
                     payload["source_modes"] = [str(mode_name) for mode_name in source_modes if str(mode_name).strip()]

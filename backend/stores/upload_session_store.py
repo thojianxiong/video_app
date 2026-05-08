@@ -65,6 +65,8 @@ class UploadSessionStore:
                     total_chunks INTEGER NOT NULL DEFAULT 0,
                     received_bytes INTEGER NOT NULL DEFAULT 0,
                     status TEXT NOT NULL DEFAULT 'pending',
+                    finalize_progress_percent REAL NOT NULL DEFAULT 0,
+                    finalize_stage TEXT NOT NULL DEFAULT '',
                     uploaded_filename TEXT NOT NULL DEFAULT '',
                     converted_to_mp4 INTEGER NOT NULL DEFAULT 0,
                     error TEXT NOT NULL DEFAULT '',
@@ -98,6 +100,24 @@ class UploadSessionStore:
                 ON upload_session_chunks(file_id, chunk_index)
                 """
             )
+            file_columns = {
+                str(row["name"] or "").strip().lower()
+                for row in conn.execute("PRAGMA table_info(upload_session_files)").fetchall()
+            }
+            if "finalize_progress_percent" not in file_columns:
+                conn.execute(
+                    """
+                    ALTER TABLE upload_session_files
+                    ADD COLUMN finalize_progress_percent REAL NOT NULL DEFAULT 0
+                    """
+                )
+            if "finalize_stage" not in file_columns:
+                conn.execute(
+                    """
+                    ALTER TABLE upload_session_files
+                    ADD COLUMN finalize_stage TEXT NOT NULL DEFAULT ''
+                    """
+                )
             conn.commit()
 
     @staticmethod
@@ -159,6 +179,15 @@ class UploadSessionStore:
         received_bytes = max(0, min(source_size, int(row["received_bytes"] or 0)))
         total_chunks = max(1, int(row["total_chunks"] or 1))
         received_chunks = max(0, int(row["received_chunks"] or 0))
+        try:
+            finalize_progress_percent = float(row["finalize_progress_percent"] or 0.0)
+        except (TypeError, ValueError):
+            finalize_progress_percent = 0.0
+        finalize_progress_percent = max(0.0, min(100.0, finalize_progress_percent))
+        status_value = str(row["status"] or "pending")
+        if status_value == "completed":
+            finalize_progress_percent = 100.0
+        finalize_stage = str(row["finalize_stage"] or "")
         progress_percent = 100.0
         if source_size > 0:
             progress_percent = max(
@@ -185,7 +214,9 @@ class UploadSessionStore:
             "total_chunks": total_chunks,
             "received_chunks": received_chunks,
             "received_bytes": received_bytes,
-            "status": str(row["status"] or "pending"),
+            "status": status_value,
+            "finalize_progress_percent": finalize_progress_percent,
+            "finalize_stage": finalize_stage,
             "uploaded_filename": str(row["uploaded_filename"] or ""),
             "converted_to_mp4": bool(int(row["converted_to_mp4"] or 0)),
             "error": str(row["error"] or ""),
@@ -539,6 +570,8 @@ class UploadSessionStore:
         session_id: str,
         file_id: str,
         status: str,
+        finalize_progress_percent: float | None = None,
+        finalize_stage: str | None = None,
         uploaded_filename: str = "",
         converted_to_mp4: bool = False,
         error: str = "",
@@ -546,24 +579,159 @@ class UploadSessionStore:
         normalized_session_id = self._normalize_session_id(session_id)
         normalized_file_id = self._normalize_file_id(file_id)
         normalized_status = self._normalize_file_status(status)
+        next_finalize_percent = None
+        if finalize_progress_percent is not None:
+            next_finalize_percent = max(0.0, min(100.0, float(finalize_progress_percent)))
+        next_finalize_stage = (
+            str(finalize_stage or "").strip()
+            if finalize_stage is not None
+            else None
+        )
+        now = self._utc_now_iso()
+        with self._lock, self._managed_connection() as conn:
+            if next_finalize_percent is None and normalized_status == "completed":
+                next_finalize_percent = 100.0
+            if next_finalize_stage is None and normalized_status == "completed":
+                next_finalize_stage = "completed"
+            if next_finalize_stage is None and normalized_status == "failed":
+                next_finalize_stage = "failed"
+
+            if next_finalize_percent is None and next_finalize_stage is None:
+                conn.execute(
+                    """
+                    UPDATE upload_session_files
+                    SET
+                        status = ?,
+                        uploaded_filename = ?,
+                        converted_to_mp4 = ?,
+                        error = ?,
+                        updated_at = ?
+                    WHERE session_id = ? AND file_id = ?
+                    """,
+                    (
+                        normalized_status,
+                        str(uploaded_filename or ""),
+                        1 if bool(converted_to_mp4) else 0,
+                        str(error or ""),
+                        now,
+                        normalized_session_id,
+                        normalized_file_id,
+                    ),
+                )
+            elif next_finalize_percent is None:
+                conn.execute(
+                    """
+                    UPDATE upload_session_files
+                    SET
+                        status = ?,
+                        finalize_stage = ?,
+                        uploaded_filename = ?,
+                        converted_to_mp4 = ?,
+                        error = ?,
+                        updated_at = ?
+                    WHERE session_id = ? AND file_id = ?
+                    """,
+                    (
+                        normalized_status,
+                        str(next_finalize_stage or ""),
+                        str(uploaded_filename or ""),
+                        1 if bool(converted_to_mp4) else 0,
+                        str(error or ""),
+                        now,
+                        normalized_session_id,
+                        normalized_file_id,
+                    ),
+                )
+            elif next_finalize_stage is None:
+                conn.execute(
+                    """
+                    UPDATE upload_session_files
+                    SET
+                        status = ?,
+                        finalize_progress_percent = ?,
+                        uploaded_filename = ?,
+                        converted_to_mp4 = ?,
+                        error = ?,
+                        updated_at = ?
+                    WHERE session_id = ? AND file_id = ?
+                    """,
+                    (
+                        normalized_status,
+                        float(next_finalize_percent),
+                        str(uploaded_filename or ""),
+                        1 if bool(converted_to_mp4) else 0,
+                        str(error or ""),
+                        now,
+                        normalized_session_id,
+                        normalized_file_id,
+                    ),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE upload_session_files
+                    SET
+                        status = ?,
+                        finalize_progress_percent = ?,
+                        finalize_stage = ?,
+                        uploaded_filename = ?,
+                        converted_to_mp4 = ?,
+                        error = ?,
+                        updated_at = ?
+                    WHERE session_id = ? AND file_id = ?
+                    """,
+                    (
+                        normalized_status,
+                        float(next_finalize_percent),
+                        str(next_finalize_stage or ""),
+                        str(uploaded_filename or ""),
+                        1 if bool(converted_to_mp4) else 0,
+                        str(error or ""),
+                        now,
+                        normalized_session_id,
+                        normalized_file_id,
+                    ),
+                )
+            conn.execute(
+                """
+                UPDATE upload_sessions
+                SET updated_at = ?
+                WHERE session_id = ?
+                """,
+                (now, normalized_session_id),
+            )
+            conn.commit()
+            payload = self._load_session_locked(conn, normalized_session_id)
+        if payload is None:
+            raise KeyError("upload session not found")
+        return payload
+
+    def update_file_finalize_progress(
+        self,
+        *,
+        session_id: str,
+        file_id: str,
+        progress_percent: float,
+        stage: str = "",
+    ) -> dict[str, Any]:
+        normalized_session_id = self._normalize_session_id(session_id)
+        normalized_file_id = self._normalize_file_id(file_id)
+        safe_progress = max(0.0, min(100.0, float(progress_percent)))
+        safe_stage = str(stage or "").strip()
         now = self._utc_now_iso()
         with self._lock, self._managed_connection() as conn:
             conn.execute(
                 """
                 UPDATE upload_session_files
                 SET
-                    status = ?,
-                    uploaded_filename = ?,
-                    converted_to_mp4 = ?,
-                    error = ?,
+                    finalize_progress_percent = ?,
+                    finalize_stage = ?,
                     updated_at = ?
                 WHERE session_id = ? AND file_id = ?
                 """,
                 (
-                    normalized_status,
-                    str(uploaded_filename or ""),
-                    1 if bool(converted_to_mp4) else 0,
-                    str(error or ""),
+                    float(safe_progress),
+                    safe_stage,
                     now,
                     normalized_session_id,
                     normalized_file_id,
@@ -610,4 +778,3 @@ class UploadSessionStore:
         if payload is None:
             raise KeyError("upload session not found")
         return payload
-

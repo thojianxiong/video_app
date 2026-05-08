@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import shutil
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
@@ -19,6 +20,7 @@ class MediaService:
     QUEUE_KIND_TRIAGE_TIMELINE = "triage_timeline"
     QUEUE_PRIORITY_SEMANTIC_INDEX = 50
     QUEUE_PRIORITY_ANALYSIS = 70
+    QUEUE_PRIORITY_TRIAGE_TIMELINE = 20
     DELETE_LOCK_CHECK_ATTEMPTS = 10
     DELETE_LOCK_CHECK_DELAY_SECONDS = 0.15
     DELETE_LOCK_CHECK_BACKOFF_MULTIPLIER = 1.6
@@ -92,6 +94,49 @@ class MediaService:
 
     def _upload_session_chunk_lock(self):
         return getattr(self.app.state, "upload_session_chunk_lock", None)
+
+    async def _queue_finalize_uploaded_temp_file(
+        self,
+        *,
+        case_paths: Any,
+        source_filename: str,
+        source_index: int,
+        temp_upload_path: Path,
+        session_id: str = "",
+        file_id: str = "",
+    ) -> dict:
+        finalize_queue = getattr(self.app.state, "ingest_finalize_queue", None)
+        if not isinstance(finalize_queue, asyncio.Queue):
+            return await self._finalize_uploaded_temp_file(
+                case_paths=case_paths,
+                source_filename=source_filename,
+                source_index=source_index,
+                temp_upload_path=temp_upload_path,
+                session_id=session_id,
+                file_id=file_id,
+            )
+
+        loop = asyncio.get_running_loop()
+        result_future: asyncio.Future = loop.create_future()
+        await finalize_queue.put(
+            {
+                "kind": "upload_finalize",
+                "session_id": str(session_id or ""),
+                "file_id": str(file_id or ""),
+                "source_filename": str(source_filename or ""),
+                "callback": self._finalize_uploaded_temp_file,
+                "kwargs": {
+                    "case_paths": case_paths,
+                    "source_filename": source_filename,
+                    "source_index": source_index,
+                    "temp_upload_path": temp_upload_path,
+                    "session_id": session_id,
+                    "file_id": file_id,
+                },
+                "future": result_future,
+            }
+        )
+        return await result_future
 
     @staticmethod
     def compute_source_fingerprint_sha256(
@@ -1311,6 +1356,114 @@ class MediaService:
         except Exception as exc:
             print(f"[pipeline][{case_id}] delete_video_failed file={filename} error={exc}")
 
+    async def _enqueue_auto_triage_timeline(
+        self,
+        *,
+        case_id: str,
+        filename: str,
+        bucket_seconds: float = 1.0,
+        force: bool = False,
+        source: str = "upload_auto",
+    ) -> dict[str, Any]:
+        normalized_case_id = str(case_id or "").strip()
+        safe_filename = Path(str(filename or "")).name.strip()
+        if not normalized_case_id or not safe_filename:
+            return {"queued": False, "reason": "invalid_input"}
+        if self._is_case_delete_in_progress(normalized_case_id):
+            return {"queued": False, "reason": "case_delete_in_progress"}
+        if self._is_video_delete_in_progress(normalized_case_id, safe_filename):
+            return {"queued": False, "reason": "video_delete_in_progress"}
+
+        queue_store = getattr(self.app.state, "index_queue_store", None)
+        if queue_store is None:
+            return {"queued": False, "reason": "queue_unavailable"}
+
+        try:
+            safe_bucket_seconds = max(0.5, float(bucket_seconds))
+        except Exception:
+            safe_bucket_seconds = 1.0
+
+        await self._pipeline_ensure_snapshot(
+            case_id=normalized_case_id,
+            filename=safe_filename,
+        )
+        snapshot = await self._pipeline_get_video_snapshot(
+            case_id=normalized_case_id,
+            filename=safe_filename,
+        )
+        triage_stage_status = self._stage_status(snapshot or {}, "triage")
+        if not bool(force) and triage_stage_status in {"completed", "running"}:
+            return {
+                "queued": False,
+                "reason": f"triage_already_{triage_stage_status}",
+            }
+
+        await self._pipeline_update_stage(
+            case_id=normalized_case_id,
+            filename=safe_filename,
+            stage="triage",
+            status="pending",
+            event="auto_triage_queued",
+            details={
+                "source": str(source or "upload_auto"),
+                "bucket_seconds": float(safe_bucket_seconds),
+                "force": bool(force),
+                "auto_trigger": True,
+            },
+        )
+
+        try:
+            queued_job = await asyncio.to_thread(
+                queue_store.enqueue_or_get_active,
+                case_id=normalized_case_id,
+                filenames=[safe_filename],
+                frame_interval_seconds=float(safe_bucket_seconds),
+                batch_size=1,
+                force=bool(force),
+                job_kind=self.QUEUE_KIND_TRIAGE_TIMELINE,
+                priority=self.QUEUE_PRIORITY_TRIAGE_TIMELINE,
+                metadata={
+                    "bucket_seconds": float(safe_bucket_seconds),
+                    "force": bool(force),
+                    "auto_trigger": str(source or "upload_auto"),
+                },
+            )
+        except Exception as exc:
+            return {
+                "queued": False,
+                "reason": "enqueue_failed",
+                "error": str(exc),
+            }
+
+        if not isinstance(queued_job, dict):
+            return {"queued": False, "reason": "enqueue_failed"}
+
+        created = bool(queued_job.get("created", False))
+        reason = str(queued_job.get("reason") or "")
+        queue_position = max(0, int(queued_job.get("queue_position", 0)))
+        queue_job_id = int(queued_job.get("job_id", 0))
+        queue_status = str(queued_job.get("status") or "queued")
+
+        print(
+            f"[triage-auto-enqueue][{normalized_case_id}] file={safe_filename} "
+            f"job_id={queue_job_id} created={created} reason={reason or 'queued'} "
+            f"queue_position={queue_position} source={source}"
+        )
+        return {
+            "queued": True,
+            "created": created,
+            "reason": reason,
+            "queue_position": queue_position,
+            "queue": {
+                "job_id": queue_job_id,
+                "job_kind": str(queued_job.get("job_kind") or self.QUEUE_KIND_TRIAGE_TIMELINE),
+                "priority": max(1, int(queued_job.get("priority", self.QUEUE_PRIORITY_TRIAGE_TIMELINE))),
+                "status": queue_status,
+            },
+            "filename": safe_filename,
+            "bucket_seconds": float(safe_bucket_seconds),
+        }
+
     async def _persist_index_snapshot(self, snapshot: dict) -> None:
         index_job_store = getattr(self.app.state, "index_job_store", None)
         if index_job_store is None:
@@ -1339,6 +1492,8 @@ class MediaService:
         source_filename: str,
         source_index: int,
         temp_upload_path: Path,
+        session_id: str = "",
+        file_id: str = "",
     ) -> dict:
         source_name = Path(str(source_filename or "")).name.strip()
         if not source_name:
@@ -1374,6 +1529,9 @@ class MediaService:
         )
         pipeline_filename = str(converted_name)
         current_stage = "normalize"
+        upload_session_store = self._upload_session_store()
+        normalized_session_id = str(session_id or "").strip()
+        normalized_file_id = str(file_id or "").strip()
 
         try:
             uploaded_size = int(temp_upload_path.stat().st_size) if temp_upload_path.exists() else 0
@@ -1418,10 +1576,45 @@ class MediaService:
                 f"[upload][{case_paths.case_id}] resumable convert input={source_name} "
                 f"output={converted_name}"
             )
+
+            progress_state = {
+                "percent": -1.0,
+                "stage": "",
+                "monotonic": 0.0,
+            }
+
+            def _emit_conversion_progress(percent: float, stage: str) -> None:
+                if upload_session_store is None:
+                    return
+                if not normalized_session_id or not normalized_file_id:
+                    return
+                safe_percent = max(0.0, min(100.0, float(percent)))
+                safe_stage = str(stage or "").strip().lower()
+                now = time.monotonic()
+                stage_changed = safe_stage != progress_state["stage"]
+                percent_changed = safe_percent >= (float(progress_state["percent"]) + 1.0)
+                slow_tick = (now - float(progress_state["monotonic"])) >= 0.8
+                if not (stage_changed or percent_changed or slow_tick or safe_percent >= 100.0):
+                    return
+                progress_state["percent"] = safe_percent
+                progress_state["stage"] = safe_stage
+                progress_state["monotonic"] = now
+                try:
+                    upload_session_store.update_file_finalize_progress(
+                        session_id=normalized_session_id,
+                        file_id=normalized_file_id,
+                        progress_percent=safe_percent,
+                        stage=safe_stage,
+                    )
+                except Exception:
+                    # Best-effort progress reporting only.
+                    return
+
             conversion_ok, conversion_error = await asyncio.to_thread(
                 self.convert_to_mp4,
                 temp_upload_path,
                 temp_converted_path,
+                _emit_conversion_progress,
             )
 
             if conversion_ok:
@@ -1466,6 +1659,7 @@ class MediaService:
                     f"[upload][{case_paths.case_id}] resumable convert success input={source_name} "
                     f"output={converted_name}"
                 )
+                _emit_conversion_progress(100.0, "completed")
                 return {
                     "success": True,
                     "source_filename": source_name,
@@ -1529,6 +1723,7 @@ class MediaService:
                     f"file={fallback_name}"
                 )
             short_error = self.truncate_error(conversion_error)
+            _emit_conversion_progress(100.0, "failed")
             await self._pipeline_update_stage(
                 case_id=case_paths.case_id,
                 filename=pipeline_filename,
@@ -1618,6 +1813,8 @@ class MediaService:
         errors: list[str] = []
         transcoded: list[dict[str, str]] = []
         uploaded_items: list[dict[str, str | int | bool]] = []
+        triage_queued: list[str] = []
+        triage_queue_details: list[dict[str, Any]] = []
 
         for source_index, upload_file in enumerate(files):
             if not upload_file.filename:
@@ -1761,6 +1958,23 @@ class MediaService:
                             "source_file_size_bytes": int(uploaded_size),
                         },
                     )
+                    triage_result = await self._enqueue_auto_triage_timeline(
+                        case_id=case_paths.case_id,
+                        filename=str(converted_name),
+                        bucket_seconds=1.0,
+                        force=False,
+                        source="upload",
+                    )
+                    if bool(triage_result.get("queued")):
+                        triage_queued.append(str(converted_name))
+                        triage_queue_details.append(
+                            {
+                                "filename": str(converted_name),
+                                "queue": triage_result.get("queue", {}),
+                                "created": bool(triage_result.get("created", False)),
+                                "reason": str(triage_result.get("reason") or ""),
+                            }
+                        )
                 else:
                     temp_converted_path.unlink(missing_ok=True)
                     fallback_name, fallback_path = self.unique_video_path(
@@ -1839,6 +2053,23 @@ class MediaService:
                             "source_file_size_bytes": int(uploaded_size),
                         },
                     )
+                    triage_result = await self._enqueue_auto_triage_timeline(
+                        case_id=case_paths.case_id,
+                        filename=str(fallback_name),
+                        bucket_seconds=1.0,
+                        force=False,
+                        source="upload",
+                    )
+                    if bool(triage_result.get("queued")):
+                        triage_queued.append(str(fallback_name))
+                        triage_queue_details.append(
+                            {
+                                "filename": str(fallback_name),
+                                "queue": triage_result.get("queue", {}),
+                                "created": bool(triage_result.get("created", False)),
+                                "reason": str(triage_result.get("reason") or ""),
+                            }
+                        )
                     print(
                         f"[upload][{case_paths.case_id}] convert failure input={upload_file.filename} "
                         f"output={converted_name}"
@@ -1868,6 +2099,8 @@ class MediaService:
             "uploaded_items": uploaded_items,
             "errors": errors,
             "transcoded": transcoded,
+            "triage_queued": triage_queued,
+            "triage_queue_details": triage_queue_details,
         }
 
     async def start_upload_session(
@@ -2160,6 +2393,8 @@ class MediaService:
         errors: list[str] = []
         transcoded: list[dict[str, str]] = []
         uploaded_items: list[dict[str, str | int | bool]] = []
+        triage_queued: list[str] = []
+        triage_queue_details: list[dict[str, Any]] = []
 
         files = initial_session.get("files")
         file_list = files if isinstance(files, list) else []
@@ -2213,11 +2448,30 @@ class MediaService:
                     ),
                 )
 
-            finalize_payload = await self._finalize_uploaded_temp_file(
+            if file_id:
+                try:
+                    await asyncio.to_thread(
+                        upload_session_store.update_file_status,
+                        session_id=session_id,
+                        file_id=file_id,
+                        status="in_progress",
+                        finalize_progress_percent=0.0,
+                        finalize_stage="queued",
+                        uploaded_filename="",
+                        converted_to_mp4=False,
+                        error="",
+                    )
+                except Exception:
+                    # Best effort only; finalize can still continue.
+                    pass
+
+            finalize_payload = await self._queue_finalize_uploaded_temp_file(
                 case_paths=case_paths,
                 source_filename=source_filename,
                 source_index=source_index,
                 temp_upload_path=temp_upload_path,
+                session_id=session_id,
+                file_id=file_id,
             )
             finalize_success = bool(finalize_payload.get("success"))
             finalize_error = str(finalize_payload.get("error") or "").strip()
@@ -2250,12 +2504,32 @@ class MediaService:
                         session_id=session_id,
                         file_id=file_id,
                         status="completed",
+                        finalize_progress_percent=100.0,
+                        finalize_stage="completed",
                         uploaded_filename=stored_filename,
                         converted_to_mp4=converted_to_mp4,
                         error="",
                     )
                 except Exception as exc:
                     errors.append(f"{source_filename}: session state update failed ({exc})")
+
+                triage_result = await self._enqueue_auto_triage_timeline(
+                    case_id=case_id,
+                    filename=stored_filename,
+                    bucket_seconds=1.0,
+                    force=False,
+                    source="upload_session_complete",
+                )
+                if bool(triage_result.get("queued")):
+                    triage_queued.append(str(stored_filename))
+                    triage_queue_details.append(
+                        {
+                            "filename": str(stored_filename),
+                            "queue": triage_result.get("queue", {}),
+                            "created": bool(triage_result.get("created", False)),
+                            "reason": str(triage_result.get("reason") or ""),
+                        }
+                    )
                 continue
 
             failure_message = finalize_error or "failed to finalize uploaded file"
@@ -2266,6 +2540,8 @@ class MediaService:
                     session_id=session_id,
                     file_id=file_id,
                     status="failed",
+                    finalize_progress_percent=100.0,
+                    finalize_stage="failed",
                     uploaded_filename="",
                     converted_to_mp4=False,
                     error=failure_message,
@@ -2291,6 +2567,8 @@ class MediaService:
             "uploaded_items": uploaded_items,
             "errors": errors,
             "transcoded": transcoded,
+            "triage_queued": triage_queued,
+            "triage_queue_details": triage_queue_details,
             "session": final_session if isinstance(final_session, dict) else {},
         }
 
@@ -2865,20 +3143,30 @@ class MediaService:
 
         if created:
             with lock:
-                queued_state = self.new_index_job_record(
-                    case_id=resolved_case_id,
-                    filenames=queued_filenames or resolved_filenames,
-                    frame_interval_seconds=frame_interval_seconds,
-                    batch_size=batch_size,
-                    force=force,
+                live_job = jobs.get(resolved_case_id)
+                live_status = (
+                    str(live_job.get("status") or "").strip().lower()
+                    if isinstance(live_job, dict)
+                    else ""
                 )
-                queued_state["running"] = False
-                queued_state["status"] = "queued"
-                queued_state["queue_job_id"] = queue_job_id
-                queued_state["queue_job_kind"] = queue_job_kind
-                queued_state["queue_priority"] = queue_priority
-                jobs[resolved_case_id] = queued_state
-                snapshot = self.index_job_snapshot(queued_state, case_id=resolved_case_id)
+                if isinstance(live_job, dict) and live_status in {"running", "cancelling"}:
+                    # Keep the currently running in-memory job state intact.
+                    snapshot = self.index_job_snapshot(live_job, case_id=resolved_case_id)
+                else:
+                    queued_state = self.new_index_job_record(
+                        case_id=resolved_case_id,
+                        filenames=queued_filenames or resolved_filenames,
+                        frame_interval_seconds=frame_interval_seconds,
+                        batch_size=batch_size,
+                        force=force,
+                    )
+                    queued_state["running"] = False
+                    queued_state["status"] = "queued"
+                    queued_state["queue_job_id"] = queue_job_id
+                    queued_state["queue_job_kind"] = queue_job_kind
+                    queued_state["queue_priority"] = queue_priority
+                    jobs[resolved_case_id] = queued_state
+                    snapshot = self.index_job_snapshot(queued_state, case_id=resolved_case_id)
             await self._persist_index_snapshot(snapshot)
         elif isinstance(existing, dict):
             with lock:

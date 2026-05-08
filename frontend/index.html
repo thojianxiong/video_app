@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Local Video Semantic Search</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260508m" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260508n" />
   </head>
   <body>
     <main class="app-shell repository-mode">
@@ -271,9 +271,31 @@
             </div>
           </section>
 
+          <section class="panel search-panel">
+            <h2>Suspect Photo Search (FACE-01)</h2>
+            <div class="search-controls analysis-search-controls">
+              <input id="suspectProbeInput" type="file" accept="image/*" />
+              <label for="suspectModeSelect">Mode</label>
+              <select id="suspectModeSelect">
+                <option value="auto" selected>Auto (use face if detected)</option>
+                <option value="face">Face only</option>
+                <option value="person">Person appearance</option>
+              </select>
+              <button id="suspectSearchBtn" type="button">Search By Photo</button>
+            </div>
+            <p id="suspectStatus" class="status">
+              Upload a probe image, then run suspect search.
+            </p>
+          </section>
+
           <section class="panel player-panel">
             <video id="facePeoplePlayer" controls preload="metadata"></video>
             <p id="facePeoplePlayerMeta" class="player-meta">Select a face or person result to preview.</p>
+          </section>
+
+          <section class="panel wall-panel">
+            <h2>Suspect Sightings</h2>
+            <section id="suspectWall" class="wall-grid"></section>
           </section>
 
           <section class="panel wall-panel">
@@ -347,6 +369,9 @@
           <button id="queueTaskPopupCloseBtn" type="button" class="ghost">Close</button>
         </div>
         <p id="queueTaskPopupMeta" class="player-meta">Task details.</p>
+        <div class="queue-task-actions">
+          <button id="queueTaskPopupDeleteBtn" type="button" class="danger ghost" hidden>Delete Queue Item</button>
+        </div>
         <section id="queueTaskPopupRecovery" class="queue-task-recovery" hidden>
           <div class="queue-task-recovery-controls">
             <label class="queue-task-select-all">
@@ -365,6 +390,6 @@
         </section>
       </div>
     </div>
-    <script src="/static/script.js?v=20260508r"></script>
+    <script src="/static/script.js?v=20260508s"></script>
   </body>
 </html>

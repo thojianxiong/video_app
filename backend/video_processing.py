@@ -4,8 +4,10 @@ import hashlib
 import os
 import shutil
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 import cv2
 import numpy as np
@@ -40,6 +42,22 @@ def _resolve_ffmpeg_executable() -> str | None:
 
 def resolve_ffmpeg_executable() -> str | None:
     return _resolve_ffmpeg_executable()
+
+
+def _estimate_video_duration_seconds(video_path: Path) -> float:
+    capture = cv2.VideoCapture(str(video_path))
+    if not capture.isOpened():
+        return 0.0
+    try:
+        fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
+        frame_count = float(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0.0)
+        if fps > 0 and frame_count > 0:
+            duration = frame_count / fps
+            if duration > 0:
+                return float(duration)
+        return 0.0
+    finally:
+        capture.release()
 
 
 def compute_video_signature(video_path: Path) -> str:
@@ -154,7 +172,92 @@ def generate_preview_thumbnail(
         capture.release()
 
 
-def convert_to_mp4(input_path: Path, output_path: Path) -> tuple[bool, str]:
+def _run_ffmpeg_with_progress(
+    command: list[str],
+    *,
+    duration_seconds: float,
+    phase: str,
+    progress_callback: Callable[[float, str], None] | None = None,
+) -> tuple[int, str]:
+    if not command or len(command) < 2:
+        return 1, "invalid ffmpeg command"
+
+    command_with_progress = list(command[:-1]) + ["-progress", "pipe:2", "-nostats", command[-1]]
+    process = subprocess.Popen(
+        command_with_progress,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="ignore",
+        bufsize=1,
+    )
+
+    log_lines: list[str] = []
+    max_log_lines = 300
+    last_percent = -1.0
+    last_emit_monotonic = 0.0
+
+    def emit_progress(percent: float, *, force: bool = False) -> None:
+        nonlocal last_percent, last_emit_monotonic
+        if progress_callback is None:
+            return
+        safe_percent = max(0.0, min(100.0, float(percent)))
+        now = time.monotonic()
+        should_emit = force or safe_percent >= 100.0
+        if not should_emit:
+            should_emit = (
+                safe_percent >= (last_percent + 1.0)
+                or (now - last_emit_monotonic) >= 0.8
+            )
+        if not should_emit:
+            return
+        last_percent = safe_percent
+        last_emit_monotonic = now
+        try:
+            progress_callback(safe_percent, phase)
+        except Exception:
+            # Never fail conversion because of a UI progress callback issue.
+            return
+
+    emit_progress(0.0, force=True)
+
+    if process.stderr is not None:
+        for raw_line in process.stderr:
+            line = str(raw_line or "").strip()
+            if not line:
+                continue
+
+            is_progress_line = "=" in line
+            if line.startswith("out_time_ms="):
+                raw_value = line.split("=", 1)[1].strip()
+                try:
+                    out_time_ms = int(raw_value)
+                except ValueError:
+                    out_time_ms = -1
+                if out_time_ms >= 0 and duration_seconds > 0:
+                    elapsed_seconds = float(out_time_ms) / 1_000_000.0
+                    emit_progress((elapsed_seconds / duration_seconds) * 100.0)
+            elif line.startswith("progress="):
+                progress_state = line.split("=", 1)[1].strip().lower()
+                if progress_state == "end":
+                    emit_progress(100.0, force=True)
+
+            if not is_progress_line:
+                log_lines.append(line)
+                if len(log_lines) > max_log_lines:
+                    log_lines.pop(0)
+
+    return_code = process.wait()
+    emit_progress(100.0, force=True)
+    return return_code, "\n".join(log_lines).strip()
+
+
+def convert_to_mp4(
+    input_path: Path,
+    output_path: Path,
+    progress_callback: Callable[[float, str], None] | None = None,
+) -> tuple[bool, str]:
     """
     Converts any video to MP4 using ffmpeg while preserving audio.
     Strategy:
@@ -172,6 +275,7 @@ def convert_to_mp4(input_path: Path, output_path: Path) -> tuple[bool, str]:
 
     try:
         output_path.parent.mkdir(parents=True, exist_ok=True)
+        duration_seconds = _estimate_video_duration_seconds(input_path)
 
         remux_command = [
             resolved_ffmpeg,
@@ -194,16 +298,13 @@ def convert_to_mp4(input_path: Path, output_path: Path) -> tuple[bool, str]:
             "+faststart",
             str(output_path),
         ]
-        remux_completed = subprocess.run(
+        remux_returncode, remux_error = _run_ffmpeg_with_progress(
             remux_command,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="ignore",
-            check=False,
+            duration_seconds=duration_seconds,
+            phase="remux",
+            progress_callback=progress_callback,
         )
-        remux_error = (remux_completed.stderr or "").strip()
-        if remux_completed.returncode == 0 and output_path.exists():
+        if remux_returncode == 0 and output_path.exists():
             print(
                 f"[convert] mode=remux input={input_path.name} output={output_path.name}"
             )
@@ -242,16 +343,13 @@ def convert_to_mp4(input_path: Path, output_path: Path) -> tuple[bool, str]:
             "+faststart",
             str(output_path),
         ]
-        transcode_completed = subprocess.run(
+        transcode_returncode, transcode_error = _run_ffmpeg_with_progress(
             transcode_command,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="ignore",
-            check=False,
+            duration_seconds=duration_seconds,
+            phase="transcode",
+            progress_callback=progress_callback,
         )
-        transcode_error = (transcode_completed.stderr or "").strip()
-        if transcode_completed.returncode != 0 or not output_path.exists():
+        if transcode_returncode != 0 or not output_path.exists():
             if output_path.exists():
                 output_path.unlink(missing_ok=True)
             combined_error = transcode_error or remux_error

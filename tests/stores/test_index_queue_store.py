@@ -100,6 +100,35 @@ class IndexQueueStoreTests(unittest.TestCase):
         filenames = [str(item) for item in (payload.get("filenames") or [])]
         self.assertEqual(filenames, ["a.mp4", "c.mp4"])
 
+    def test_running_job_creates_follow_up_queued_job(self) -> None:
+        first = self.store.enqueue_or_get_active(
+            case_id="case_a",
+            filenames=["a.mp4"],
+            frame_interval_seconds=1.0,
+            batch_size=32,
+            force=False,
+            job_kind="semantic_index",
+        )
+        claimed = self.store.claim_next_queued()
+        self.assertIsNotNone(claimed)
+        self.assertEqual(str(claimed["status"]), "running")
+
+        second = self.store.enqueue_or_get_active(
+            case_id="case_a",
+            filenames=["b.mp4"],
+            frame_interval_seconds=1.0,
+            batch_size=32,
+            force=False,
+            job_kind="semantic_index",
+        )
+        self.assertTrue(bool(second["created"]))
+        self.assertEqual(str(second["reason"]), "queued")
+        self.assertNotEqual(int(first["job_id"]), int(second["job_id"]))
+
+        active = self.store.get_case_active("case_a", job_kind="semantic_index")
+        self.assertIsNotNone(active)
+        self.assertEqual(int(active["job_id"]), int(first["job_id"]))
+
     def test_mark_running_interrupted(self) -> None:
         queued = self.store.enqueue_or_get_active(
             case_id="case_a",
@@ -122,6 +151,63 @@ class IndexQueueStoreTests(unittest.TestCase):
             error="test",
         )
         self.assertEqual(done["status"], "interrupted")
+
+    def test_recover_running_jobs_to_queued(self) -> None:
+        queued = self.store.enqueue_or_get_active(
+            case_id="case_a",
+            filenames=["a.mp4", "b.mp4"],
+            frame_interval_seconds=1.0,
+            batch_size=32,
+            force=False,
+            job_kind="semantic_index",
+        )
+        claimed = self.store.claim_next_queued()
+        self.assertIsNotNone(claimed)
+        self.assertEqual(str(claimed["status"]), "running")
+
+        recovered = self.store.recover_running_jobs_to_queued()
+        self.assertEqual(recovered, 1)
+
+        active = self.store.get_case_active("case_a", job_kind="semantic_index")
+        self.assertIsNotNone(active)
+        self.assertEqual(str(active.get("status")), "queued")
+        self.assertEqual(int(active.get("job_id", 0)), int(queued["job_id"]))
+
+    def test_delete_jobs_removes_queued_and_cancels_running(self) -> None:
+        queued_job = self.store.enqueue_or_get_active(
+            case_id="case_a",
+            filenames=["queued.mp4"],
+            frame_interval_seconds=1.0,
+            batch_size=32,
+            force=False,
+            job_kind="triage_timeline",
+        )
+        running_job = self.store.enqueue_or_get_active(
+            case_id="case_b",
+            filenames=["running.mp4"],
+            frame_interval_seconds=1.0,
+            batch_size=32,
+            force=False,
+            job_kind="semantic_index",
+        )
+        claimed = self.store.claim_next_queued(job_kinds={"semantic_index"})
+        self.assertIsNotNone(claimed)
+        self.assertEqual(int(claimed["job_id"]), int(running_job["job_id"]))
+
+        result = self.store.delete_jobs(
+            [int(queued_job["job_id"]), int(running_job["job_id"]), 999999],
+            cancel_running=True,
+        )
+        self.assertEqual(int(result.get("removed_count", 0)), 1)
+        self.assertEqual(int(result.get("cancelled_running_count", 0)), 1)
+        self.assertIn(999999, result.get("not_found_ids") or [])
+
+        queued_lookup = self.store.get_job(int(queued_job["job_id"]))
+        self.assertIsNone(queued_lookup)
+
+        running_lookup = self.store.get_job(int(running_job["job_id"]))
+        self.assertIsNotNone(running_lookup)
+        self.assertEqual(str(running_lookup.get("status")), "cancelled")
 
     def test_clear_case(self) -> None:
         self.store.enqueue_or_get_active(
@@ -188,6 +274,34 @@ class IndexQueueStoreTests(unittest.TestCase):
         self.assertEqual(claimed_first["job_id"], high_priority["job_id"])
         self.assertEqual(claimed_second["job_id"], medium_priority["job_id"])
         self.assertEqual(claimed_third["job_id"], low_priority["job_id"])
+
+    def test_claim_can_filter_by_job_kind(self) -> None:
+        triage = self.store.enqueue_or_get_active(
+            case_id="case_a",
+            filenames=["a.mp4"],
+            frame_interval_seconds=1.0,
+            batch_size=1,
+            force=False,
+            job_kind="triage_timeline",
+            priority=20,
+        )
+        semantic = self.store.enqueue_or_get_active(
+            case_id="case_b",
+            filenames=["b.mp4"],
+            frame_interval_seconds=1.0,
+            batch_size=32,
+            force=False,
+            job_kind="semantic_index",
+            priority=10,
+        )
+
+        claimed_triage = self.store.claim_next_queued(job_kinds={"triage_timeline"})
+        self.assertIsNotNone(claimed_triage)
+        self.assertEqual(int(claimed_triage["job_id"]), int(triage["job_id"]))
+
+        claimed_semantic = self.store.claim_next_queued(job_kinds={"semantic_index", "analysis"})
+        self.assertIsNotNone(claimed_semantic)
+        self.assertEqual(int(claimed_semantic["job_id"]), int(semantic["job_id"]))
 
     def test_case_active_isolated_by_job_kind(self) -> None:
         semantic = self.store.enqueue_or_get_active(

@@ -10,3 +10,8 @@ class ShutdownRequest(BaseModel):
 class CancelIndexRequest(BaseModel):
     case_id: str
     force: bool = False
+
+
+class DeleteQueueJobsRequest(BaseModel):
+    job_ids: list[int]
+    cancel_running: bool = True

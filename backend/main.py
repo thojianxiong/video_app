@@ -181,7 +181,7 @@ async def _startup_application(application: FastAPI) -> None:
     application.state.upload_session_chunk_lock = Lock()
 
     interrupted_jobs = await asyncio.to_thread(index_job_store.mark_incomplete_jobs_interrupted)
-    interrupted_queue_jobs = await asyncio.to_thread(index_queue_store.mark_running_jobs_interrupted)
+    recovered_queue_jobs = await asyncio.to_thread(index_queue_store.recover_running_jobs_to_queued)
     interrupted_pipeline = await asyncio.to_thread(video_pipeline_store.mark_running_as_interrupted)
     raw_snapshots = await asyncio.to_thread(index_job_store.load_all_snapshots)
     restored_jobs: dict[str, dict] = {}
@@ -211,8 +211,8 @@ async def _startup_application(application: FastAPI) -> None:
     )
     if interrupted_jobs > 0:
         print(f"[startup] Marked {interrupted_jobs} incomplete index job(s) as interrupted.")
-    if interrupted_queue_jobs > 0:
-        print(f"[startup] Marked {interrupted_queue_jobs} running queued job(s) as interrupted.")
+    if recovered_queue_jobs > 0:
+        print(f"[startup] Re-queued {recovered_queue_jobs} in-flight queue job(s) after restart.")
     if interrupted_pipeline > 0:
         print(f"[startup] Marked {interrupted_pipeline} running pipeline stage(s) as interrupted.")
     if restored_jobs:

@@ -53,6 +53,11 @@ let facePeopleVideoSelectList = null;
 let vehicleVideoSelectList = null;
 let facePeopleQueryInput = null;
 let facePeopleSearchBtn = null;
+let suspectProbeInput = null;
+let suspectModeSelect = null;
+let suspectSearchBtn = null;
+let suspectStatus = null;
+let suspectWall = null;
 let vehicleQueryInput = null;
 let vehicleSearchBtn = null;
 let faceWall = null;
@@ -78,6 +83,7 @@ let queueTaskPopupRecovery = null;
 let queueTaskPopupSelectAll = null;
 let queueTaskPopupRestartBtn = null;
 let queueTaskPopupCancelBtn = null;
+let queueTaskPopupDeleteBtn = null;
 let queueTaskPopupSelectionMeta = null;
 let queueTaskPopupRecoveryStatus = null;
 let queryInput = null;
@@ -149,6 +155,7 @@ const backgroundIndexStatusByCase = new Map();
 let reportQueuePollToken = 0;
 let queueTaskPopupLoadToken = 0;
 let queueTaskPopupRecoveryContext = null;
+let queueTaskPopupCurrentItem = null;
 const analysisQueueStatusByCase = {
   face_people: new Map(),
   vehicles: new Map(),
@@ -218,6 +225,11 @@ function bindDomElements() {
   vehicleVideoSelectList = document.getElementById("vehicleVideoSelectList");
   facePeopleQueryInput = document.getElementById("facePeopleQueryInput");
   facePeopleSearchBtn = document.getElementById("facePeopleSearchBtn");
+  suspectProbeInput = document.getElementById("suspectProbeInput");
+  suspectModeSelect = document.getElementById("suspectModeSelect");
+  suspectSearchBtn = document.getElementById("suspectSearchBtn");
+  suspectStatus = document.getElementById("suspectStatus");
+  suspectWall = document.getElementById("suspectWall");
   vehicleQueryInput = document.getElementById("vehicleQueryInput");
   vehicleSearchBtn = document.getElementById("vehicleSearchBtn");
   faceWall = document.getElementById("faceWall");
@@ -243,6 +255,7 @@ function bindDomElements() {
   queueTaskPopupSelectAll = document.getElementById("queueTaskPopupSelectAll");
   queueTaskPopupRestartBtn = document.getElementById("queueTaskPopupRestartBtn");
   queueTaskPopupCancelBtn = document.getElementById("queueTaskPopupCancelBtn");
+  queueTaskPopupDeleteBtn = document.getElementById("queueTaskPopupDeleteBtn");
   queueTaskPopupSelectionMeta = document.getElementById("queueTaskPopupSelectionMeta");
   queueTaskPopupRecoveryStatus = document.getElementById("queueTaskPopupRecoveryStatus");
   queryInput = document.getElementById("queryInput");
@@ -298,6 +311,14 @@ function setAnalysisStatus(message, kind = "") {
   }
   analysisStatus.textContent = message;
   analysisStatus.className = `status ${kind}`.trim();
+}
+
+function setSuspectStatus(message, kind = "") {
+  if (!suspectStatus) {
+    return;
+  }
+  suspectStatus.textContent = message;
+  suspectStatus.className = `status ${kind}`.trim();
 }
 
 function setVehicleStatus(message, kind = "") {
@@ -2567,8 +2588,13 @@ function queueTaskPopupSetRecoveryStatus(message, kind = "") {
 
 function queueTaskPopupResetRecovery() {
   queueTaskPopupRecoveryContext = null;
+  queueTaskPopupCurrentItem = null;
   if (queueTaskPopupRecovery) {
     queueTaskPopupRecovery.setAttribute("hidden", "");
+  }
+  if (queueTaskPopupDeleteBtn) {
+    queueTaskPopupDeleteBtn.setAttribute("hidden", "");
+    queueTaskPopupDeleteBtn.textContent = "Delete Queue Item";
   }
   if (queueTaskPopupSelectAll) {
     queueTaskPopupSelectAll.checked = false;
@@ -2578,6 +2604,95 @@ function queueTaskPopupResetRecovery() {
     queueTaskPopupSelectionMeta.textContent = "0 selected";
   }
   queueTaskPopupSetRecoveryStatus("", "");
+}
+
+function queueTaskPopupResolveJobId(item) {
+  const candidates = [
+    item?.queue_job_id,
+    item?.job_id,
+    item?.queue?.job_id,
+  ];
+  for (const candidate of candidates) {
+    const parsed = Number(candidate);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return Math.floor(parsed);
+    }
+  }
+  return 0;
+}
+
+function queueTaskPopupConfigureDelete(item) {
+  if (!queueTaskPopupDeleteBtn) {
+    return;
+  }
+  const type = String(item?.type || "").trim().toLowerCase();
+  const jobId = queueTaskPopupResolveJobId(item);
+  if (!jobId) {
+    queueTaskPopupDeleteBtn.setAttribute("hidden", "");
+    return;
+  }
+  if (!["queue_job", "background_index", "analysis_interrupted"].includes(type)) {
+    queueTaskPopupDeleteBtn.setAttribute("hidden", "");
+    return;
+  }
+  const status = String(item?.status || "").trim().toLowerCase();
+  queueTaskPopupDeleteBtn.textContent = status === "running" ? "Stop/Remove Queue Item" : "Delete Queue Item";
+  queueTaskPopupDeleteBtn.removeAttribute("hidden");
+}
+
+async function deleteQueueItemFromPopup() {
+  const item = queueTaskPopupCurrentItem;
+  const jobId = queueTaskPopupResolveJobId(item);
+  if (!jobId) {
+    setStatus("No queue job selected to delete.", "error");
+    return;
+  }
+
+  const status = String(item?.status || "").trim().toLowerCase();
+  const running = status === "running";
+  const confirmed = window.confirm(
+    running
+      ? `Job #${jobId} is running. Stop and remove it from queue tracking?`
+      : `Delete queue item #${jobId}?`,
+  );
+  if (!confirmed) {
+    return;
+  }
+
+  try {
+    const payload = await fetchJson("/processes/queue/delete", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        job_ids: [jobId],
+        cancel_running: true,
+      }),
+    });
+
+    const removed = Math.max(0, Number(payload?.removed_count || 0));
+    const cancelledRunning = Math.max(0, Number(payload?.cancelled_running_count || 0));
+    const msg = running
+      ? `Queue item #${jobId} stop requested (${cancelledRunning} running cancelled, ${removed} removed).`
+      : `Queue item #${jobId} deleted (${removed} removed).`;
+    setStatus(msg, "ok");
+
+    const activeCaseId = String(state.activeCaseId || "").trim();
+    if (activeCaseId) {
+      await syncBackgroundIndexStatus(activeCaseId);
+      await Promise.all([
+        syncAnalysisQueueStatus(activeCaseId, "face_people"),
+        syncAnalysisQueueStatus(activeCaseId, "vehicles"),
+      ]);
+    }
+    if (state.workspaceView === "queue") {
+      await refreshReportQueue({ silent: true });
+    }
+    closeQueueTaskPopup();
+  } catch (error) {
+    const errorText = formatError(error);
+    setStatus(`Delete queue item failed: ${errorText}`, "error");
+    queueTaskPopupSetRecoveryStatus(`Delete queue item failed: ${errorText}`, "error");
+  }
 }
 
 function queueTaskPopupUpdateRecoverySelectionMeta() {
@@ -2900,6 +3015,8 @@ function openQueueTaskPopup(item) {
   const caseId = String(item?.case_id || "").trim() || "n/a";
   const recoveryEnabled = isQueueTaskRecoveryAvailable(item);
   queueTaskPopupResetRecovery();
+  queueTaskPopupCurrentItem = item && typeof item === "object" ? { ...item } : null;
+  queueTaskPopupConfigureDelete(queueTaskPopupCurrentItem);
 
   if (type === "background_index") {
     queueTaskPopupTitle.textContent = "Background Index Worker";
@@ -6606,12 +6723,76 @@ async function refreshVehicleWall() {
 
 async function refreshAnalysisWalls() {
   if (!state.activeCaseId) {
+    renderWall(suspectWall, [], "Select a case first.", facePeoplePlayer, facePeoplePlayerMeta);
     renderWall(faceWall, [], "Select a case first.", facePeoplePlayer, facePeoplePlayerMeta);
     renderWall(peopleWall, [], "Select a case first.", facePeoplePlayer, facePeoplePlayerMeta);
     renderWall(vehicleWall, [], "Select a case first.", vehiclePlayer, vehiclePlayerMeta);
+    setSuspectStatus("Select a case first.", "error");
     return;
   }
   await Promise.all([refreshFacePeopleWall(), refreshVehicleWall()]);
+}
+
+function resetSuspectSearchView() {
+  renderWall(
+    suspectWall,
+    [],
+    "Upload a probe image and click Search By Photo.",
+    facePeoplePlayer,
+    facePeoplePlayerMeta,
+  );
+  setSuspectStatus("Upload a probe image, then run suspect search.", "");
+}
+
+async function runSuspectPhotoSearch() {
+  let caseId = "";
+  try {
+    caseId = ensureActiveCaseId();
+  } catch (error) {
+    setSuspectStatus(formatError(error), "error");
+    return;
+  }
+
+  const probeFile = suspectProbeInput?.files?.[0];
+  if (!probeFile) {
+    setSuspectStatus("Select a probe image first.", "error");
+    return;
+  }
+
+  const selectedMode = String(suspectModeSelect?.value || "auto").trim().toLowerCase() || "auto";
+  try {
+    setSuspectStatus("Running suspect photo search...", "working");
+    const formData = new FormData();
+    formData.append("case_id", caseId);
+    formData.append("mode", selectedMode);
+    formData.append("top_k", "180");
+    formData.append("probe_image", probeFile);
+
+    const payload = await fetchJson("/suspect_photo_search", {
+      method: "POST",
+      body: formData,
+    });
+
+    const results = Array.isArray(payload?.results) ? payload.results : [];
+    renderWall(
+      suspectWall,
+      results,
+      "No suspect sightings matched this probe image.",
+      facePeoplePlayer,
+      facePeoplePlayerMeta,
+    );
+
+    const modeUsed = String(payload?.mode_used || selectedMode || "auto");
+    const faceDetected = Boolean(payload?.face_detected);
+    const count = Math.max(0, Number(payload?.count || results.length || 0));
+    const faceHint = faceDetected ? "face detected" : "no face detected";
+    setSuspectStatus(
+      `Suspect search complete: ${count} sighting(s). Mode: ${modeUsed}. (${faceHint})`,
+      "ok",
+    );
+  } catch (error) {
+    setSuspectStatus(`Suspect search failed: ${formatError(error)}`, "error");
+  }
 }
 
 async function runFacePeopleCropSearch() {
@@ -6788,6 +6969,7 @@ async function selectCase(caseId) {
   restoreSearchForCase(nextCaseId);
   resetPlayerForCase(nextCaseId);
   resetAuxPlayers(nextCaseId);
+  resetSuspectSearchView();
   setCaseUrl(nextCaseId);
   renderCaseList();
   syncWorkspaceVisibility();
@@ -7436,6 +7618,9 @@ async function uploadAndIndex() {
     const uploaded = uploadResult.uploaded || [];
     const errors = uploadResult.errors || [];
     const transcoded = uploadResult.transcoded || [];
+    const triageQueued = Array.isArray(uploadResult.triage_queued)
+      ? uploadResult.triage_queued
+      : [];
     const selectedIndexTargets = resolveSelectedSemanticIndexTargets(
       uploadResult,
       selectedSourceIndices,
@@ -7484,7 +7669,7 @@ async function uploadAndIndex() {
       backgroundMessage = "Upload finished. No videos were selected for semantic indexing.";
     }
 
-    const summary = `Case ${caseId}: uploaded ${uploaded.length}, transcoded ${transcoded.length}, selected for semantic indexing ${selectedIndexTargets.length}, engine ${engineLabel}. ${backgroundMessage}`;
+    const summary = `Case ${caseId}: uploaded ${uploaded.length}, transcoded ${transcoded.length}, triage auto-queued ${triageQueued.length}, selected for semantic indexing ${selectedIndexTargets.length}, engine ${engineLabel}. ${backgroundMessage}`;
     const duplicateNote = duplicateSkippedCount > 0
       ? ` Skipped duplicate uploads: ${duplicateSkippedCount}.`
       : "";
@@ -8082,6 +8267,9 @@ function setupListeners() {
   facePeopleSearchBtn?.addEventListener("click", () => {
     runFacePeopleCropSearch();
   });
+  suspectSearchBtn?.addEventListener("click", () => {
+    void runSuspectPhotoSearch();
+  });
   vehicleSearchBtn?.addEventListener("click", () => {
     runVehicleCropSearch();
   });
@@ -8132,6 +8320,9 @@ function setupListeners() {
   queueTaskPopupCancelBtn?.addEventListener("click", () => {
     void cancelInterruptedAnalysisFromPopup();
   });
+  queueTaskPopupDeleteBtn?.addEventListener("click", () => {
+    void deleteQueueItemFromPopup();
+  });
   window.addEventListener("keydown", (event) => {
     if (event.key !== "Escape") {
       return;
@@ -8171,6 +8362,7 @@ async function init() {
   await loadSearchSettings();
 
   clearResults();
+  resetSuspectSearchView();
   try {
     setStatus("Loading cases...", "working");
     await loadCasesWithRetry(3);
@@ -8184,6 +8376,7 @@ async function init() {
       syncWorkspaceVisibility();
       setTriageStatus("", "");
       setAnalysisStatus("", "");
+      setSuspectStatus("", "");
       setVehicleStatus("", "");
       setStatus("No cases yet. Click + New Case to begin.", "ok");
       return;
@@ -8204,6 +8397,7 @@ async function init() {
   } catch (error) {
     setTriageStatus(`Startup failed: ${formatError(error)}`, "error");
     setAnalysisStatus(`Startup failed: ${formatError(error)}`, "error");
+    setSuspectStatus(`Startup failed: ${formatError(error)}`, "error");
     setVehicleStatus(`Startup failed: ${formatError(error)}`, "error");
     setStatus(`Startup failed: ${formatError(error)}. Check backend at http://127.0.0.1:8000/.`, "error");
   }

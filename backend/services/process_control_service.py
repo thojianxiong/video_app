@@ -482,6 +482,77 @@ class ProcessControlService:
             reason=reason,
         )
 
+    def delete_queue_jobs_sync(
+        self,
+        *,
+        job_ids: list[int],
+        cancel_running: bool = True,
+    ) -> dict:
+        queue_store = getattr(self.app.state, "index_queue_store", None)
+        if queue_store is None or not hasattr(queue_store, "delete_jobs"):
+            raise ValueError("Queue store is unavailable.")
+
+        result = queue_store.delete_jobs(
+            job_ids=job_ids,
+            cancel_running=bool(cancel_running),
+            reason="Removed from queue by user request.",
+        )
+        if not isinstance(result, dict):
+            result = {}
+
+        affected_case_ids = [
+            str(item).strip()
+            for item in (result.get("affected_case_ids") or [])
+            if str(item).strip()
+        ]
+        if affected_case_ids:
+            jobs: dict[str, dict] = self.app.state.index_jobs
+            lock: Lock = self.app.state.index_jobs_lock
+            now = self.utc_now_iso()
+            with lock:
+                for case_id in affected_case_ids:
+                    job = jobs.get(case_id)
+                    if not isinstance(job, dict):
+                        continue
+                    status = str(job.get("status") or "").strip().lower()
+                    running = bool(job.get("running"))
+                    if running:
+                        continue
+                    if status in {"queued", "cancelling"}:
+                        job["status"] = "idle"
+                        job["running"] = False
+                        job["cancel_requested"] = False
+                        job["queue_job_id"] = 0
+                        job["queue_job_kind"] = ""
+                        job["queue_priority"] = 0
+                        job["updated_at"] = now
+
+        return {
+            "requested_count": int(result.get("requested_count", 0)),
+            "found_count": int(result.get("found_count", 0)),
+            "removed_count": int(result.get("removed_count", 0)),
+            "cancelled_running_count": int(result.get("cancelled_running_count", 0)),
+            "skipped_running_count": int(result.get("skipped_running_count", 0)),
+            "removed_job_ids": result.get("removed_job_ids") or [],
+            "cancelled_running_job_ids": result.get("cancelled_running_job_ids") or [],
+            "skipped_running_job_ids": result.get("skipped_running_job_ids") or [],
+            "not_found_ids": result.get("not_found_ids") or [],
+            "affected_case_ids": affected_case_ids,
+            "message": "Queue items updated.",
+        }
+
+    async def delete_queue_jobs(
+        self,
+        *,
+        job_ids: list[int],
+        cancel_running: bool = True,
+    ) -> dict:
+        return await asyncio.to_thread(
+            self.delete_queue_jobs_sync,
+            job_ids=job_ids,
+            cancel_running=cancel_running,
+        )
+
     async def graceful_shutdown(self, *, confirm: bool) -> dict:
         if not confirm:
             raise ValueError("confirm=true is required for shutdown.")

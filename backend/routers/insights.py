@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter
+from fastapi import APIRouter, File, Form, UploadFile
 
 from backend.schemas.insights import CropGalleryRequest, SearchRequest, TriageTimelineRequest
 from backend.services.insights_service import InsightsService
@@ -46,5 +46,25 @@ def build_insights_router(*, insights_service: InsightsService) -> APIRouter:
             diversity_seconds=request.diversity_seconds,
             oversample_factor=request.oversample_factor,
         )
+
+    @router.post("/suspect_photo_search")
+    async def suspect_photo_search(
+        case_id: str | None = Form(default=None),
+        mode: str = Form(default="auto"),
+        top_k: int = Form(default=120),
+        min_score: float | None = Form(default=None),
+        probe_image: UploadFile = File(...),
+    ) -> dict:
+        probe_bytes = await probe_image.read()
+        try:
+            return await insights_service.suspect_photo_search(
+                case_id=case_id,
+                probe_image_bytes=probe_bytes,
+                mode=mode,
+                top_k=top_k,
+                min_score=min_score,
+            )
+        finally:
+            await probe_image.close()
 
     return router
