@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
+from threading import Lock
 from typing import Any
 
 from fastapi import HTTPException
@@ -9,6 +11,9 @@ from backend.analysis_store import AnalysisCropStore
 
 
 class InsightsService:
+    QUEUE_KIND_TRIAGE_TIMELINE = "triage_timeline"
+    QUEUE_PRIORITY_TRIAGE_TIMELINE = 20
+
     def __init__(
         self,
         *,
@@ -47,6 +52,32 @@ class InsightsService:
         self.semantic_object = semantic_object
         self.semantic_action = semantic_action
         self.semantic_scene = semantic_scene
+
+    def _video_delete_registry(self) -> tuple[Lock, set[str]]:
+        state = self.app.state
+        guard_lock = getattr(state, "deleting_video_keys_lock", None)
+        if guard_lock is None or not hasattr(guard_lock, "acquire"):
+            guard_lock = Lock()
+            setattr(state, "deleting_video_keys_lock", guard_lock)
+
+        deleting_keys = getattr(state, "deleting_video_keys", None)
+        if not isinstance(deleting_keys, set):
+            deleting_keys = set()
+            setattr(state, "deleting_video_keys", deleting_keys)
+
+        setattr(state, "deleting_videos_lock", guard_lock)
+        setattr(state, "deleting_videos", deleting_keys)
+        return guard_lock, deleting_keys
+
+    def _is_video_delete_in_progress(self, case_id: str, filename: str) -> bool:
+        normalized_case_id = str(case_id or "").strip()
+        safe_filename = Path(str(filename or "")).name.strip().lower()
+        if not normalized_case_id or not safe_filename:
+            return False
+        key = f"{normalized_case_id}::{safe_filename}"
+        guard_lock, deleting_keys = self._video_delete_registry()
+        with guard_lock:
+            return key in deleting_keys
 
     async def analysis_gallery(
         self,
@@ -132,13 +163,79 @@ class InsightsService:
                 self.resolve_case_id_or_default,
                 case_id,
             )
-            return await asyncio.to_thread(
-                self.build_video_triage_sync,
+            cached_payload = await asyncio.to_thread(
+                self.load_cached_video_triage_sync,
                 case_id=selected_case_id,
                 filename=filename,
                 bucket_seconds=bucket_seconds,
-                force=force,
             )
+            cache_status = str(cached_payload.get("cache_status") or "").strip().lower()
+            if cache_status == "hit" or bool(cached_payload.get("cached", False)):
+                return cached_payload
+
+            queue_store = getattr(self.app.state, "index_queue_store", None)
+            if queue_store is None:
+                raise RuntimeError("Background queue is unavailable.")
+
+            safe_filename = str(filename or "").strip()
+            if not safe_filename:
+                raise ValueError("filename is required")
+            safe_filename = Path(safe_filename).name.strip()
+            if self._is_video_delete_in_progress(selected_case_id, safe_filename):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"'{safe_filename}' is currently being deleted in case '{selected_case_id}'. "
+                        "Wait for deletion to finish, then retry timeline build."
+                    ),
+                )
+
+            queued_job = await asyncio.to_thread(
+                queue_store.enqueue_or_get_active,
+                case_id=selected_case_id,
+                filenames=[safe_filename],
+                frame_interval_seconds=float(bucket_seconds),
+                batch_size=1,
+                force=bool(force),
+                job_kind=self.QUEUE_KIND_TRIAGE_TIMELINE,
+                priority=self.QUEUE_PRIORITY_TRIAGE_TIMELINE,
+                metadata={
+                    "bucket_seconds": float(bucket_seconds),
+                    "force": bool(force),
+                },
+            )
+            if not isinstance(queued_job, dict):
+                raise RuntimeError("Failed to enqueue triage timeline job.")
+
+            queue_position = max(0, int(queued_job.get("queue_position", 0)))
+            queue_job_id = int(queued_job.get("job_id", 0))
+            queue_job_kind = str(queued_job.get("job_kind") or self.QUEUE_KIND_TRIAGE_TIMELINE)
+            queue_priority = max(1, int(queued_job.get("priority", self.QUEUE_PRIORITY_TRIAGE_TIMELINE)))
+            created = bool(queued_job.get("created", False))
+            reason = str(queued_job.get("reason") or "")
+
+            return {
+                "case_id": selected_case_id,
+                "filename": safe_filename,
+                "bucket_seconds": float(bucket_seconds),
+                "cache_status": "queued",
+                "cached": False,
+                "queued": True,
+                "queue": {
+                    "job_id": queue_job_id,
+                    "job_kind": queue_job_kind,
+                    "priority": queue_priority,
+                    "status": str(queued_job.get("status") or "queued"),
+                    "position_ahead": queue_position,
+                    "created": created,
+                    "reason": reason,
+                },
+                "message": (
+                    "Triage timeline queued."
+                    if created
+                    else "Triage timeline already queued/running."
+                ),
+            }
         except FileNotFoundError:
             raise HTTPException(status_code=404, detail=f"Video not found: {filename}")
         except KeyError:

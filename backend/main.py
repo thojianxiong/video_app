@@ -87,6 +87,12 @@ SEMANTIC_ACTION = "action"
 SEMANTIC_SCENE = "scene"
 SEMANTIC_INTENT_OPTIONS = [SEMANTIC_OBJECT, SEMANTIC_ACTION, SEMANTIC_SCENE]
 TRIAGE_CACHE_VERSION = 2
+QUEUE_JOB_KIND_SEMANTIC_INDEX = "semantic_index"
+QUEUE_JOB_KIND_TRIAGE_TIMELINE = "triage_timeline"
+QUEUE_JOB_KIND_ANALYSIS = "analysis"
+QUEUE_PRIORITY_TRIAGE_TIMELINE = 20
+QUEUE_PRIORITY_SEMANTIC_INDEX = 50
+QUEUE_PRIORITY_ANALYSIS = 70
 
 INTENT_PROMPTS = {
     SEMANTIC_OBJECT: [
@@ -184,6 +190,12 @@ async def _startup_application(application: FastAPI) -> None:
     application.state.shutdown_requested_at = ""
     application.state.embedding_settings = embedding_settings
     application.state.intent_prompt_embeddings = _build_intent_prompt_embeddings(embedder)
+    application.state.deleting_case_ids = set()
+    application.state.deleting_case_ids_lock = Lock()
+    application.state.deleting_video_keys = set()
+    application.state.deleting_video_keys_lock = Lock()
+    application.state.queue_running_case_ids = set()
+    application.state.queue_running_case_ids_lock = Lock()
     print(
         f"[startup] OpenCLIP model={embedder.model_name} "
         f"pretrained={embedder.pretrained} "
@@ -327,6 +339,7 @@ def _tokenize_query(text: str) -> set[str]:
     normalized = str(text or "").strip().lower()
     if not normalized:
         return set()
+
     return {
         token
         for token in re.split(r"[^a-z0-9]+", normalized)
@@ -560,6 +573,8 @@ def _new_index_job_record(
         "frame_interval_seconds": float(frame_interval_seconds),
         "batch_size": int(batch_size),
         "force": bool(force),
+        "queue_job_kind": QUEUE_JOB_KIND_SEMANTIC_INDEX,
+        "queue_priority": QUEUE_PRIORITY_SEMANTIC_INDEX,
         "embedding_engine": _embedding_engine_info(),
         "started_at": now,
         "updated_at": now,
@@ -588,6 +603,8 @@ def _index_job_snapshot(job: dict | None, *, case_id: str) -> dict:
             "frame_interval_seconds": 0.0,
             "batch_size": 0,
             "force": False,
+            "queue_job_kind": QUEUE_JOB_KIND_SEMANTIC_INDEX,
+            "queue_priority": QUEUE_PRIORITY_SEMANTIC_INDEX,
             "embedding_engine": _embedding_engine_info(),
             "errors": [],
             "results": [],
@@ -617,6 +634,11 @@ def _index_job_snapshot(job: dict | None, *, case_id: str) -> dict:
             current_video_eta_seconds = max(0.0, float(raw_eta))
         except (TypeError, ValueError):
             current_video_eta_seconds = None
+    raw_queue_priority = job.get("queue_priority", 50)
+    try:
+        queue_priority = max(1, int(raw_queue_priority))
+    except (TypeError, ValueError):
+        queue_priority = 50
 
     return {
         "case_id": case_id,
@@ -637,6 +659,8 @@ def _index_job_snapshot(job: dict | None, *, case_id: str) -> dict:
         "frame_interval_seconds": float(job.get("frame_interval_seconds", 0.0)),
         "batch_size": max(0, int(job.get("batch_size", 0))),
         "force": bool(job.get("force", False)),
+        "queue_job_kind": str(job.get("queue_job_kind") or QUEUE_JOB_KIND_SEMANTIC_INDEX),
+        "queue_priority": queue_priority,
         "embedding_engine": dict(job.get("embedding_engine") or _embedding_engine_info()),
         "errors": [str(item) for item in (job.get("errors") or [])],
         "results": [item for item in (job.get("results") or []) if isinstance(item, dict)],
@@ -777,6 +801,453 @@ def _map_index_snapshot_to_queue_status(snapshot: dict) -> tuple[str, str]:
     return "failed", f"Unexpected index job status: {status or 'unknown'}"
 
 
+def _is_case_delete_in_progress(case_id: str) -> bool:
+    normalized_case_id = str(case_id or "").strip()
+    if not normalized_case_id:
+        return False
+
+    case_delete_guard = getattr(app.state, "case_delete_in_progress", None)
+    case_delete_guard_lock = getattr(app.state, "case_delete_guard_lock", None)
+    if isinstance(case_delete_guard, set):
+        if case_delete_guard_lock is not None and hasattr(case_delete_guard_lock, "acquire"):
+            with case_delete_guard_lock:
+                if normalized_case_id in case_delete_guard:
+                    return True
+        elif normalized_case_id in case_delete_guard:
+            return True
+
+    deleting_case_ids = getattr(app.state, "deleting_case_ids", None)
+    deleting_case_ids_lock = getattr(app.state, "deleting_case_ids_lock", None)
+    if isinstance(deleting_case_ids, set):
+        if deleting_case_ids_lock is not None and hasattr(deleting_case_ids_lock, "acquire"):
+            with deleting_case_ids_lock:
+                return normalized_case_id in deleting_case_ids
+        return normalized_case_id in deleting_case_ids
+
+    return False
+
+
+def _is_video_delete_in_progress(case_id: str, filename: str) -> bool:
+    normalized_case_id = str(case_id or "").strip()
+    safe_filename = Path(str(filename or "")).name.strip().lower()
+    if not normalized_case_id or not safe_filename:
+        return False
+    key = f"{normalized_case_id}::{safe_filename}"
+
+    deleting_keys = getattr(app.state, "deleting_video_keys", None)
+    deleting_lock = getattr(app.state, "deleting_video_keys_lock", None)
+    if not isinstance(deleting_keys, set):
+        deleting_keys = getattr(app.state, "deleting_videos", None)
+        deleting_lock = getattr(app.state, "deleting_videos_lock", deleting_lock)
+
+    if isinstance(deleting_keys, set):
+        if deleting_lock is not None and hasattr(deleting_lock, "acquire"):
+            with deleting_lock:
+                return key in deleting_keys
+        return key in deleting_keys
+    return False
+
+
+def _set_queue_case_running(case_id: str, running: bool) -> None:
+    normalized_case_id = str(case_id or "").strip()
+    if not normalized_case_id:
+        return
+    running_cases = getattr(app.state, "queue_running_case_ids", None)
+    running_lock = getattr(app.state, "queue_running_case_ids_lock", None)
+    if not isinstance(running_cases, set):
+        running_cases = set()
+        setattr(app.state, "queue_running_case_ids", running_cases)
+    if running_lock is None or not hasattr(running_lock, "acquire"):
+        running_lock = Lock()
+        setattr(app.state, "queue_running_case_ids_lock", running_lock)
+    with running_lock:
+        if running:
+            running_cases.add(normalized_case_id)
+        else:
+            running_cases.discard(normalized_case_id)
+
+
+def _is_queue_case_running(case_id: str) -> bool:
+    normalized_case_id = str(case_id or "").strip()
+    if not normalized_case_id:
+        return False
+    running_cases = getattr(app.state, "queue_running_case_ids", None)
+    running_lock = getattr(app.state, "queue_running_case_ids_lock", None)
+    if not isinstance(running_cases, set):
+        return False
+    if running_lock is not None and hasattr(running_lock, "acquire"):
+        with running_lock:
+            return normalized_case_id in running_cases
+    return normalized_case_id in running_cases
+
+
+def _is_queue_job_cancelled_sync(queue_store: IndexQueueStore, job_id: int) -> bool:
+    try:
+        payload = queue_store.get_job(int(job_id))
+    except Exception:
+        return False
+    if not isinstance(payload, dict):
+        return True
+    status = str(payload.get("status") or "").strip().lower()
+    return status in {"cancelled", "interrupted"}
+
+
+async def _run_triage_queue_job_async(
+    *,
+    queue_store: IndexQueueStore,
+    job_id: int,
+    case_id: str,
+    payload: dict[str, Any],
+    filenames: list[str],
+) -> tuple[str, str]:
+    metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+    raw_bucket_seconds = metadata.get("bucket_seconds", payload.get("frame_interval_seconds", 1.0))
+    try:
+        bucket_seconds = max(0.5, float(raw_bucket_seconds))
+    except Exception:
+        bucket_seconds = 1.0
+    force = bool(payload.get("force", False))
+
+    completed = 0
+    failed = 0
+    errors: list[str] = []
+
+    for filename in filenames:
+        if await asyncio.to_thread(_is_queue_job_cancelled_sync, queue_store, int(job_id)):
+            return "cancelled", "Cancelled by user request."
+        if _is_video_delete_in_progress(case_id, filename):
+            await _pipeline_update_stage(
+                case_id=case_id,
+                filename=filename,
+                stage="triage",
+                status="skipped",
+                event="background_triage_skipped_delete_in_progress",
+                details={"source": "queue", "reason": "delete_in_progress"},
+            )
+            continue
+
+        await _pipeline_update_stage(
+            case_id=case_id,
+            filename=filename,
+            stage="triage",
+            status="running",
+            increment_attempt=True,
+            event="background_triage_started",
+            details={
+                "source": "queue",
+                "bucket_seconds": float(bucket_seconds),
+                "force": bool(force),
+            },
+        )
+        try:
+            await asyncio.to_thread(
+                _build_video_triage_sync,
+                case_id=case_id,
+                filename=filename,
+                bucket_seconds=float(bucket_seconds),
+                force=bool(force),
+            )
+            completed += 1
+            await _pipeline_update_stage(
+                case_id=case_id,
+                filename=filename,
+                stage="triage",
+                status="completed",
+                event="background_triage_completed",
+                details={
+                    "source": "queue",
+                    "bucket_seconds": float(bucket_seconds),
+                    "force": bool(force),
+                },
+            )
+        except Exception as exc:
+            failed += 1
+            errors.append(f"{filename}: {exc}")
+            await _pipeline_update_stage(
+                case_id=case_id,
+                filename=filename,
+                stage="triage",
+                status="failed",
+                event="background_triage_failed",
+                error=_truncate_error(str(exc)),
+                details={"source": "queue"},
+            )
+
+    if failed > 0 and completed == 0:
+        return "failed", _truncate_error(errors[-1] if errors else "Background triage failed.")
+    if failed > 0:
+        return "completed", _truncate_error(
+            f"Completed with errors ({failed}/{len(filenames)} failed)."
+        )
+    return "completed", ""
+
+
+async def _run_analysis_queue_job_async(
+    *,
+    queue_store: IndexQueueStore,
+    job_id: int,
+    case_id: str,
+    payload: dict[str, Any],
+    filenames: list[str],
+) -> tuple[str, str]:
+    metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+    analysis_face_people = bool(metadata.get("analysis_face_people", False))
+    analysis_vehicles = bool(metadata.get("analysis_vehicles", False))
+    if not analysis_face_people and not analysis_vehicles:
+        return "failed", "Analysis queue payload missing analysis type."
+
+    try:
+        frame_interval_seconds = max(0.1, float(payload.get("frame_interval_seconds", 1.0)))
+    except Exception:
+        frame_interval_seconds = 1.0
+    try:
+        batch_size = max(1, int(payload.get("batch_size", 32)))
+    except Exception:
+        batch_size = 32
+    force = bool(payload.get("force", False))
+
+    completed = 0
+    skipped = 0
+    failed = 0
+    errors: list[str] = []
+
+    def _cancel_check() -> bool:
+        if _is_case_delete_in_progress(case_id):
+            return True
+        if _is_video_delete_in_progress(case_id, filename):
+            return True
+        return _is_queue_job_cancelled_sync(queue_store, int(job_id))
+
+    for filename in filenames:
+        if await asyncio.to_thread(_is_queue_job_cancelled_sync, queue_store, int(job_id)):
+            return "cancelled", "Cancelled by user request."
+        if _is_video_delete_in_progress(case_id, filename):
+            skipped += 1
+            await _pipeline_update_stage(
+                case_id=case_id,
+                filename=filename,
+                stage="analysis",
+                status="skipped",
+                event="background_analysis_skipped_delete_in_progress",
+                details={"source": "queue", "reason": "delete_in_progress"},
+            )
+            continue
+
+        await _pipeline_update_stage(
+            case_id=case_id,
+            filename=filename,
+            stage="analysis",
+            status="running",
+            increment_attempt=True,
+            event="background_analysis_started",
+            details={
+                "source": "queue",
+                "analysis_face_people": bool(analysis_face_people),
+                "analysis_vehicles": bool(analysis_vehicles),
+                "frame_interval_seconds": float(frame_interval_seconds),
+                "batch_size": int(batch_size),
+                "force": bool(force),
+            },
+        )
+        progress_state: dict[str, float | int] = {
+            "latest_processed": 0,
+            "latest_estimated": 0,
+            "latest_percent": 0.0,
+            "last_emit_processed": -1,
+            "last_emit_ts": 0.0,
+        }
+
+        def _on_analysis_progress(processed_frames: int, estimated_total_frames: int | None) -> None:
+            processed = max(0, int(processed_frames))
+            estimated = max(0, int(estimated_total_frames or 0))
+            if estimated > 0 and estimated < processed:
+                estimated = processed
+
+            if estimated > 0:
+                progress_percent = min(
+                    100.0,
+                    max(0.0, (float(processed) / float(estimated)) * 100.0),
+                )
+            else:
+                progress_percent = 0.0
+
+            progress_state["latest_processed"] = processed
+            progress_state["latest_estimated"] = estimated
+            progress_state["latest_percent"] = progress_percent
+
+            last_emit_processed = int(progress_state.get("last_emit_processed", -1))
+            last_emit_ts = float(progress_state.get("last_emit_ts", 0.0))
+            now_ts = float(time.time())
+            should_emit = (
+                processed <= 1
+                or (estimated > 0 and processed >= estimated)
+                or (processed - max(0, last_emit_processed) >= 5)
+                or (now_ts - last_emit_ts >= 0.75)
+            )
+            if not should_emit:
+                return
+
+            progress_state["last_emit_processed"] = processed
+            progress_state["last_emit_ts"] = now_ts
+            try:
+                _pipeline_update_stage_sync(
+                    case_id=case_id,
+                    filename=filename,
+                    stage="analysis",
+                    status="running",
+                    event="background_analysis_progress",
+                    details={
+                        "source": "queue",
+                        "analysis_face_people": bool(analysis_face_people),
+                        "analysis_vehicles": bool(analysis_vehicles),
+                        "processed_frames": processed,
+                        "estimated_total_frames": estimated,
+                        "progress_percent": float(progress_percent),
+                    },
+                )
+            except Exception as exc:
+                print(
+                    f"[pipeline][{case_id}] analysis_progress_update_failed "
+                    f"file={filename} error={exc}"
+                )
+
+        try:
+            result = await asyncio.to_thread(
+                _process_video_sync,
+                case_id=case_id,
+                filename=filename,
+                frame_interval_seconds=frame_interval_seconds,
+                batch_size=batch_size,
+                force=force,
+                analysis_face_people=analysis_face_people,
+                analysis_vehicles=analysis_vehicles,
+                analysis_only=True,
+                progress_callback=_on_analysis_progress,
+                cancel_check=_cancel_check,
+            )
+            analysis_payload = result.get("analysis") if isinstance(result.get("analysis"), dict) else {}
+            analysis_status = str(analysis_payload.get("status") or "").strip().lower()
+            analysis_summary = (
+                analysis_payload.get("summary")
+                if isinstance(analysis_payload.get("summary"), dict)
+                else {}
+            )
+            processed_frames = max(
+                0,
+                int(
+                    analysis_summary.get(
+                        "processed_frames",
+                        progress_state.get("latest_processed", 0),
+                    )
+                ),
+            )
+            estimated_total_frames = max(
+                0,
+                int(progress_state.get("latest_estimated", processed_frames)),
+            )
+            if estimated_total_frames < processed_frames:
+                estimated_total_frames = processed_frames
+            progress_percent = float(progress_state.get("latest_percent", 0.0))
+            if estimated_total_frames > 0:
+                progress_percent = min(
+                    100.0,
+                    max(0.0, (float(processed_frames) / float(estimated_total_frames)) * 100.0),
+                )
+            if analysis_status in {"processed", "completed", "skipped"} and processed_frames > 0:
+                progress_percent = 100.0
+            if analysis_status in {"processed", "completed"}:
+                completed += 1
+                await _pipeline_update_stage(
+                    case_id=case_id,
+                    filename=filename,
+                    stage="analysis",
+                    status="completed",
+                    event="background_analysis_completed",
+                    details={
+                        "source": "queue",
+                        "analysis_status": analysis_status or "processed",
+                        "processed_frames": processed_frames,
+                        "estimated_total_frames": estimated_total_frames,
+                        "progress_percent": float(progress_percent),
+                    },
+                )
+            elif analysis_status in {"skipped", "not_requested"}:
+                skipped += 1
+                await _pipeline_update_stage(
+                    case_id=case_id,
+                    filename=filename,
+                    stage="analysis",
+                    status="skipped",
+                    event="background_analysis_skipped",
+                    details={
+                        "source": "queue",
+                        "analysis_status": analysis_status or "skipped",
+                        "processed_frames": processed_frames,
+                        "estimated_total_frames": estimated_total_frames,
+                        "progress_percent": float(progress_percent),
+                    },
+                )
+            else:
+                failed += 1
+                reason = str(analysis_payload.get("reason") or "analysis unavailable")
+                errors.append(f"{filename}: {reason}")
+                await _pipeline_update_stage(
+                    case_id=case_id,
+                    filename=filename,
+                    stage="analysis",
+                    status="failed",
+                    event="background_analysis_failed",
+                    error=_truncate_error(reason),
+                    details={
+                        "source": "queue",
+                        "processed_frames": processed_frames,
+                        "estimated_total_frames": estimated_total_frames,
+                        "progress_percent": float(progress_percent),
+                    },
+                )
+        except _IndexCancellationRequested:
+            await _pipeline_update_stage(
+                case_id=case_id,
+                filename=filename,
+                stage="analysis",
+                status="interrupted",
+                event="background_analysis_cancelled",
+                error="Background analysis cancelled.",
+                details={
+                    "source": "queue",
+                    "processed_frames": max(0, int(progress_state.get("latest_processed", 0))),
+                    "estimated_total_frames": max(0, int(progress_state.get("latest_estimated", 0))),
+                    "progress_percent": float(progress_state.get("latest_percent", 0.0)),
+                },
+            )
+            return "cancelled", "Cancelled by user request."
+        except Exception as exc:
+            failed += 1
+            errors.append(f"{filename}: {exc}")
+            await _pipeline_update_stage(
+                case_id=case_id,
+                filename=filename,
+                stage="analysis",
+                status="failed",
+                event="background_analysis_failed",
+                error=_truncate_error(str(exc)),
+                details={
+                    "source": "queue",
+                    "processed_frames": max(0, int(progress_state.get("latest_processed", 0))),
+                    "estimated_total_frames": max(0, int(progress_state.get("latest_estimated", 0))),
+                    "progress_percent": float(progress_state.get("latest_percent", 0.0)),
+                },
+            )
+
+    if failed > 0 and completed == 0 and skipped == 0:
+        return "failed", _truncate_error(errors[-1] if errors else "Background analysis failed.")
+    if failed > 0:
+        return "completed", _truncate_error(
+            f"Completed with errors ({failed}/{len(filenames)} failed)."
+        )
+    return "completed", ""
+
+
 async def _index_queue_worker_loop() -> None:
     queue_store = getattr(app.state, "index_queue_store", None)
     if not isinstance(queue_store, IndexQueueStore):
@@ -792,74 +1263,152 @@ async def _index_queue_worker_loop() -> None:
             job_id = int(queued_job.get("job_id", 0))
             payload = queued_job.get("payload") or {}
             case_id = _normalize_case_id(str(queued_job.get("case_id") or payload.get("case_id") or ""))
-
-            filenames = [str(item) for item in (payload.get("filenames") or []) if str(item).strip()]
-            if not filenames:
-                await asyncio.to_thread(
-                    queue_store.complete_job,
-                    job_id=job_id,
-                    status="failed",
-                    error="Queued job payload missing filenames.",
-                )
-                continue
-
-            frame_interval_seconds = float(payload.get("frame_interval_seconds", 1.0))
-            batch_size = int(payload.get("batch_size", 32))
-            force = bool(payload.get("force", False))
-
+            job_kind = str(queued_job.get("job_kind") or "").strip().lower() or QUEUE_JOB_KIND_SEMANTIC_INDEX
             try:
-                await asyncio.to_thread(_get_case_paths_or_raise, case_id)
-            except Exception as exc:
-                await asyncio.to_thread(
-                    queue_store.complete_job,
-                    job_id=job_id,
-                    status="failed",
-                    error=_truncate_error(f"Case validation failed: {exc}"),
-                )
-                continue
+                queue_priority = max(1, int(queued_job.get("priority", 50)))
+            except (TypeError, ValueError):
+                queue_priority = 50
 
-            with app.state.index_jobs_lock:
-                job = _new_index_job_record(
-                    case_id=case_id,
-                    filenames=filenames,
-                    frame_interval_seconds=frame_interval_seconds,
-                    batch_size=batch_size,
-                    force=force,
-                )
-                job["running"] = False
-                job["status"] = "queued"
-                job["queue_job_id"] = int(job_id)
-                app.state.index_jobs[case_id] = job
-
-            await _persist_index_job_snapshot(case_id)
-
-            run_task = asyncio.create_task(_run_index_job_async(case_id))
-            with app.state.index_jobs_lock:
-                app.state.index_tasks[case_id] = run_task
-
+            queue_case_marked = False
             try:
-                await run_task
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
+                if _is_case_delete_in_progress(case_id):
+                    await asyncio.to_thread(
+                        queue_store.complete_job,
+                        job_id=job_id,
+                        status="cancelled",
+                        error="Cancelled because case deletion is in progress.",
+                    )
+                    continue
+
+                _set_queue_case_running(case_id, True)
+                queue_case_marked = True
+
+                print(
+                    f"[index-queue-worker] claim job_id={job_id} case={case_id} "
+                    f"kind={job_kind} priority={queue_priority}"
+                )
+
+                raw_filenames = [str(item) for item in (payload.get("filenames") or []) if str(item).strip()]
+                filenames = [
+                    safe_name
+                    for safe_name in raw_filenames
+                    if not _is_video_delete_in_progress(case_id, safe_name)
+                ]
+                if not filenames:
+                    await asyncio.to_thread(
+                        queue_store.complete_job,
+                        job_id=job_id,
+                        status="cancelled",
+                        error=(
+                            "Queued job targets videos that are currently being deleted. "
+                            "Retry once delete operations finish."
+                        ),
+                    )
+                    continue
+
+                frame_interval_seconds = float(payload.get("frame_interval_seconds", 1.0))
+                batch_size = int(payload.get("batch_size", 32))
+                force = bool(payload.get("force", False))
+
+                try:
+                    await asyncio.to_thread(_get_case_paths_or_raise, case_id)
+                except Exception as exc:
+                    await asyncio.to_thread(
+                        queue_store.complete_job,
+                        job_id=job_id,
+                        status="failed",
+                        error=_truncate_error(f"Case validation failed: {exc}"),
+                    )
+                    continue
+
+                if job_kind == QUEUE_JOB_KIND_TRIAGE_TIMELINE:
+                    queue_status, queue_error = await _run_triage_queue_job_async(
+                        queue_store=queue_store,
+                        job_id=job_id,
+                        case_id=case_id,
+                        payload=payload,
+                        filenames=filenames,
+                    )
+                    await asyncio.to_thread(
+                        queue_store.complete_job,
+                        job_id=job_id,
+                        status=queue_status,
+                        error=_truncate_error(queue_error),
+                    )
+                    continue
+
+                if job_kind == QUEUE_JOB_KIND_ANALYSIS:
+                    queue_status, queue_error = await _run_analysis_queue_job_async(
+                        queue_store=queue_store,
+                        job_id=job_id,
+                        case_id=case_id,
+                        payload=payload,
+                        filenames=filenames,
+                    )
+                    await asyncio.to_thread(
+                        queue_store.complete_job,
+                        job_id=job_id,
+                        status=queue_status,
+                        error=_truncate_error(queue_error),
+                    )
+                    continue
+
+                if job_kind != QUEUE_JOB_KIND_SEMANTIC_INDEX:
+                    await asyncio.to_thread(
+                        queue_store.complete_job,
+                        job_id=job_id,
+                        status="failed",
+                        error=f"Unsupported queue job kind for worker: {job_kind}",
+                    )
+                    continue
+
+                with app.state.index_jobs_lock:
+                    job = _new_index_job_record(
+                        case_id=case_id,
+                        filenames=filenames,
+                        frame_interval_seconds=frame_interval_seconds,
+                        batch_size=batch_size,
+                        force=force,
+                    )
+                    job["running"] = False
+                    job["status"] = "queued"
+                    job["queue_job_id"] = int(job_id)
+                    job["queue_job_kind"] = job_kind
+                    job["queue_priority"] = queue_priority
+                    app.state.index_jobs[case_id] = job
+
+                await _persist_index_job_snapshot(case_id)
+
+                run_task = asyncio.create_task(_run_index_job_async(case_id))
+                with app.state.index_jobs_lock:
+                    app.state.index_tasks[case_id] = run_task
+
+                try:
+                    await run_task
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    await asyncio.to_thread(
+                        queue_store.complete_job,
+                        job_id=job_id,
+                        status="failed",
+                        error=_truncate_error(str(exc)),
+                    )
+                    continue
+
+                with app.state.index_jobs_lock:
+                    snapshot = _index_job_snapshot(app.state.index_jobs.get(case_id), case_id=case_id)
+
+                queue_status, queue_error = _map_index_snapshot_to_queue_status(snapshot)
                 await asyncio.to_thread(
                     queue_store.complete_job,
                     job_id=job_id,
-                    status="failed",
-                    error=_truncate_error(str(exc)),
+                    status=queue_status,
+                    error=queue_error,
                 )
-                continue
-
-            with app.state.index_jobs_lock:
-                snapshot = _index_job_snapshot(app.state.index_jobs.get(case_id), case_id=case_id)
-
-            queue_status, queue_error = _map_index_snapshot_to_queue_status(snapshot)
-            await asyncio.to_thread(
-                queue_store.complete_job,
-                job_id=job_id,
-                status=queue_status,
-                error=queue_error,
-            )
+            finally:
+                if queue_case_marked:
+                    _set_queue_case_running(case_id, False)
         except asyncio.CancelledError:
             return
         except Exception as exc:
@@ -928,6 +1477,35 @@ async def _run_index_job_async(case_id: str) -> None:
                 current["current_video_started_ts"] = float(time.time())
                 current["updated_at"] = _utc_now_iso()
 
+            if _is_video_delete_in_progress(normalized_case_id, filename):
+                with lock:
+                    current = jobs.get(normalized_case_id)
+                    if isinstance(current, dict):
+                        current["completed"] = int(current.get("completed", 0)) + 1
+                        current["skipped"] = int(current.get("skipped", 0)) + 1
+                        results = current.setdefault("results", [])
+                        if isinstance(results, list):
+                            results.append(
+                                {
+                                    "video_filename": str(filename),
+                                    "status": "skipped",
+                                    "indexed_frames": 0,
+                                    "indexed_windows": 0,
+                                    "reason": "delete_in_progress",
+                                }
+                            )
+                        current["updated_at"] = _utc_now_iso()
+                await _pipeline_update_stage(
+                    case_id=normalized_case_id,
+                    filename=filename,
+                    stage="base_index",
+                    status="skipped",
+                    event="background_index_skipped_delete_in_progress",
+                    details={"source": "background_index", "reason": "delete_in_progress"},
+                )
+                await _persist_index_job_snapshot(normalized_case_id)
+                continue
+
             await _pipeline_update_stage(
                 case_id=normalized_case_id,
                 filename=filename,
@@ -945,7 +1523,16 @@ async def _run_index_job_async(case_id: str) -> None:
             await _persist_index_job_snapshot(normalized_case_id)
 
             try:
+                progress_emit_state: dict[str, float | int] = {
+                    "last_emit_processed": -1,
+                    "last_emit_ts": 0.0,
+                }
+
                 def _is_cancel_requested() -> bool:
+                    if _is_case_delete_in_progress(normalized_case_id):
+                        return True
+                    if _is_video_delete_in_progress(normalized_case_id, filename):
+                        return True
                     with lock:
                         running_job = jobs.get(normalized_case_id)
                         if not isinstance(running_job, dict):
@@ -985,6 +1572,45 @@ async def _run_index_job_async(case_id: str) -> None:
                             eta_seconds = 0.0
                         running_job["current_video_eta_seconds"] = eta_seconds
                         running_job["updated_at"] = _utc_now_iso()
+
+                    last_emit_processed = int(progress_emit_state.get("last_emit_processed", -1))
+                    last_emit_ts = float(progress_emit_state.get("last_emit_ts", 0.0))
+                    now_ts = float(time.time())
+                    should_emit = (
+                        processed <= 1
+                        or (estimated > 0 and processed >= estimated)
+                        or (processed - max(0, last_emit_processed) >= 5)
+                        or (now_ts - last_emit_ts >= 0.75)
+                    )
+                    if not should_emit:
+                        return
+
+                    progress_emit_state["last_emit_processed"] = processed
+                    progress_emit_state["last_emit_ts"] = now_ts
+                    progress_percent = (
+                        min(100.0, max(0.0, (float(processed) / float(estimated)) * 100.0))
+                        if estimated > 0
+                        else 0.0
+                    )
+                    try:
+                        _pipeline_update_stage_sync(
+                            case_id=normalized_case_id,
+                            filename=filename,
+                            stage="base_index",
+                            status="running",
+                            event="background_index_progress",
+                            details={
+                                "source": "background_index",
+                                "processed_frames": processed,
+                                "estimated_total_frames": estimated,
+                                "progress_percent": float(progress_percent),
+                            },
+                        )
+                    except Exception as exc:
+                        print(
+                            f"[pipeline][{normalized_case_id}] index_progress_update_failed "
+                            f"file={filename} error={exc}"
+                        )
 
                 result = await asyncio.to_thread(
                     _process_video_sync,
@@ -1346,7 +1972,12 @@ def _describe_video_lock_context(case_id: str, filename: str) -> str:
 
     index_jobs = getattr(app.state, "index_jobs", None)
     index_lock = getattr(app.state, "index_jobs_lock", None)
-    if isinstance(index_jobs, dict) and isinstance(index_lock, Lock) and normalized_case_id:
+    if (
+        isinstance(index_jobs, dict)
+        and index_lock is not None
+        and hasattr(index_lock, "acquire")
+        and normalized_case_id
+    ):
         with index_lock:
             existing_job = index_jobs.get(normalized_case_id)
             if isinstance(existing_job, dict):
@@ -1816,6 +2447,8 @@ def _run_optional_analysis_sync(
     batch_size: int,
     selection: AnalysisSelection,
     force: bool,
+    progress_callback=None,
+    cancel_check=None,
 ) -> dict:
     requested = selection.to_dict()
     if not selection.any_selected():
@@ -1890,6 +2523,7 @@ def _run_optional_analysis_sync(
     vehicle_images: list[Image.Image] = []
 
     processed_frames = 0
+    estimated_total_frames = 0
     face_count = 0
     people_count = 0
     vehicle_count = 0
@@ -1940,8 +2574,24 @@ def _run_optional_analysis_sync(
         images.append(Image.fromarray(crop_rgb))
 
     try:
+        estimated_total_frames = _estimate_sampled_frame_count(video_path, frame_interval_seconds)
+        if progress_callback is not None:
+            try:
+                progress_callback(0, estimated_total_frames)
+            except Exception:
+                pass
+
         for frame in iter_video_frames(video_path, interval_seconds=frame_interval_seconds):
+            if cancel_check is not None and bool(cancel_check()):
+                raise _IndexCancellationRequested(
+                    f"Background analysis cancelled while processing frames: {resolved_filename}"
+                )
             processed_frames += 1
+            if progress_callback is not None:
+                try:
+                    progress_callback(processed_frames, estimated_total_frames)
+                except Exception:
+                    pass
             detections = analyzer.detect_frame(frame.frame_rgb, pending_selection)
 
             if pending["face_people"]:
@@ -1995,6 +2645,16 @@ def _run_optional_analysis_sync(
                         records=vehicle_records,
                         images=vehicle_images,
                     )
+
+        if estimated_total_frames < processed_frames:
+            estimated_total_frames = processed_frames
+        if progress_callback is not None:
+            try:
+                progress_callback(processed_frames, estimated_total_frames)
+            except Exception:
+                pass
+    except _IndexCancellationRequested:
+        raise
     except Exception as exc:
         existing_record = vector_store.get_video_analysis(signature, frame_interval_seconds)
         return {
@@ -2007,6 +2667,10 @@ def _run_optional_analysis_sync(
         }
 
     embedder: OpenCLIPEmbedder = app.state.embedder
+    if cancel_check is not None and bool(cancel_check()):
+        raise _IndexCancellationRequested(
+            f"Background analysis cancelled before embedding crops: {resolved_filename}"
+        )
     if pending["face_people"]:
         if face_people_images:
             face_people_embeddings = embedder.encode_images(
@@ -2301,6 +2965,8 @@ def _process_video_sync(
             vehicles=analysis_vehicles,
         ),
         force=force,
+        progress_callback=progress_callback,
+        cancel_check=cancel_check,
     )
 
     response = {

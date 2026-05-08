@@ -22,6 +22,14 @@ def _snapshot(job: dict | None, *, case_id: str) -> dict:
 
 class ProcessControlServiceTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
+        class _FakeQueueStore:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, str]] = []
+
+            def cancel_case_active(self, case_id: str, *, reason: str = "") -> int:
+                self.calls.append((str(case_id), str(reason)))
+                return 1 if str(case_id) == "case_running" else 0
+
         state = SimpleNamespace()
         state.index_jobs = {
             "case_running": {
@@ -44,6 +52,7 @@ class ProcessControlServiceTests(unittest.IsolatedAsyncioTestCase):
         }
         state.index_jobs_lock = Lock()
         state.index_tasks = {}
+        state.index_queue_store = _FakeQueueStore()
         state.shutdown_requested = False
         state.shutdown_requested_at = ""
 
@@ -72,6 +81,21 @@ class ProcessControlServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(running_job["status"], "cancelling")
         self.assertFalse(running_job["running"])
 
+    def test_cancel_case_index_jobs_sync_marks_target_case(self) -> None:
+        payload = self.service.cancel_case_index_jobs_sync(case_id="case_running")
+        self.assertTrue(payload["cancel_requested"])
+        self.assertEqual(payload["case_id"], "case_running")
+        self.assertEqual(payload["queue_cancelled_count"], 1)
+        running_job = self.app.state.index_jobs["case_running"]
+        self.assertTrue(running_job["cancel_requested"])
+        self.assertEqual(running_job["status"], "cancelling")
+        self.assertFalse(running_job["running"])
+        self.assertEqual(len(self.app.state.index_queue_store.calls), 1)
+
+    def test_cancel_case_index_jobs_sync_requires_case_id(self) -> None:
+        with self.assertRaises(ValueError):
+            self.service.cancel_case_index_jobs_sync(case_id="  ")
+
     async def test_graceful_shutdown_sets_state(self) -> None:
         # Prevent signal-based exit scheduling during test runs.
         self.service.schedule_process_exit = lambda _delay_seconds=1.0: None
@@ -92,4 +116,3 @@ class ProcessControlServiceTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

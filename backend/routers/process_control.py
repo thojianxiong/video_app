@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException
 
-from backend.schemas.process_control import ShutdownRequest
+from backend.schemas.process_control import CancelIndexRequest, ShutdownRequest
 from backend.services.process_control_service import ProcessControlService
 
 
@@ -23,6 +23,19 @@ def build_process_control_router(
     async def graceful_shutdown(request: ShutdownRequest) -> dict:
         try:
             return await process_control_service.graceful_shutdown(confirm=request.confirm)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc))
+
+    @router.post("/processes/index/cancel")
+    async def cancel_case_index(request: CancelIndexRequest) -> dict:
+        try:
+            return await process_control_service.cancel_case_index_jobs(
+                case_id=request.case_id,
+                force=request.force,
+                reason="Cancelled from process control API.",
+            )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
         except Exception as exc:

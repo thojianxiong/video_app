@@ -270,29 +270,36 @@ def delete_case_sync(
             cases_registry_path=cases_registry_path,
             cases_dir=cases_dir,
         )
-        existing_cases = payload.get("cases", [])
-        remaining_cases: list[dict[str, str]] = []
-        deleted_case: dict | None = None
-
-        for item in existing_cases:
-            if item.get("case_id") == normalized and deleted_case is None:
-                deleted_case = item
-            else:
-                remaining_cases.append(item)
-
+        deleted_case = find_case_locked(payload, normalized)
         if deleted_case is None:
             raise KeyError(normalized)
+        deleted_case = {
+            "case_id": str(deleted_case.get("case_id") or normalized),
+            "name": str(deleted_case.get("name") or normalized),
+            "created_at": str(deleted_case.get("created_at") or ""),
+        }
 
+    case_paths = build_case_paths(normalized, cases_dir=cases_dir)
+    if case_paths.case_dir.exists():
+        shutil.rmtree(case_paths.case_dir)
+
+    with case_registry_lock:
+        payload = load_cases_registry_locked(
+            cases_registry_path=cases_registry_path,
+            cases_dir=cases_dir,
+        )
+        existing_cases = payload.get("cases", [])
+        remaining_cases: list[dict[str, str]] = []
+        for item in existing_cases:
+            if item.get("case_id") == normalized:
+                continue
+            remaining_cases.append(item)
         payload["cases"] = remaining_cases
         save_cases_registry_locked(
             payload,
             cases_registry_path=cases_registry_path,
             cases_dir=cases_dir,
         )
-
-    case_paths = build_case_paths(normalized, cases_dir=cases_dir)
-    if case_paths.case_dir.exists():
-        shutil.rmtree(case_paths.case_dir)
 
     deleted_name = str(deleted_case.get("name") or normalized)
     deleted_created_at = str(deleted_case.get("created_at") or "")
