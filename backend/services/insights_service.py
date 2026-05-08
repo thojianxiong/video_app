@@ -26,6 +26,7 @@ class InsightsService:
         app: Any,
         resolve_case_id_or_default: Any,
         get_analysis_store_for_case: Any,
+        get_face_identity_store_for_case: Any,
         hydrate_crop_item: Any,
         load_cached_video_triage_sync: Any,
         build_video_triage_sync: Any,
@@ -46,6 +47,7 @@ class InsightsService:
         self.app = app
         self.resolve_case_id_or_default = resolve_case_id_or_default
         self.get_analysis_store_for_case = get_analysis_store_for_case
+        self.get_face_identity_store_for_case = get_face_identity_store_for_case
         self.hydrate_crop_item = hydrate_crop_item
         self.load_cached_video_triage_sync = load_cached_video_triage_sync
         self.build_video_triage_sync = build_video_triage_sync
@@ -169,12 +171,8 @@ class InsightsService:
         search_kind = "person"
 
         if requested_mode == self.SUSPECT_MODE_FACE:
-            if selected_face_box is None:
-                raise HTTPException(
-                    status_code=400,
-                    detail="No face detected in probe image. Try mode=person or a clearer face image.",
-                )
-            query_image = self._crop_to_box(probe_image, selected_face_box)
+            if selected_face_box is not None:
+                query_image = self._crop_to_box(probe_image, selected_face_box)
             search_kind = "face"
         elif requested_mode == self.SUSPECT_MODE_AUTO:
             if selected_face_box is not None:
@@ -187,41 +185,105 @@ class InsightsService:
         else:
             search_kind = "person"
 
-        try:
-            query_embedding_batch = await asyncio.to_thread(
-                self.app.state.embedder.encode_images,
-                [query_image],
-                1,
-            )
-        except Exception as exc:
-            raise HTTPException(status_code=500, detail=f"Failed to embed probe image: {exc}")
+        safe_search_pool = max(safe_top_k * 4, safe_top_k)
 
-        if not isinstance(query_embedding_batch, np.ndarray) or query_embedding_batch.size == 0:
-            raise HTTPException(status_code=500, detail="Failed to produce probe embedding")
-        query_embedding = np.asarray(query_embedding_batch[0], dtype=np.float32)
+        arcface_results: list[dict[str, Any]] = []
+        arcface_used = False
+        arcface_fallback_used = False
+        arcface_error = ""
+        face_engine_available = False
+        face_embedder = getattr(self.app.state, "face_embedder", None)
+        face_engine_label = (
+            str(face_embedder.engine_label())
+            if face_embedder is not None and hasattr(face_embedder, "engine_label")
+            else "insightface unavailable"
+        )
+        if face_embedder is not None and bool(getattr(face_embedder, "available", False)):
+            face_engine_available = True
+
+        if search_kind == "face" and face_engine_available:
+            try:
+                _, face_identity_store = await asyncio.to_thread(
+                    self.get_face_identity_store_for_case,
+                    selected_case_id,
+                )
+                probe_face_embedding, probe_box = await asyncio.to_thread(
+                    face_embedder.encode_probe_face,
+                    probe_image,
+                )
+                if probe_box is not None:
+                    selected_face_box = probe_box
+                    query_image = self._crop_to_box(probe_image, probe_box)
+                if probe_face_embedding is not None:
+                    arcface_used = True
+                    raw_arcface_items = await asyncio.to_thread(
+                        face_identity_store.search,
+                        query_embedding=probe_face_embedding,
+                        top_k=safe_search_pool,
+                    )
+                    for item in raw_arcface_items:
+                        score = float(item.get("similarity_score", -1.0))
+                        if safe_min_score is not None and score < safe_min_score:
+                            continue
+                        hydrated = self.hydrate_crop_item(case_paths, item)
+                        if str(hydrated.get("kind") or "").strip().lower() != "face":
+                            continue
+                        arcface_results.append(hydrated)
+                elif requested_mode == self.SUSPECT_MODE_FACE:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="No face detected in probe image. Try mode=person or a clearer face image.",
+                    )
+            except HTTPException:
+                raise
+            except Exception as exc:
+                arcface_error = str(exc)
 
         raw_items: list[dict[str, Any]] = []
-        try:
-            raw_items = await asyncio.to_thread(
-                crop_store.search,
-                category=AnalysisCropStore.FACE_PEOPLE,
-                query_embedding=query_embedding,
-                top_k=max(safe_top_k * 4, safe_top_k),
-                kind=search_kind,
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
-        except Exception as exc:
-            raise HTTPException(status_code=500, detail=str(exc))
+        if not arcface_results:
+            if search_kind == "face" and selected_face_box is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="No face detected in probe image. Try mode=person or a clearer face image.",
+                )
+            try:
+                query_embedding_batch = await asyncio.to_thread(
+                    self.app.state.embedder.encode_images,
+                    [query_image],
+                    1,
+                )
+            except Exception as exc:
+                raise HTTPException(status_code=500, detail=f"Failed to embed probe image: {exc}")
+
+            if not isinstance(query_embedding_batch, np.ndarray) or query_embedding_batch.size == 0:
+                raise HTTPException(status_code=500, detail="Failed to produce probe embedding")
+            query_embedding = np.asarray(query_embedding_batch[0], dtype=np.float32)
+
+            try:
+                raw_items = await asyncio.to_thread(
+                    crop_store.search,
+                    category=AnalysisCropStore.FACE_PEOPLE,
+                    query_embedding=query_embedding,
+                    top_k=safe_search_pool,
+                    kind=search_kind,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc))
+            except Exception as exc:
+                raise HTTPException(status_code=500, detail=str(exc))
+            if arcface_used:
+                arcface_fallback_used = True
 
         results: list[dict[str, Any]] = []
         seen: set[tuple[str, int, str]] = set()
-        for item in raw_items:
-            score = float(item.get("similarity_score", -1.0))
-            if safe_min_score is not None and score < safe_min_score:
-                continue
-
-            hydrated = self.hydrate_crop_item(case_paths, item)
+        source_items = arcface_results if arcface_results else []
+        if not source_items:
+            for item in raw_items:
+                score = float(item.get("similarity_score", -1.0))
+                if safe_min_score is not None and score < safe_min_score:
+                    continue
+                source_items.append(self.hydrate_crop_item(case_paths, item))
+        for hydrated in source_items:
             video_filename = str(hydrated.get("video_filename") or "").strip()
             timestamp_seconds = float(hydrated.get("timestamp_seconds", 0.0))
             item_kind = str(hydrated.get("kind") or "").strip().lower() or search_kind
@@ -233,16 +295,27 @@ class InsightsService:
             if dedupe_key in seen:
                 continue
             seen.add(dedupe_key)
-
             results.append(hydrated)
             if len(results) >= safe_top_k:
                 break
+
+        if arcface_results:
+            engine_used = "insightface_arcface"
+            if arcface_fallback_used:
+                engine_used = "insightface_arcface+clip_fallback"
+        else:
+            engine_used = "clip"
 
         return {
             "case_id": case_paths.case_id,
             "mode_requested": requested_mode,
             "mode_used": mode_used,
             "search_kind": search_kind,
+            "engine_used": engine_used,
+            "face_engine_available": bool(face_engine_available),
+            "face_engine_label": face_engine_label,
+            "fallback_used": bool(arcface_fallback_used),
+            "face_engine_error": arcface_error,
             "face_detected": bool(selected_face_box is not None),
             "probe_face_box": (
                 [int(selected_face_box[0]), int(selected_face_box[1]), int(selected_face_box[2]), int(selected_face_box[3])]

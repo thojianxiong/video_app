@@ -22,6 +22,8 @@ class CasePaths:
     temporal_metadata_path: Path
     face_people_index_path: Path
     face_people_metadata_path: Path
+    face_identity_index_path: Path
+    face_identity_metadata_path: Path
     vehicles_index_path: Path
     vehicles_metadata_path: Path
 
@@ -54,6 +56,8 @@ def build_case_paths(case_id: str, *, cases_dir: Path) -> CasePaths:
         temporal_metadata_path=data_dir / "temporal_metadata.json",
         face_people_index_path=data_dir / "face_people.index",
         face_people_metadata_path=data_dir / "face_people_metadata.json",
+        face_identity_index_path=data_dir / "face_identity.index",
+        face_identity_metadata_path=data_dir / "face_identity_metadata.json",
         vehicles_index_path=data_dir / "vehicles.index",
         vehicles_metadata_path=data_dir / "vehicles_metadata.json",
     )

@@ -25,6 +25,7 @@ from PIL import Image
 from backend.analysis import AnalysisSelection, VideoAnalyzer
 from backend.analysis_store import AnalysisCropStore
 from backend.embeddings import OpenCLIPEmbedder
+from backend.face_embeddings import InsightFaceArcEmbedder
 from backend.routers.cases import build_cases_router
 from backend.routers.embedding_settings import build_embedding_settings_router
 from backend.routers.insights import build_insights_router
@@ -59,6 +60,7 @@ from backend.services.media_service import MediaService
 from backend.services.process_control_service import ProcessControlService
 from backend.stores.index_job_store import IndexJobStore
 from backend.stores.index_queue_store import IndexQueueStore
+from backend.stores.face_identity_store import FaceIdentityStore
 from backend.stores.upload_session_store import UploadSessionStore
 from backend.stores.video_pipeline_store import VideoPipelineStore
 from backend.temporal_store import TemporalWindowStore
@@ -159,14 +161,23 @@ async def _startup_application(application: FastAPI) -> None:
         _float_from_env("YOLO_CONFIDENCE", 0.3),
         _float_from_env("YOLO_IOU", 0.45),
     )
+    face_embedder = await asyncio.to_thread(
+        InsightFaceArcEmbedder,
+        model_name=os.getenv("ARCFACE_MODEL_NAME", "buffalo_l"),
+        model_root=os.getenv("INSIGHTFACE_HOME"),
+        device_preference=embedding_settings["device_preference"],
+    )
     application.state.embedder = embedder
     application.state.analyzer = analyzer
+    application.state.face_embedder = face_embedder
     application.state.vector_stores = {}
     application.state.vector_stores_lock = Lock()
     application.state.temporal_stores = {}
     application.state.temporal_stores_lock = Lock()
     application.state.analysis_stores = {}
     application.state.analysis_stores_lock = Lock()
+    application.state.face_identity_stores = {}
+    application.state.face_identity_stores_lock = Lock()
     application.state.index_jobs = {}
     application.state.index_jobs_lock = Lock()
     application.state.index_tasks = {}
@@ -209,6 +220,7 @@ async def _startup_application(application: FastAPI) -> None:
         f"device={embedder.device} "
         f"device_preference={embedder.device_preference}"
     )
+    print(f"[startup] FACE-02 engine={face_embedder.engine_label()}")
     if interrupted_jobs > 0:
         print(f"[startup] Marked {interrupted_jobs} incomplete index job(s) as interrupted.")
     if recovered_queue_jobs > 0:
@@ -560,6 +572,24 @@ def _embedding_engine_info() -> dict[str, Any]:
         "device_preference": str(getattr(embedder, "device_preference", "")),
         "device": str(getattr(embedder, "device", "")),
         "embedding_dim": int(getattr(embedder, "embedding_dim", 0)),
+    }
+
+
+def _face_embedding_engine_info() -> dict[str, Any]:
+    face_embedder = getattr(app.state, "face_embedder", None)
+    if face_embedder is None:
+        return {
+            "available": False,
+            "label": "insightface unavailable",
+        }
+    return {
+        "available": bool(getattr(face_embedder, "available", False)),
+        "model_name": str(getattr(face_embedder, "model_name", "")),
+        "device_preference": str(getattr(face_embedder, "device_preference", "")),
+        "device": str(getattr(face_embedder, "device", "")),
+        "embedding_dim": int(getattr(face_embedder, "embedding_dim", 0)),
+        "error_message": str(getattr(face_embedder, "error_message", "")),
+        "label": str(face_embedder.engine_label()) if hasattr(face_embedder, "engine_label") else "",
     }
 
 
@@ -2236,6 +2266,48 @@ def _get_analysis_store_for_case(case_id: str) -> tuple[CasePaths, AnalysisCropS
     return case_paths, store
 
 
+def _get_face_identity_store_for_case(case_id: str) -> tuple[CasePaths, FaceIdentityStore]:
+    case_paths = _get_case_paths_or_raise(case_id)
+    face_embedder = getattr(app.state, "face_embedder", None)
+    expected_dimension: int | None = None
+    if face_embedder is not None:
+        try:
+            embedding_dim = int(getattr(face_embedder, "embedding_dim", 0))
+            if embedding_dim > 0:
+                expected_dimension = embedding_dim
+        except Exception:
+            expected_dimension = None
+
+    cache: dict[str, FaceIdentityStore] = app.state.face_identity_stores
+    cache_lock: Lock = app.state.face_identity_stores_lock
+
+    with cache_lock:
+        store = cache.get(case_paths.case_id)
+        if store is None:
+            try:
+                store = FaceIdentityStore(
+                    index_path=case_paths.face_identity_index_path,
+                    metadata_path=case_paths.face_identity_metadata_path,
+                    expected_dimension=expected_dimension,
+                )
+            except RuntimeError as exc:
+                if "dimension mismatch" not in str(exc).lower():
+                    raise
+                _reset_store_files(
+                    [case_paths.face_identity_index_path, case_paths.face_identity_metadata_path],
+                    label=f"{case_paths.case_id}/face_identity",
+                    reason=str(exc),
+                )
+                store = FaceIdentityStore(
+                    index_path=case_paths.face_identity_index_path,
+                    metadata_path=case_paths.face_identity_metadata_path,
+                    expected_dimension=expected_dimension,
+                )
+            cache[case_paths.case_id] = store
+
+    return case_paths, store
+
+
 def _unique_video_path(
     target_dir: Path,
     filename: str,
@@ -2870,6 +2942,8 @@ def _run_optional_analysis_sync(
         }
 
     _, analysis_store = _get_analysis_store_for_case(case_paths.case_id)
+    _, face_identity_store = _get_face_identity_store_for_case(case_paths.case_id)
+    face_embedder = getattr(app.state, "face_embedder", None)
     existing_status = vector_store.get_video_analysis_status(
         signature,
         frame_interval_seconds,
@@ -3075,6 +3149,9 @@ def _run_optional_analysis_sync(
         }
 
     embedder: OpenCLIPEmbedder = app.state.embedder
+    face_identity_status = "not_requested"
+    face_identity_reason = ""
+    face_identity_indexed = 0
     if cancel_check is not None and bool(cancel_check()):
         raise _IndexCancellationRequested(
             f"Background analysis cancelled before embedding crops: {resolved_filename}"
@@ -3097,6 +3174,52 @@ def _run_optional_analysis_sync(
             embeddings=face_people_embeddings,
             force=force or not existing_status["face_people"],
         )
+        face_only_records: list[dict] = []
+        face_only_images: list[Image.Image] = []
+        for record, image in zip(face_people_records, face_people_images):
+            if str(record.get("kind") or "").strip().lower() != "face":
+                continue
+            face_only_records.append(record)
+            face_only_images.append(image)
+
+        # Refresh face identity records on each face/people rerun so suspect search stays in sync.
+        face_identity_store.delete_video(resolved_filename)
+        if cancel_check is not None and bool(cancel_check()):
+            raise _IndexCancellationRequested(
+                f"Background analysis cancelled before FACE-02 embedding: {resolved_filename}"
+            )
+        if face_only_images:
+            if face_embedder is not None and bool(getattr(face_embedder, "available", False)):
+                try:
+                    face_vectors, matched_indices = face_embedder.encode_face_crops(face_only_images)
+                    matched_records = [
+                        face_only_records[index]
+                        for index in matched_indices
+                        if 0 <= int(index) < len(face_only_records)
+                    ]
+                    upsert_result = face_identity_store.upsert_faces(
+                        video_filename=resolved_filename,
+                        records=matched_records,
+                        embeddings=face_vectors,
+                        force=True,
+                    )
+                    face_identity_status = str(upsert_result.get("status") or "processed")
+                    face_identity_indexed = int(upsert_result.get("indexed", 0))
+                except Exception as exc:
+                    face_identity_status = "failed"
+                    face_identity_reason = _truncate_error(str(exc))
+                    print(
+                        f"[face-identity][{case_paths.case_id}] "
+                        f"file={resolved_filename} status=failed error={face_identity_reason}"
+                    )
+            else:
+                face_identity_status = "unavailable"
+                face_identity_reason = _truncate_error(
+                    str(getattr(face_embedder, "error_message", "InsightFace unavailable"))
+                )
+        else:
+            face_identity_status = "processed"
+            face_identity_indexed = 0
 
     if pending["vehicles"]:
         if vehicle_images:
@@ -3134,7 +3257,8 @@ def _run_optional_analysis_sync(
     print(
         f"[analysis][{case_paths.case_id}] file={resolved_filename} "
         f"pending={pending} processed_frames={processed_frames} "
-        f"face_crops={len(face_people_records)} vehicle_crops={len(vehicle_records)}"
+        f"face_crops={len(face_people_records)} vehicle_crops={len(vehicle_records)} "
+        f"face_identity_status={face_identity_status} face_identity_indexed={face_identity_indexed}"
     )
 
     return {
@@ -3143,6 +3267,12 @@ def _run_optional_analysis_sync(
         "ran": True,
         "status": "processed",
         "summary": _analysis_summary_from_record(stored),
+        "face_identity": {
+            "status": face_identity_status,
+            "indexed": int(face_identity_indexed),
+            "reason": face_identity_reason,
+            "engine": _face_embedding_engine_info(),
+        },
     }
 
 
@@ -3408,6 +3538,7 @@ def _delete_video_sync(case_id: str, filename: str) -> dict:
     case_paths, vector_store = _get_vector_store_for_case(case_id)
     _, temporal_store = _get_temporal_store_for_case(case_id)
     _, analysis_store = _get_analysis_store_for_case(case_id)
+    _, face_identity_store = _get_face_identity_store_for_case(case_id)
     safe_filename = Path(str(filename or "")).name.strip()
     if not safe_filename:
         raise ValueError("filename is required")
@@ -3431,6 +3562,7 @@ def _delete_video_sync(case_id: str, filename: str) -> dict:
     vector_result = vector_store.delete_video_embeddings(safe_filename)
     temporal_result = temporal_store.delete_video_windows(safe_filename)
     crop_result = analysis_store.delete_video(safe_filename)
+    face_identity_result = face_identity_store.delete_video(safe_filename)
 
     thumbnail_dir = case_paths.thumbnails_dir / Path(safe_filename).stem
     if thumbnail_dir.exists():
@@ -3453,6 +3585,7 @@ def _delete_video_sync(case_id: str, filename: str) -> dict:
         "removed_temporal_records": int(temporal_result.get("removed_records", 0)),
         "removed_face_people_crops": int(crop_result.get("removed_face_people", 0)),
         "removed_vehicle_crops": int(crop_result.get("removed_vehicles", 0)),
+        "removed_face_identity_vectors": int(face_identity_result.get("removed_faces", 0)),
     }
 
 _process_control_service = ProcessControlService(
@@ -3750,6 +3883,7 @@ _insights_service = InsightsService(
     app=app,
     resolve_case_id_or_default=_resolve_case_id_or_default,
     get_analysis_store_for_case=_get_analysis_store_for_case,
+    get_face_identity_store_for_case=_get_face_identity_store_for_case,
     hydrate_crop_item=_hydrate_crop_item,
     load_cached_video_triage_sync=_load_cached_video_triage_sync,
     build_video_triage_sync=_build_video_triage_sync,

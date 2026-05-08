@@ -12,3 +12,6 @@ torchvision==0.22.1+cu118
 open-clip-torch==3.2.0
 imageio-ffmpeg>=0.5.1,<1
 ultralytics>=8.3.0,<9
+# FACE-02 suspect photo matching (ArcFace / InsightFace).
+insightface>=0.7.3,<1
+onnxruntime>=1.20.0,<2

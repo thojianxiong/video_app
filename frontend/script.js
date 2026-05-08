@@ -6786,8 +6786,11 @@ async function runSuspectPhotoSearch() {
     const faceDetected = Boolean(payload?.face_detected);
     const count = Math.max(0, Number(payload?.count || results.length || 0));
     const faceHint = faceDetected ? "face detected" : "no face detected";
+    const engineUsed = String(payload?.engine_used || "clip");
+    const fallbackUsed = Boolean(payload?.fallback_used);
+    const fallbackHint = fallbackUsed ? " | fallback used" : "";
     setSuspectStatus(
-      `Suspect search complete: ${count} sighting(s). Mode: ${modeUsed}. (${faceHint})`,
+      `Suspect search complete: ${count} sighting(s). Mode: ${modeUsed}. Engine: ${engineUsed}${fallbackHint}. (${faceHint})`,
       "ok",
     );
   } catch (error) {
