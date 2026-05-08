@@ -488,7 +488,7 @@ h1 {
 }
 
 .search-controls {
-  grid-template-columns: minmax(200px, 1fr) auto 90px auto;
+  grid-template-columns: minmax(200px, 1fr) auto minmax(150px, 240px) auto auto;
 }
 
 .analysis-search-controls {
@@ -514,6 +514,41 @@ h1 {
   grid-template-columns: auto minmax(200px, 1fr) auto minmax(160px, 220px) auto;
   align-items: center;
   gap: 8px;
+}
+
+.search-settings-controls {
+  grid-template-columns:
+    auto minmax(90px, 120px)
+    auto minmax(180px, 1fr)
+    auto minmax(90px, 120px)
+    auto;
+}
+
+.search-dedupe-setting-wrap {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.search-dedupe-setting-wrap input[type="range"] {
+  flex: 1 1 auto;
+  min-width: 120px;
+}
+
+.search-dedupe-setting-wrap span {
+  flex: 0 0 auto;
+  min-width: 28px;
+  text-align: right;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.threshold-value {
+  min-width: 44px;
+  text-align: right;
+  font-size: 0.85rem;
+  color: var(--muted);
 }
 
 .embedding-controls select {

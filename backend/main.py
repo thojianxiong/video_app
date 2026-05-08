@@ -90,9 +90,16 @@ TRIAGE_CACHE_VERSION = 2
 QUEUE_JOB_KIND_SEMANTIC_INDEX = "semantic_index"
 QUEUE_JOB_KIND_TRIAGE_TIMELINE = "triage_timeline"
 QUEUE_JOB_KIND_ANALYSIS = "analysis"
+QUEUE_WORKER_GPU_KINDS = {QUEUE_JOB_KIND_SEMANTIC_INDEX, QUEUE_JOB_KIND_ANALYSIS}
+QUEUE_WORKER_CPU_KINDS = {QUEUE_JOB_KIND_TRIAGE_TIMELINE}
 QUEUE_PRIORITY_TRIAGE_TIMELINE = 20
 QUEUE_PRIORITY_SEMANTIC_INDEX = 50
 QUEUE_PRIORITY_ANALYSIS = 70
+DEFAULT_SEARCH_SCORE_THRESHOLD = 0.22
+DEFAULT_SEARCH_DEDUPE_AGGRESSIVENESS = 55.0
+DEFAULT_SEARCH_RESULT_LIMIT = 120
+SEARCH_MIN_RESULT_LIMIT = 10
+SEARCH_MAX_RESULT_LIMIT = 500
 
 INTENT_PROMPTS = {
     SEMANTIC_OBJECT: [
@@ -211,7 +218,22 @@ async def _startup_application(application: FastAPI) -> None:
     if restored_jobs:
         print(f"[startup] Restored {len(restored_jobs)} persisted index job snapshot(s).")
     await asyncio.to_thread(_list_cases_sync)
-    application.state.index_queue_worker_task = asyncio.create_task(_index_queue_worker_loop())
+    application.state.index_queue_worker_gpu_task = asyncio.create_task(
+        _index_queue_worker_loop(
+            worker_name="gpu",
+            allowed_job_kinds=set(QUEUE_WORKER_GPU_KINDS),
+        )
+    )
+    application.state.index_queue_worker_cpu_task = asyncio.create_task(
+        _index_queue_worker_loop(
+            worker_name="cpu",
+            allowed_job_kinds=set(QUEUE_WORKER_CPU_KINDS),
+        )
+    )
+    application.state.ingest_finalize_queue = asyncio.Queue()
+    application.state.ingest_finalize_worker_task = asyncio.create_task(
+        _ingest_finalize_worker_loop()
+    )
 
 
 @asynccontextmanager
@@ -220,11 +242,21 @@ async def _app_lifespan(application: FastAPI):
     try:
         yield
     finally:
-        worker_task = getattr(application.state, "index_queue_worker_task", None)
-        if isinstance(worker_task, asyncio.Task):
-            worker_task.cancel()
+        worker_tasks: list[asyncio.Task] = []
+        for attr in (
+            "index_queue_worker_gpu_task",
+            "index_queue_worker_cpu_task",
+            "ingest_finalize_worker_task",
+        ):
+            task = getattr(application.state, attr, None)
+            if isinstance(task, asyncio.Task):
+                worker_tasks.append(task)
+
+        for task in worker_tasks:
+            task.cancel()
+        for task in worker_tasks:
             try:
-                await worker_task
+                await task
             except asyncio.CancelledError:
                 pass
 
@@ -303,6 +335,128 @@ def _build_embedding_settings_response_sync() -> dict:
         default_pretrained=DEFAULT_OPENCLIP_PRETRAINED,
         default_device=DEFAULT_OPENCLIP_DEVICE,
     )
+
+
+def _read_app_settings_payload_sync() -> dict[str, Any]:
+    with APP_SETTINGS_LOCK:
+        if not APP_SETTINGS_PATH.exists():
+            return {}
+        try:
+            payload = json.loads(APP_SETTINGS_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+        if not isinstance(payload, dict):
+            return {}
+        return payload
+
+
+def _write_app_settings_payload_sync(payload: dict[str, Any]) -> None:
+    safe_payload = payload if isinstance(payload, dict) else {}
+    with APP_SETTINGS_LOCK:
+        APP_SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        APP_SETTINGS_PATH.write_text(json.dumps(safe_payload, indent=2), encoding="utf-8")
+
+
+def _clamp_float(value: Any, default_value: float, min_value: float, max_value: float) -> float:
+    try:
+        parsed = float(value)
+    except Exception:
+        parsed = float(default_value)
+    return max(float(min_value), min(float(max_value), parsed))
+
+
+def _clamp_int(value: Any, default_value: int, min_value: int, max_value: int) -> int:
+    try:
+        parsed = int(value)
+    except Exception:
+        parsed = int(default_value)
+    return max(int(min_value), min(int(max_value), parsed))
+
+
+def _derive_search_runtime_settings(dedupe_aggressiveness: float) -> dict[str, Any]:
+    normalized = _clamp_float(dedupe_aggressiveness, DEFAULT_SEARCH_DEDUPE_AGGRESSIVENESS, 0.0, 100.0)
+    ratio = normalized / 100.0
+    near_duplicate_seconds = 0.75 + (5.25 * ratio)
+    diversity_seconds = 2.0 + (10.0 * ratio)
+    per_video_cap = int(round(12.0 - (10.0 * ratio)))
+    per_video_cap = max(2, min(12, per_video_cap))
+    return {
+        "dedupe_aggressiveness": float(normalized),
+        "near_duplicate_seconds": float(round(near_duplicate_seconds, 2)),
+        "diversity_seconds": float(round(diversity_seconds, 2)),
+        "per_video_cap": int(per_video_cap),
+    }
+
+
+def _read_saved_search_settings_sync() -> dict[str, Any]:
+    payload = _read_app_settings_payload_sync()
+    raw_search = payload.get("search") if isinstance(payload.get("search"), dict) else {}
+    score_threshold = _clamp_float(
+        raw_search.get("score_threshold"),
+        DEFAULT_SEARCH_SCORE_THRESHOLD,
+        -1.0,
+        1.0,
+    )
+    dedupe_aggressiveness = _clamp_float(
+        raw_search.get("dedupe_aggressiveness"),
+        DEFAULT_SEARCH_DEDUPE_AGGRESSIVENESS,
+        0.0,
+        100.0,
+    )
+    result_limit = _clamp_int(
+        raw_search.get("result_limit"),
+        DEFAULT_SEARCH_RESULT_LIMIT,
+        SEARCH_MIN_RESULT_LIMIT,
+        SEARCH_MAX_RESULT_LIMIT,
+    )
+    return {
+        "score_threshold": float(score_threshold),
+        "dedupe_aggressiveness": float(dedupe_aggressiveness),
+        "result_limit": int(result_limit),
+    }
+
+
+def _write_saved_search_settings_sync(
+    *,
+    score_threshold: float,
+    dedupe_aggressiveness: float,
+    result_limit: int,
+) -> dict[str, Any]:
+    saved = {
+        "score_threshold": _clamp_float(score_threshold, DEFAULT_SEARCH_SCORE_THRESHOLD, -1.0, 1.0),
+        "dedupe_aggressiveness": _clamp_float(
+            dedupe_aggressiveness,
+            DEFAULT_SEARCH_DEDUPE_AGGRESSIVENESS,
+            0.0,
+            100.0,
+        ),
+        "result_limit": _clamp_int(
+            result_limit,
+            DEFAULT_SEARCH_RESULT_LIMIT,
+            SEARCH_MIN_RESULT_LIMIT,
+            SEARCH_MAX_RESULT_LIMIT,
+        ),
+    }
+    payload = _read_app_settings_payload_sync()
+    payload["search"] = saved
+    _write_app_settings_payload_sync(payload)
+    return dict(saved)
+
+
+def _build_search_settings_response_sync() -> dict[str, Any]:
+    saved = _read_saved_search_settings_sync()
+    recommended = {
+        "score_threshold": float(DEFAULT_SEARCH_SCORE_THRESHOLD),
+        "dedupe_aggressiveness": float(DEFAULT_SEARCH_DEDUPE_AGGRESSIVENESS),
+        "result_limit": int(DEFAULT_SEARCH_RESULT_LIMIT),
+    }
+    return {
+        "saved": dict(saved),
+        "recommended": recommended,
+        "derived": _derive_search_runtime_settings(
+            float(saved.get("dedupe_aggressiveness", DEFAULT_SEARCH_DEDUPE_AGGRESSIVENESS))
+        ),
+    }
 
 
 def _normalize_embedding_vector(vector: np.ndarray) -> np.ndarray:
@@ -892,6 +1046,70 @@ def _is_queue_job_cancelled_sync(queue_store: IndexQueueStore, job_id: int) -> b
     return status in {"cancelled", "interrupted"}
 
 
+def _normalize_unique_filenames(raw_items: list[Any]) -> list[str]:
+    output: list[str] = []
+    seen: set[str] = set()
+    for item in raw_items:
+        safe_name = str(item or "").strip()
+        if not safe_name or safe_name in seen:
+            continue
+        seen.add(safe_name)
+        output.append(safe_name)
+    return output
+
+
+def _slice_analysis_metadata_for_filenames(
+    metadata: dict[str, Any],
+    target_filenames: list[str],
+) -> dict[str, Any]:
+    sliced: dict[str, Any] = dict(metadata)
+    target_set = {str(item or "").strip() for item in target_filenames if str(item or "").strip()}
+
+    face_key = "analysis_face_people_filenames"
+    vehicle_key = "analysis_vehicles_filenames"
+    has_face_list = isinstance(metadata.get(face_key), list)
+    has_vehicle_list = isinstance(metadata.get(vehicle_key), list)
+
+    for key in (face_key, vehicle_key):
+        if not isinstance(metadata.get(key), list):
+            continue
+        filtered = _normalize_unique_filenames(
+            [item for item in (metadata.get(key) or []) if str(item or "").strip() in target_set]
+        )
+        if filtered:
+            sliced[key] = filtered
+        else:
+            sliced.pop(key, None)
+
+    face_enabled = bool(metadata.get("analysis_face_people", False))
+    vehicle_enabled = bool(metadata.get("analysis_vehicles", False))
+    if has_face_list:
+        face_enabled = bool(sliced.get(face_key))
+    if has_vehicle_list:
+        vehicle_enabled = bool(sliced.get(vehicle_key))
+
+    if "analysis_face_people" in metadata or has_face_list:
+        sliced["analysis_face_people"] = bool(face_enabled)
+    if "analysis_vehicles" in metadata or has_vehicle_list:
+        sliced["analysis_vehicles"] = bool(vehicle_enabled)
+    return sliced
+
+
+def _build_payload_subset_for_filenames(payload: dict[str, Any], filenames: list[str]) -> dict[str, Any]:
+    metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+    subset = {
+        "case_id": str(payload.get("case_id") or "").strip(),
+        "filenames": _normalize_unique_filenames(filenames),
+        "frame_interval_seconds": float(payload.get("frame_interval_seconds", 1.0)),
+        "batch_size": int(payload.get("batch_size", 32)),
+        "force": bool(payload.get("force", False)),
+        "metadata": metadata,
+    }
+    if metadata:
+        subset["metadata"] = _slice_analysis_metadata_for_filenames(metadata, subset["filenames"])
+    return subset
+
+
 async def _run_triage_queue_job_async(
     *,
     queue_store: IndexQueueStore,
@@ -1248,14 +1466,71 @@ async def _run_analysis_queue_job_async(
     return "completed", ""
 
 
-async def _index_queue_worker_loop() -> None:
-    queue_store = getattr(app.state, "index_queue_store", None)
-    if not isinstance(queue_store, IndexQueueStore):
+async def _ingest_finalize_worker_loop() -> None:
+    finalize_queue = getattr(app.state, "ingest_finalize_queue", None)
+    if not isinstance(finalize_queue, asyncio.Queue):
         return
 
     while True:
         try:
-            queued_job = await asyncio.to_thread(queue_store.claim_next_queued)
+            item = await finalize_queue.get()
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            await asyncio.sleep(0.2)
+            continue
+
+        try:
+            if not isinstance(item, dict):
+                continue
+            callback = item.get("callback")
+            kwargs = item.get("kwargs") if isinstance(item.get("kwargs"), dict) else {}
+            future = item.get("future")
+
+            if callback is None:
+                if isinstance(future, asyncio.Future) and not future.done():
+                    future.set_exception(RuntimeError("Finalize queue item missing callback."))
+                continue
+
+            try:
+                result = callback(**kwargs)
+                if asyncio.iscoroutine(result):
+                    result = await result
+            except Exception as exc:
+                if isinstance(future, asyncio.Future) and not future.done():
+                    future.set_exception(exc)
+                continue
+
+            if isinstance(future, asyncio.Future) and not future.done():
+                future.set_result(result)
+        finally:
+            try:
+                finalize_queue.task_done()
+            except Exception:
+                pass
+
+
+async def _index_queue_worker_loop(
+    *,
+    worker_name: str,
+    allowed_job_kinds: set[str] | None = None,
+) -> None:
+    queue_store = getattr(app.state, "index_queue_store", None)
+    if not isinstance(queue_store, IndexQueueStore):
+        return
+
+    normalized_allowed_job_kinds: set[str] = set()
+    for item in (allowed_job_kinds or set()):
+        normalized = str(item or "").strip().lower()
+        if normalized:
+            normalized_allowed_job_kinds.add(normalized)
+
+    while True:
+        try:
+            queued_job = await asyncio.to_thread(
+                queue_store.claim_next_queued,
+                job_kinds=normalized_allowed_job_kinds or None,
+            )
             if not isinstance(queued_job, dict):
                 await asyncio.sleep(0.5)
                 continue
@@ -1284,16 +1559,12 @@ async def _index_queue_worker_loop() -> None:
                 queue_case_marked = True
 
                 print(
-                    f"[index-queue-worker] claim job_id={job_id} case={case_id} "
+                    f"[index-queue-worker:{worker_name}] claim job_id={job_id} case={case_id} "
                     f"kind={job_kind} priority={queue_priority}"
                 )
 
-                raw_filenames = [str(item) for item in (payload.get("filenames") or []) if str(item).strip()]
-                filenames = [
-                    safe_name
-                    for safe_name in raw_filenames
-                    if not _is_video_delete_in_progress(case_id, safe_name)
-                ]
+                raw_filenames = _normalize_unique_filenames(payload.get("filenames") or [])
+                filenames = [safe_name for safe_name in raw_filenames if not _is_video_delete_in_progress(case_id, safe_name)]
                 if not filenames:
                     await asyncio.to_thread(
                         queue_store.complete_job,
@@ -1306,9 +1577,21 @@ async def _index_queue_worker_loop() -> None:
                     )
                     continue
 
-                frame_interval_seconds = float(payload.get("frame_interval_seconds", 1.0))
-                batch_size = int(payload.get("batch_size", 32))
-                force = bool(payload.get("force", False))
+                current_filename = str(filenames[0]).strip()
+                if not current_filename:
+                    await asyncio.to_thread(
+                        queue_store.complete_job,
+                        job_id=job_id,
+                        status="cancelled",
+                        error="Queued job has no valid filename to process.",
+                    )
+                    continue
+                remaining_filenames = filenames[1:]
+                current_payload = _build_payload_subset_for_filenames(payload, [current_filename])
+                remaining_payload = _build_payload_subset_for_filenames(payload, remaining_filenames)
+                frame_interval_seconds = float(current_payload.get("frame_interval_seconds", 1.0))
+                batch_size = int(current_payload.get("batch_size", 32))
+                force = bool(current_payload.get("force", False))
 
                 try:
                     await asyncio.to_thread(_get_case_paths_or_raise, case_id)
@@ -1321,90 +1604,132 @@ async def _index_queue_worker_loop() -> None:
                     )
                     continue
 
+                async def _enqueue_remaining_files_if_needed() -> tuple[int, int]:
+                    if not remaining_filenames:
+                        return 0, 0
+                    if _is_case_delete_in_progress(case_id):
+                        return 0, 0
+                    try:
+                        requeued = await asyncio.to_thread(
+                            queue_store.enqueue_or_get_active,
+                            case_id=case_id,
+                            filenames=remaining_filenames,
+                            frame_interval_seconds=float(remaining_payload.get("frame_interval_seconds", 1.0)),
+                            batch_size=int(remaining_payload.get("batch_size", 32)),
+                            force=bool(remaining_payload.get("force", False)),
+                            job_kind=job_kind,
+                            priority=queue_priority,
+                            metadata=(
+                                remaining_payload.get("metadata")
+                                if isinstance(remaining_payload.get("metadata"), dict)
+                                else {}
+                            ),
+                        )
+                        if not isinstance(requeued, dict):
+                            return 0, len(remaining_filenames)
+                        queued_payload = (
+                            requeued.get("payload")
+                            if isinstance(requeued.get("payload"), dict)
+                            else {}
+                        )
+                        queued_filenames = _normalize_unique_filenames(
+                            queued_payload.get("filenames") or []
+                        )
+                        appended_count = max(0, int(requeued.get("appended_count", 0)))
+                        if bool(requeued.get("created", False)):
+                            queued_count = len(queued_filenames or remaining_filenames)
+                        else:
+                            queued_count = appended_count
+                        queue_position = max(0, int(requeued.get("queue_position", 0)))
+                        print(
+                            f"[index-queue-worker:{worker_name}] requeue case={case_id} kind={job_kind} "
+                            f"current={current_filename} remaining={len(remaining_filenames)} "
+                            f"created={bool(requeued.get('created', False))} "
+                            f"queue_position={queue_position}"
+                        )
+                        return queued_count, 0
+                    except Exception as exc:
+                        print(
+                            f"[index-queue-worker:{worker_name}] requeue_failed case={case_id} kind={job_kind} "
+                            f"current={current_filename} remaining={len(remaining_filenames)} "
+                            f"error={exc}"
+                        )
+                        return 0, len(remaining_filenames)
+
+                queue_status = "failed"
+                queue_error = ""
                 if job_kind == QUEUE_JOB_KIND_TRIAGE_TIMELINE:
                     queue_status, queue_error = await _run_triage_queue_job_async(
                         queue_store=queue_store,
                         job_id=job_id,
                         case_id=case_id,
-                        payload=payload,
-                        filenames=filenames,
+                        payload=current_payload,
+                        filenames=[current_filename],
                     )
-                    await asyncio.to_thread(
-                        queue_store.complete_job,
-                        job_id=job_id,
-                        status=queue_status,
-                        error=_truncate_error(queue_error),
-                    )
-                    continue
-
-                if job_kind == QUEUE_JOB_KIND_ANALYSIS:
+                elif job_kind == QUEUE_JOB_KIND_ANALYSIS:
                     queue_status, queue_error = await _run_analysis_queue_job_async(
                         queue_store=queue_store,
                         job_id=job_id,
                         case_id=case_id,
-                        payload=payload,
-                        filenames=filenames,
+                        payload=current_payload,
+                        filenames=[current_filename],
                     )
-                    await asyncio.to_thread(
-                        queue_store.complete_job,
-                        job_id=job_id,
-                        status=queue_status,
-                        error=_truncate_error(queue_error),
-                    )
-                    continue
+                elif job_kind == QUEUE_JOB_KIND_SEMANTIC_INDEX:
+                    with app.state.index_jobs_lock:
+                        job = _new_index_job_record(
+                            case_id=case_id,
+                            filenames=[current_filename],
+                            frame_interval_seconds=frame_interval_seconds,
+                            batch_size=batch_size,
+                            force=force,
+                        )
+                        job["running"] = False
+                        job["status"] = "queued"
+                        job["queue_job_id"] = int(job_id)
+                        job["queue_job_kind"] = job_kind
+                        job["queue_priority"] = queue_priority
+                        job["queue_single_file_mode"] = True
+                        app.state.index_jobs[case_id] = job
 
-                if job_kind != QUEUE_JOB_KIND_SEMANTIC_INDEX:
-                    await asyncio.to_thread(
-                        queue_store.complete_job,
-                        job_id=job_id,
-                        status="failed",
-                        error=f"Unsupported queue job kind for worker: {job_kind}",
-                    )
-                    continue
+                    await _persist_index_job_snapshot(case_id)
 
-                with app.state.index_jobs_lock:
-                    job = _new_index_job_record(
-                        case_id=case_id,
-                        filenames=filenames,
-                        frame_interval_seconds=frame_interval_seconds,
-                        batch_size=batch_size,
-                        force=force,
-                    )
-                    job["running"] = False
-                    job["status"] = "queued"
-                    job["queue_job_id"] = int(job_id)
-                    job["queue_job_kind"] = job_kind
-                    job["queue_priority"] = queue_priority
-                    app.state.index_jobs[case_id] = job
+                    run_task = asyncio.create_task(_run_index_job_async(case_id))
+                    with app.state.index_jobs_lock:
+                        app.state.index_tasks[case_id] = run_task
 
-                await _persist_index_job_snapshot(case_id)
+                    try:
+                        await run_task
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        queue_status = "failed"
+                        queue_error = _truncate_error(str(exc))
+                    else:
+                        with app.state.index_jobs_lock:
+                            snapshot = _index_job_snapshot(app.state.index_jobs.get(case_id), case_id=case_id)
+                        queue_status, queue_error = _map_index_snapshot_to_queue_status(snapshot)
+                else:
+                    queue_status = "failed"
+                    queue_error = f"Unsupported queue job kind for worker: {job_kind}"
 
-                run_task = asyncio.create_task(_run_index_job_async(case_id))
-                with app.state.index_jobs_lock:
-                    app.state.index_tasks[case_id] = run_task
+                should_requeue_remaining = (
+                    bool(remaining_filenames)
+                    and queue_status not in {"cancelled", "interrupted"}
+                )
+                if should_requeue_remaining:
+                    _, requeue_failed_count = await _enqueue_remaining_files_if_needed()
+                    if requeue_failed_count > 0:
+                        queue_status = "failed"
+                        queue_error = _truncate_error(
+                            f"{queue_error or 'Queue continuation failed.'} "
+                            f"Unable to requeue {requeue_failed_count} file(s)."
+                        )
 
-                try:
-                    await run_task
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    await asyncio.to_thread(
-                        queue_store.complete_job,
-                        job_id=job_id,
-                        status="failed",
-                        error=_truncate_error(str(exc)),
-                    )
-                    continue
-
-                with app.state.index_jobs_lock:
-                    snapshot = _index_job_snapshot(app.state.index_jobs.get(case_id), case_id=case_id)
-
-                queue_status, queue_error = _map_index_snapshot_to_queue_status(snapshot)
                 await asyncio.to_thread(
                     queue_store.complete_job,
                     job_id=job_id,
                     status=queue_status,
-                    error=queue_error,
+                    error=_truncate_error(queue_error),
                 )
             finally:
                 if queue_case_marked:
@@ -1412,7 +1737,7 @@ async def _index_queue_worker_loop() -> None:
         except asyncio.CancelledError:
             return
         except Exception as exc:
-            print(f"[index-queue] worker_error={exc}")
+            print(f"[index-queue:{worker_name}] worker_error={exc}")
             await asyncio.sleep(0.5)
 
 
@@ -1430,6 +1755,7 @@ async def _run_index_job_async(case_id: str) -> None:
         frame_interval_seconds = float(initial.get("frame_interval_seconds", 2.0))
         batch_size = int(initial.get("batch_size", 32))
         force = bool(initial.get("force", False))
+        queue_single_file_mode = bool(initial.get("queue_single_file_mode", False))
         initial_filenames: list[str] = []
         initial_seen: set[str] = set()
         for item in (initial.get("filenames") or []):
@@ -1448,6 +1774,7 @@ async def _run_index_job_async(case_id: str) -> None:
 
     try:
         next_index = 0
+        fixed_filenames = list(initial_filenames)
         while True:
             with lock:
                 current = jobs.get(normalized_case_id)
@@ -1455,14 +1782,17 @@ async def _run_index_job_async(case_id: str) -> None:
                     return
                 if bool(current.get("cancel_requested", False)):
                     raise asyncio.CancelledError()
-                dynamic_filenames: list[str] = []
-                dynamic_seen: set[str] = set()
-                for item in (current.get("filenames") or []):
-                    safe = str(item).strip()
-                    if not safe or safe in dynamic_seen:
-                        continue
-                    dynamic_seen.add(safe)
-                    dynamic_filenames.append(safe)
+                if queue_single_file_mode:
+                    dynamic_filenames = list(fixed_filenames)
+                else:
+                    dynamic_filenames = []
+                    dynamic_seen: set[str] = set()
+                    for item in (current.get("filenames") or []):
+                        safe = str(item).strip()
+                        if not safe or safe in dynamic_seen:
+                            continue
+                        dynamic_seen.add(safe)
+                        dynamic_filenames.append(safe)
                 current["filenames"] = dynamic_filenames
                 current["total"] = len(dynamic_filenames)
                 if next_index >= len(dynamic_filenames):
@@ -1785,6 +2115,7 @@ async def _run_index_job_async(case_id: str) -> None:
                 current["current_video_started_ts"] = 0.0
                 current["updated_at"] = now
                 current["finished_at"] = now
+                current["queue_single_file_mode"] = False
             tasks.pop(normalized_case_id, None)
         await _persist_index_job_snapshot(normalized_case_id)
 
@@ -2202,9 +2533,21 @@ def _apply_semantic_post_filters(
     top_k: int,
     min_score: float,
     diversity_seconds: float,
-) -> list[dict]:
+    near_duplicate_seconds: float = 2.0,
+    per_video_cap: int = 6,
+    return_stats: bool = False,
+) -> list[dict] | tuple[list[dict], dict[str, Any]]:
     if top_k <= 0 or not raw_results:
-        return []
+        empty_stats = {
+            "input_count": len(raw_results or []),
+            "thresholded_count": 0,
+            "exact_duplicates_removed": 0,
+            "near_duplicates_removed": 0,
+            "diversity_suppressed": 0,
+            "per_video_cap_suppressed": 0,
+            "final_count": 0,
+        }
+        return ([], empty_stats) if return_stats else []
 
     sorted_results = sorted(
         raw_results,
@@ -2218,43 +2561,108 @@ def _apply_semantic_post_filters(
     ]
     candidates = thresholded if thresholded else sorted_results
 
-    if diversity_seconds <= 0:
-        return candidates[:top_k]
+    safe_diversity_seconds = max(0.0, float(diversity_seconds))
+    safe_near_dup_seconds = max(0.0, float(near_duplicate_seconds))
+    safe_per_video_cap = max(0, int(per_video_cap))
 
     selected: list[dict] = []
+    deferred_diversity: list[dict] = []
+    deferred_cap: list[dict] = []
     used_keys: set[tuple[str, float, str]] = set()
     per_video_buckets: dict[str, set[int]] = {}
+    per_video_timestamps: dict[str, list[float]] = {}
+    per_video_counts: dict[str, int] = {}
+    exact_duplicates_removed = 0
+    near_duplicates_removed = 0
+    diversity_suppressed = 0
+    per_video_cap_suppressed = 0
 
     for item in candidates:
         key = _semantic_result_unique_key(item)
         if key in used_keys:
+            exact_duplicates_removed += 1
             continue
 
         video_filename = key[0]
         timestamp = key[1]
         if video_filename:
-            bucket = int(max(0.0, float(timestamp)) // float(diversity_seconds))
-            seen_buckets = per_video_buckets.setdefault(video_filename, set())
-            if bucket in seen_buckets:
+            seen_timestamps = per_video_timestamps.setdefault(video_filename, [])
+            is_near_duplicate = False
+            if safe_near_dup_seconds > 0:
+                for seen_ts in seen_timestamps:
+                    if abs(float(timestamp) - float(seen_ts)) <= safe_near_dup_seconds:
+                        is_near_duplicate = True
+                        break
+            if is_near_duplicate:
+                near_duplicates_removed += 1
                 continue
-            seen_buckets.add(bucket)
+
+            if safe_per_video_cap > 0 and per_video_counts.get(video_filename, 0) >= safe_per_video_cap:
+                per_video_cap_suppressed += 1
+                deferred_cap.append(item)
+                continue
+
+            if safe_diversity_seconds > 0:
+                bucket = int(max(0.0, float(timestamp)) // safe_diversity_seconds)
+                seen_buckets = per_video_buckets.setdefault(video_filename, set())
+                if bucket in seen_buckets:
+                    diversity_suppressed += 1
+                    deferred_diversity.append(item)
+                    continue
+                seen_buckets.add(bucket)
+
+            seen_timestamps.append(float(timestamp))
+            per_video_counts[video_filename] = per_video_counts.get(video_filename, 0) + 1
 
         used_keys.add(key)
         selected.append(item)
         if len(selected) >= top_k:
-            return selected
+            stats = {
+                "input_count": len(raw_results),
+                "thresholded_count": len(thresholded),
+                "exact_duplicates_removed": exact_duplicates_removed,
+                "near_duplicates_removed": near_duplicates_removed,
+                "diversity_suppressed": diversity_suppressed,
+                "per_video_cap_suppressed": per_video_cap_suppressed,
+                "final_count": len(selected),
+            }
+            return (selected, stats) if return_stats else selected
 
     if len(selected) < top_k:
-        for item in candidates:
+        relaxed_pool = deferred_diversity + deferred_cap + candidates
+        for item in relaxed_pool:
             key = _semantic_result_unique_key(item)
             if key in used_keys:
                 continue
+            video_filename = str(item.get("video_filename") or "")
+            timestamp = float(item.get("timestamp_seconds") or 0.0)
+            if video_filename and safe_near_dup_seconds > 0:
+                seen_timestamps = per_video_timestamps.setdefault(video_filename, [])
+                is_near_duplicate = False
+                for seen_ts in seen_timestamps:
+                    if abs(float(timestamp) - float(seen_ts)) <= safe_near_dup_seconds:
+                        is_near_duplicate = True
+                        break
+                if is_near_duplicate:
+                    near_duplicates_removed += 1
+                    continue
+                seen_timestamps.append(float(timestamp))
             used_keys.add(key)
             selected.append(item)
             if len(selected) >= top_k:
                 break
 
-    return selected[:top_k]
+    selected = selected[:top_k]
+    stats = {
+        "input_count": len(raw_results),
+        "thresholded_count": len(thresholded),
+        "exact_duplicates_removed": exact_duplicates_removed,
+        "near_duplicates_removed": near_duplicates_removed,
+        "diversity_suppressed": diversity_suppressed,
+        "per_video_cap_suppressed": per_video_cap_suppressed,
+        "final_count": len(selected),
+    }
+    return (selected, stats) if return_stats else selected
 
 
 def _build_temporal_window_records_and_embeddings(
@@ -3068,6 +3476,9 @@ app.include_router(
         read_saved_settings_sync=_read_saved_embedding_settings_sync,
         write_saved_settings_sync=_write_saved_embedding_settings_sync,
         build_settings_response_sync=_build_embedding_settings_response_sync,
+        read_saved_search_settings_sync=_read_saved_search_settings_sync,
+        write_saved_search_settings_sync=_write_saved_search_settings_sync,
+        build_search_settings_response_sync=_build_search_settings_response_sync,
     )
 )
 _media_service = MediaService(
@@ -3346,6 +3757,8 @@ _insights_service = InsightsService(
     get_temporal_store_for_case=_get_temporal_store_for_case,
     detect_semantic_intent=_detect_semantic_intent,
     apply_semantic_post_filters=_apply_semantic_post_filters,
+    read_search_settings_sync=_read_saved_search_settings_sync,
+    derive_search_runtime_settings=_derive_search_runtime_settings,
     media_url_for_case_path=_media_url_for_case_path,
     embedding_engine_info=_embedding_engine_info,
     float_from_env=_float_from_env,

@@ -81,9 +81,17 @@ let queueTaskPopupCancelBtn = null;
 let queueTaskPopupSelectionMeta = null;
 let queueTaskPopupRecoveryStatus = null;
 let queryInput = null;
-let topKInput = null;
+let scoreThresholdInput = null;
+let scoreThresholdValue = null;
 let searchBtn = null;
 let semanticSearchMeta = null;
+let searchThresholdSettingInput = null;
+let searchDedupeAggressivenessInput = null;
+let searchDedupeAggressivenessValue = null;
+let searchResultLimitInput = null;
+let saveSearchSettingsBtn = null;
+let searchSettingsMeta = null;
+let searchSettingsHint = null;
 let resultsGrid = null;
 let triagePlayer = null;
 let triagePlayerMeta = null;
@@ -110,6 +118,7 @@ const state = {
   workspaceView: "analysis",
   embeddingProfiles: [],
   embeddingSettings: null,
+  searchSettings: null,
 };
 let caseSwitchVersion = 0;
 let caseStateVersion = 0;
@@ -237,9 +246,17 @@ function bindDomElements() {
   queueTaskPopupSelectionMeta = document.getElementById("queueTaskPopupSelectionMeta");
   queueTaskPopupRecoveryStatus = document.getElementById("queueTaskPopupRecoveryStatus");
   queryInput = document.getElementById("queryInput");
-  topKInput = document.getElementById("topKInput");
+  scoreThresholdInput = document.getElementById("scoreThresholdInput");
+  scoreThresholdValue = document.getElementById("scoreThresholdValue");
   searchBtn = document.getElementById("searchBtn");
   semanticSearchMeta = document.getElementById("semanticSearchMeta");
+  searchThresholdSettingInput = document.getElementById("searchThresholdSettingInput");
+  searchDedupeAggressivenessInput = document.getElementById("searchDedupeAggressivenessInput");
+  searchDedupeAggressivenessValue = document.getElementById("searchDedupeAggressivenessValue");
+  searchResultLimitInput = document.getElementById("searchResultLimitInput");
+  saveSearchSettingsBtn = document.getElementById("saveSearchSettingsBtn");
+  searchSettingsMeta = document.getElementById("searchSettingsMeta");
+  searchSettingsHint = document.getElementById("searchSettingsHint");
   resultsGrid = document.getElementById("resultsGrid");
   triagePlayer = document.getElementById("triagePlayer");
   triagePlayerMeta = document.getElementById("triagePlayerMeta");
@@ -305,6 +322,14 @@ function setSemanticSearchMeta(message, kind = "") {
   }
   semanticSearchMeta.textContent = String(message || "");
   semanticSearchMeta.className = `status ${kind}`.trim();
+}
+
+function setSearchSettingsStatus(message, kind = "") {
+  if (!searchSettingsMeta) {
+    return;
+  }
+  searchSettingsMeta.textContent = String(message || "");
+  searchSettingsMeta.className = `status ${kind}`.trim();
 }
 
 function setReportQueueStatus(message, kind = "") {
@@ -4031,6 +4056,127 @@ async function saveEmbeddingSettings() {
   }
 }
 
+function updateSearchDedupeAggressivenessUi(value) {
+  const normalized = normalizeDedupeAggressiveness(value, 55);
+  if (searchDedupeAggressivenessInput) {
+    searchDedupeAggressivenessInput.value = String(Math.round(normalized));
+  }
+  if (searchDedupeAggressivenessValue) {
+    searchDedupeAggressivenessValue.textContent = String(Math.round(normalized));
+  }
+}
+
+function renderSearchSettings(payload) {
+  const settingsPayload = payload && typeof payload === "object" ? payload : {};
+  const savedRaw = settingsPayload.saved && typeof settingsPayload.saved === "object"
+    ? settingsPayload.saved
+    : {};
+  const recommendedRaw = settingsPayload.recommended && typeof settingsPayload.recommended === "object"
+    ? settingsPayload.recommended
+    : {};
+  const derivedRaw = settingsPayload.derived && typeof settingsPayload.derived === "object"
+    ? settingsPayload.derived
+    : {};
+
+  const saved = {
+    score_threshold: normalizeScoreThreshold(savedRaw.score_threshold, 0.22),
+    dedupe_aggressiveness: normalizeDedupeAggressiveness(savedRaw.dedupe_aggressiveness, 55),
+    result_limit: normalizeResultLimit(savedRaw.result_limit, 120),
+  };
+  const recommended = {
+    score_threshold: normalizeScoreThreshold(recommendedRaw.score_threshold, 0.22),
+    dedupe_aggressiveness: normalizeDedupeAggressiveness(recommendedRaw.dedupe_aggressiveness, 55),
+    result_limit: normalizeResultLimit(recommendedRaw.result_limit, 120),
+  };
+
+  state.searchSettings = {
+    saved,
+    recommended,
+    derived: derivedRaw,
+  };
+
+  if (searchThresholdSettingInput) {
+    searchThresholdSettingInput.value = saved.score_threshold.toFixed(2);
+  }
+  if (searchResultLimitInput) {
+    searchResultLimitInput.value = String(saved.result_limit);
+  }
+  updateSearchDedupeAggressivenessUi(saved.dedupe_aggressiveness);
+  setThresholdUiValue(saved.score_threshold);
+
+  if (searchSettingsHint) {
+    searchSettingsHint.textContent = `Recommended: threshold ${recommended.score_threshold.toFixed(2)}, dedupe ${Math.round(recommended.dedupe_aggressiveness)}, result limit ${recommended.result_limit}.`;
+  }
+
+  const nearDup = Number(derivedRaw.near_duplicate_seconds);
+  const perVideoCap = Number(derivedRaw.per_video_cap);
+  const settingsSummary = [
+    `Saved threshold ${saved.score_threshold.toFixed(2)}`,
+    `dedupe ${Math.round(saved.dedupe_aggressiveness)}`,
+    `limit ${saved.result_limit}`,
+  ];
+  if (Number.isFinite(nearDup) && nearDup > 0) {
+    settingsSummary.push(`near-dup ${nearDup.toFixed(2)}s`);
+  }
+  if (Number.isFinite(perVideoCap) && perVideoCap > 0) {
+    settingsSummary.push(`per-video cap ${Math.round(perVideoCap)}`);
+  }
+  setSearchSettingsStatus(settingsSummary.join(" | "), "ok");
+}
+
+async function loadSearchSettings() {
+  if (!scoreThresholdInput) {
+    return;
+  }
+  try {
+    const payload = await fetchJson("/settings/search");
+    renderSearchSettings(payload);
+  } catch (error) {
+    state.searchSettings = {
+      saved: {
+        score_threshold: 0.22,
+        dedupe_aggressiveness: 55,
+        result_limit: 120,
+      },
+      recommended: {
+        score_threshold: 0.22,
+        dedupe_aggressiveness: 55,
+        result_limit: 120,
+      },
+      derived: {},
+    };
+    setThresholdUiValue(0.22);
+    setSearchSettingsStatus(`Search settings unavailable: ${formatError(error)}`, "error");
+  }
+}
+
+async function saveSearchSettings() {
+  if (!searchThresholdSettingInput || !searchDedupeAggressivenessInput || !searchResultLimitInput) {
+    return;
+  }
+
+  const scoreThreshold = normalizeScoreThreshold(searchThresholdSettingInput.value, 0.22);
+  const dedupeAggressiveness = normalizeDedupeAggressiveness(searchDedupeAggressivenessInput.value, 55);
+  const resultLimit = normalizeResultLimit(searchResultLimitInput.value, 120);
+
+  try {
+    setSearchSettingsStatus("Saving search settings...", "working");
+    const payload = await fetchJson("/settings/search", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        score_threshold: scoreThreshold,
+        dedupe_aggressiveness: dedupeAggressiveness,
+        result_limit: resultLimit,
+      }),
+    });
+    renderSearchSettings(payload);
+    setSearchSettingsStatus("Search settings saved.", "ok");
+  } catch (error) {
+    setSearchSettingsStatus(`Search settings save failed: ${formatError(error)}`, "error");
+  }
+}
+
 function normalizeCases(rawCases) {
   const list = Array.isArray(rawCases) ? rawCases : [];
   const normalized = [];
@@ -4175,12 +4321,28 @@ function setupSidebarResize() {
   });
 }
 
-function normalizeTopK(value, fallback = 10) {
+function normalizeResultLimit(value, fallback = 120) {
   const parsed = Number.parseInt(String(value ?? ""), 10);
   if (!Number.isFinite(parsed)) {
     return fallback;
   }
-  return Math.max(1, Math.min(100, parsed));
+  return Math.max(10, Math.min(500, parsed));
+}
+
+function normalizeScoreThreshold(value, fallback = 0.22) {
+  const parsed = Number.parseFloat(String(value ?? ""));
+  if (!Number.isFinite(parsed)) {
+    return fallback;
+  }
+  return Math.max(-1, Math.min(1, parsed));
+}
+
+function normalizeDedupeAggressiveness(value, fallback = 55) {
+  const parsed = Number.parseFloat(String(value ?? ""));
+  if (!Number.isFinite(parsed)) {
+    return fallback;
+  }
+  return Math.max(0, Math.min(100, parsed));
 }
 
 function formatEmbeddingEngineLabel(enginePayload) {
@@ -4206,23 +4368,60 @@ function getLoadedEmbeddingEngineLabel() {
   return label || "embedding engine";
 }
 
-function defaultTopK() {
-  if (!topKInput) {
-    return 10;
-  }
-  const fromDefault = normalizeTopK(topKInput.defaultValue, NaN);
-  if (Number.isFinite(fromDefault)) {
-    return fromDefault;
-  }
-  const fromAttr = normalizeTopK(topKInput.getAttribute("value"), NaN);
-  if (Number.isFinite(fromAttr)) {
-    return fromAttr;
-  }
-  return 10;
+function getSavedSearchSettings() {
+  const payload = state.searchSettings && typeof state.searchSettings === "object"
+    ? state.searchSettings
+    : {};
+  return payload.saved && typeof payload.saved === "object"
+    ? payload.saved
+    : {};
 }
 
-function searchKey(query, topK) {
-  return `${query}\u0000${topK}`;
+function defaultSearchThreshold() {
+  const saved = getSavedSearchSettings();
+  if (saved && saved.score_threshold !== undefined) {
+    return normalizeScoreThreshold(saved.score_threshold, 0.22);
+  }
+  if (scoreThresholdInput) {
+    const fromDefault = normalizeScoreThreshold(scoreThresholdInput.defaultValue, NaN);
+    if (Number.isFinite(fromDefault)) {
+      return fromDefault;
+    }
+    const fromAttr = normalizeScoreThreshold(scoreThresholdInput.getAttribute("value"), NaN);
+    if (Number.isFinite(fromAttr)) {
+      return fromAttr;
+    }
+  }
+  return 0.22;
+}
+
+function defaultSearchResultLimit() {
+  const saved = getSavedSearchSettings();
+  if (saved && saved.result_limit !== undefined) {
+    return normalizeResultLimit(saved.result_limit, 120);
+  }
+  return 120;
+}
+
+function formatThresholdValue(value) {
+  const normalized = normalizeScoreThreshold(value, defaultSearchThreshold());
+  return normalized.toFixed(2);
+}
+
+function setThresholdUiValue(value) {
+  const normalized = normalizeScoreThreshold(value, defaultSearchThreshold());
+  if (scoreThresholdInput) {
+    scoreThresholdInput.value = normalized.toFixed(2);
+  }
+  if (scoreThresholdValue) {
+    scoreThresholdValue.textContent = normalized.toFixed(2);
+  }
+}
+
+function searchKey(query, threshold, resultLimit) {
+  const thresholdKey = normalizeScoreThreshold(threshold, defaultSearchThreshold()).toFixed(2);
+  const limitKey = normalizeResultLimit(resultLimit, defaultSearchResultLimit());
+  return `${query}\u0000${thresholdKey}\u0000${limitKey}`;
 }
 
 function ensureCaseSearchCache(caseId) {
@@ -4241,18 +4440,20 @@ function ensureCaseSearchCache(caseId) {
   return caseCache;
 }
 
-function cacheSearchResults(caseId, query, topK, results, count) {
+function cacheSearchResults(caseId, query, threshold, resultLimit, results, count) {
   const caseCache = ensureCaseSearchCache(caseId);
   if (!caseCache) {
     return;
   }
   const normalizedQuery = String(query || "").trim();
-  const normalizedTopK = normalizeTopK(topK, defaultTopK());
-  const key = searchKey(normalizedQuery, normalizedTopK);
+  const normalizedThreshold = normalizeScoreThreshold(threshold, defaultSearchThreshold());
+  const normalizedResultLimit = normalizeResultLimit(resultLimit, defaultSearchResultLimit());
+  const key = searchKey(normalizedQuery, normalizedThreshold, normalizedResultLimit);
   const normalizedResults = Array.isArray(results) ? results : [];
   caseCache.entries.set(key, {
     query: normalizedQuery,
-    topK: normalizedTopK,
+    threshold: normalizedThreshold,
+    resultLimit: normalizedResultLimit,
     results: normalizedResults,
     count: Number.isFinite(Number(count)) ? Number(count) : normalizedResults.length,
   });
@@ -4275,9 +4476,7 @@ function clearSearchUiForCase() {
   if (queryInput) {
     queryInput.value = "";
   }
-  if (topKInput) {
-    topKInput.value = String(defaultTopK());
-  }
+  setThresholdUiValue(defaultSearchThreshold());
   clearResults();
 }
 
@@ -4290,9 +4489,7 @@ function restoreSearchForCase(caseId) {
   if (queryInput) {
     queryInput.value = cached.query;
   }
-  if (topKInput) {
-    topKInput.value = String(cached.topK);
-  }
+  setThresholdUiValue(cached.threshold);
   renderResults(cached.results);
   return true;
 }
@@ -6951,14 +7148,14 @@ async function uploadAndIndex() {
       `Transferring videos to ${caseId} (engine: ${engineLabel}) | semantic index selected: ${selectedForIndexCount}/${files.length}.`,
       "working",
     );
+    const STEP1_LABEL = "Step 1/2: Upload ingest to server";
+    const STEP2_LABEL = "Step 2/2: Server convert/finalize";
     setTaskProgressUi(
-      "Transferring files to server",
+      STEP1_LABEL,
       0,
       `${files.length} file(s) | ${formatBytes(totalUploadBytes)}`,
     );
-    const TRANSFER_STAGE_MAX = 80;
-    const SERVER_RECEIVED_STAGE = 90;
-    const INDEX_QUEUE_STAGE = 95;
+    const INDEX_QUEUE_STAGE = 100;
     const uploadSession = await resolveResumableUploadSession(caseId, files);
     const sessionId = String(uploadSession?.session?.session_id || "").trim();
     if (!sessionId) {
@@ -7002,8 +7199,8 @@ async function uploadAndIndex() {
         formatEtaLabel(etaSeconds),
       ].join(" | ");
       setTaskProgressUi(
-        "Transferring files to server",
-        clampPercent(transferFraction * TRANSFER_STAGE_MAX),
+        STEP1_LABEL,
+        clampPercent(transferFraction * 100),
         meta,
       );
     };
@@ -7052,15 +7249,22 @@ async function uploadAndIndex() {
     }
 
     setTaskProgressUi(
-      "Upload received by server",
-      SERVER_RECEIVED_STAGE,
-      "Browser transfer is complete. Server ingest/transcode is still running...",
+      "Step 1/2 complete: Upload ingest to server",
+      100,
+      "Browser transfer is complete. Starting server convert/finalize...",
     );
-    const FINALIZE_STAGE_MAX = 94;
+    setTaskProgressUi(
+      STEP2_LABEL,
+      0,
+      `${files.length} file(s) queued for server convert/finalize`,
+    );
     let finalizeWatcherActive = true;
     let lastFinalizedCount = -1;
     let lastCompletedCount = -1;
     let lastFailedCount = -1;
+    let lastProcessingFileKey = "";
+    let lastReadyCount = -1;
+    let lastPendingCount = -1;
     const pollFinalizeProgress = async () => {
       while (finalizeWatcherActive) {
         try {
@@ -7068,6 +7272,14 @@ async function uploadAndIndex() {
             `/upload_session/status?session_id=${encodeURIComponent(sessionId)}`,
           );
           const sessionFiles = Array.isArray(statusPayload?.files) ? statusPayload.files : [];
+          const orderedSessionFiles = sessionFiles
+            .filter((item) => item && typeof item === "object")
+            .slice()
+            .sort((a, b) => {
+              const left = Math.max(0, Number(a.source_index || 0));
+              const right = Math.max(0, Number(b.source_index || 0));
+              return left - right;
+            });
           const completedCount = sessionFiles.filter((item) => {
             if (!item || typeof item !== "object") {
               return false;
@@ -7083,27 +7295,94 @@ async function uploadAndIndex() {
             const status = String(item.status || "").toLowerCase();
             return status === "failed";
           }).length;
+          const processingFile = orderedSessionFiles.find((item) => {
+            const status = String(item?.status || "").toLowerCase();
+            return status === "in_progress";
+          }) || null;
+          const processingProgress = processingFile
+            ? Math.max(0, Math.min(100, Number(processingFile.finalize_progress_percent || 0)))
+            : 0;
+          const processingStage = processingFile
+            ? String(processingFile.finalize_stage || "").trim()
+            : "";
+          const readyCount = sessionFiles.filter((item) => {
+            const status = String(item?.status || "").toLowerCase();
+            return status === "ready";
+          }).length;
+          const pendingCount = sessionFiles.filter((item) => {
+            const status = String(item?.status || "").toLowerCase();
+            return status === "pending" || status === "ready";
+          }).length;
+          const activeCount = sessionFiles.filter((item) => {
+            const status = String(item?.status || "").toLowerCase();
+            return status === "in_progress";
+          }).length;
           const finalizedCount = completedCount + failedCount;
           const totalFinalizeFiles = Math.max(files.length, sessionFiles.length || files.length);
+          const processingBoost = processingFile ? (processingProgress / 100) : 0;
           const finalizeFraction = totalFinalizeFiles > 0
-            ? Math.max(0, Math.min(1, finalizedCount / totalFinalizeFiles))
+            ? Math.max(0, Math.min(1, (finalizedCount + processingBoost) / totalFinalizeFiles))
             : 0;
-          if (completedCount !== lastCompletedCount || failedCount !== lastFailedCount) {
+          const processingFileKey = processingFile
+            ? String(processingFile.file_id || processingFile.source_filename || "").trim()
+            : "";
+          if (
+            completedCount !== lastCompletedCount
+            || failedCount !== lastFailedCount
+            || processingFileKey !== lastProcessingFileKey
+            || readyCount !== lastReadyCount
+            || pendingCount !== lastPendingCount
+          ) {
             lastCompletedCount = completedCount;
             lastFailedCount = failedCount;
+            lastProcessingFileKey = processingFileKey;
+            lastReadyCount = readyCount;
+            lastPendingCount = pendingCount;
             const detailParts = [
               `${completedCount}/${totalFinalizeFiles} finalized`,
             ];
             if (failedCount > 0) {
               detailParts.push(`${failedCount} failed`);
             }
-            detailParts.push("showing videos as each finalize completes");
+            if (processingFile) {
+              const processingName = String(
+                processingFile.source_filename
+                || processingFile.uploaded_filename
+                || processingFile.file_id
+                || "unknown file",
+              ).trim();
+              const processingOrdinalRaw = orderedSessionFiles.findIndex((item) => {
+                if (!item || typeof item !== "object") {
+                  return false;
+                }
+                const left = String(item.file_id || "").trim();
+                const right = String(processingFile.file_id || "").trim();
+                if (left && right) {
+                  return left === right;
+                }
+                return String(item.source_filename || "").trim() === String(processingFile.source_filename || "").trim();
+              });
+              const processingOrdinal = processingOrdinalRaw >= 0
+                ? processingOrdinalRaw + 1
+                : Math.min(totalFinalizeFiles, finalizedCount + 1);
+              detailParts.push(`processing ${processingOrdinal}/${totalFinalizeFiles}: ${processingName}`);
+              detailParts.push(`file progress ${Math.round(processingProgress)}%`);
+              if (processingStage) {
+                detailParts.push(`stage: ${processingStage}`);
+              }
+            } else if (readyCount > 0) {
+              detailParts.push(`${readyCount} waiting to finalize`);
+            }
+            if (activeCount > 0) {
+              detailParts.push(`${activeCount} active`);
+            }
+            if (pendingCount > 0) {
+              detailParts.push(`${pendingCount} pending`);
+            }
+            detailParts.push("videos appear as each file finalizes");
             setTaskProgressUi(
-              "Server ingest/transcode in progress",
-              clampPercent(
-                SERVER_RECEIVED_STAGE
-                + (finalizeFraction * (FINALIZE_STAGE_MAX - SERVER_RECEIVED_STAGE)),
-              ),
+              STEP2_LABEL,
+              clampPercent(finalizeFraction * 100),
               detailParts.join(" | "),
             );
           }
@@ -7148,8 +7427,8 @@ async function uploadAndIndex() {
       }
     }
     setTaskProgressUi(
-      "Server ingest/transcode complete",
-      FINALIZE_STAGE_MAX,
+      "Step 2/2 complete: Server convert/finalize",
+      100,
       "Preparing background indexing...",
     );
     clearResumableUploadState();
@@ -7449,15 +7728,19 @@ async function runSelectedAnalysisForCategory(category) {
 }
 
 async function runSearch() {
-  const query = queryInput.value.trim();
+  const query = queryInput?.value?.trim() || "";
   if (!query) {
     setStatus("Type a search query.", "error");
     setSemanticSearchMeta("Type a search query first.", "error");
     return;
   }
 
-  const topK = normalizeTopK(topKInput?.value || "10", 10);
-  topKInput.value = String(topK);
+  const threshold = normalizeScoreThreshold(
+    scoreThresholdInput?.value,
+    defaultSearchThreshold(),
+  );
+  setThresholdUiValue(threshold);
+  const resultLimit = defaultSearchResultLimit();
 
   try {
     const caseId = ensureActiveCaseId();
@@ -7466,11 +7749,16 @@ async function runSearch() {
     const payload = await fetchJson("/search", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ case_id: caseId, query, top_k: topK }),
+      body: JSON.stringify({
+        case_id: caseId,
+        query,
+        top_k: resultLimit,
+        min_score: threshold,
+      }),
     });
     const results = Array.isArray(payload.results) ? payload.results : [];
     renderResults(results);
-    cacheSearchResults(caseId, query, topK, results, payload.count);
+    cacheSearchResults(caseId, query, threshold, resultLimit, results, payload.count);
     const intent = String(payload.intent || "").trim();
     const mode = String(payload.search_mode || "").trim();
     const engineLabel = formatEmbeddingEngineLabel(payload.embedding_engine);
@@ -7484,15 +7772,52 @@ async function runSearch() {
     if (engineLabel) {
       metaParts.push(`engine=${engineLabel}`);
     }
+    metaParts.push(`threshold=${threshold.toFixed(2)}`);
     const metaSuffix = metaParts.length ? ` (${metaParts.join(", ")})` : "";
     setStatus(`Case ${caseId}: found ${payload.count || results.length} result(s).${metaSuffix}`, "ok");
-    const fallbackUsed = Boolean(payload.fallback_used);
-    const searchTypeLabel = intent || "unknown";
-    const modeLabel = mode || "unknown";
+    const strategy = payload.search_strategy && typeof payload.search_strategy === "object"
+      ? payload.search_strategy
+      : {};
+    const weights = strategy.weights && typeof strategy.weights === "object"
+      ? strategy.weights
+      : {};
+    const counts = strategy.candidate_counts && typeof strategy.candidate_counts === "object"
+      ? strategy.candidate_counts
+      : {};
+    const filterStats = strategy.filter_stats && typeof strategy.filter_stats === "object"
+      ? strategy.filter_stats
+      : {};
+    const fallbackUsed = Boolean(strategy.fallback_used ?? payload.fallback_used);
+    const searchTypeLabel = intent || String(strategy.intent || "unknown");
+    const modeLabel = mode || String(strategy.mode || "unknown");
     const fallbackLabel = fallbackUsed ? "yes" : "no";
+    const frameWeight = Number(weights.frame);
+    const temporalWeight = Number(weights.temporal);
+    const weightLabel = Number.isFinite(frameWeight) && Number.isFinite(temporalWeight)
+      ? ` | Weights F/T: ${(frameWeight * 100).toFixed(0)}/${(temporalWeight * 100).toFixed(0)}`
+      : "";
+    const countsLabel = [
+      Number.isFinite(Number(counts.frame_raw)) ? `frame ${Number(counts.frame_raw)}` : "",
+      Number.isFinite(Number(counts.temporal_raw)) ? `temporal ${Number(counts.temporal_raw)}` : "",
+      Number.isFinite(Number(counts.fused)) ? `fused ${Number(counts.fused)}` : "",
+      Number.isFinite(Number(counts.final)) ? `final ${Number(counts.final)}` : "",
+    ].filter(Boolean).join(", ");
+    const filterLabel = [
+      Number.isFinite(Number(filterStats.near_duplicates_removed))
+        ? `near-dup ${Number(filterStats.near_duplicates_removed)}`
+        : "",
+      Number.isFinite(Number(filterStats.diversity_suppressed))
+        ? `diversity ${Number(filterStats.diversity_suppressed)}`
+        : "",
+      Number.isFinite(Number(filterStats.per_video_cap_suppressed))
+        ? `cap ${Number(filterStats.per_video_cap_suppressed)}`
+        : "",
+    ].filter(Boolean).join(", ");
     const engineMeta = engineLabel ? ` | Engine: ${engineLabel}` : "";
+    const strategyMeta = countsLabel ? ` | Candidates: ${countsLabel}` : "";
+    const filterMeta = filterLabel ? ` | Filters: ${filterLabel}` : "";
     setSemanticSearchMeta(
-      `Search Type: ${searchTypeLabel} | Mode: ${modeLabel} | Fallback: ${fallbackLabel}${engineMeta}`,
+      `Search Type: ${searchTypeLabel} | Mode: ${modeLabel} | Fallback: ${fallbackLabel}${weightLabel}${strategyMeta}${filterMeta}${engineMeta}`,
       "ok",
     );
   } catch (error) {
@@ -7671,6 +7996,17 @@ function setupListeners() {
   saveEmbeddingSettingsBtn?.addEventListener("click", () => {
     saveEmbeddingSettings();
   });
+  saveSearchSettingsBtn?.addEventListener("click", () => {
+    saveSearchSettings();
+  });
+  scoreThresholdInput?.addEventListener("input", () => {
+    if (scoreThresholdValue) {
+      scoreThresholdValue.textContent = formatThresholdValue(scoreThresholdInput.value);
+    }
+  });
+  searchDedupeAggressivenessInput?.addEventListener("input", () => {
+    updateSearchDedupeAggressivenessUi(searchDedupeAggressivenessInput.value);
+  });
   runFacePeopleSelectedBtn?.addEventListener("click", () => {
     runSelectedAnalysisForCategory("face_people");
   });
@@ -7809,6 +8145,13 @@ function setupListeners() {
     }
   });
 
+  if (scoreThresholdInput) {
+    setThresholdUiValue(scoreThresholdInput.value);
+  }
+  if (searchDedupeAggressivenessInput) {
+    updateSearchDedupeAggressivenessUi(searchDedupeAggressivenessInput.value);
+  }
+
   renderMainTabs();
   renderAnalysisSelectionLists();
   setTaskProgressStopCase("");
@@ -7825,6 +8168,7 @@ async function init() {
   setupListeners();
   setActiveMainTab("triage");
   await loadEmbeddingSettings();
+  await loadSearchSettings();
 
   clearResults();
   try {
