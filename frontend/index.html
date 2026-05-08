@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Local Video Semantic Search</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260506e" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260508m" />
   </head>
   <body>
     <main class="app-shell repository-mode">
@@ -25,6 +25,7 @@
         <button id="workspaceBackBtn" type="button" class="ghost">Back</button>
         <button id="workspaceAnalysisBtn" type="button" class="ghost active">Analysis</button>
         <button id="workspaceReportBtn" type="button" class="ghost">Report</button>
+        <button id="workspaceQueueBtn" type="button" class="ghost">Queue</button>
         <button id="workspaceSettingsBtn" type="button" class="ghost">Settings</button>
         <button id="workspaceExitBtn" type="button" class="danger">Exit</button>
       </aside>
@@ -67,10 +68,25 @@
           <h2>Report</h2>
           <p class="analysis-note">In Development</p>
         </section>
+        <section id="workspaceQueuePage" class="panel workspace-queue-page" hidden>
+          <h2>Queue</h2>
+          <div class="report-queue-head">
+            <p class="analysis-note">Live view of all queued/running background tasks across the app.</p>
+            <button id="reportQueueRefreshBtn" type="button" class="ghost">Refresh</button>
+          </div>
+          <p id="reportQueueStatus" class="status">Loading queue status...</p>
+          <div id="reportQueueList" class="report-queue-list"></div>
+        </section>
 
         <section id="tabTriage" class="tab-pane active">
           <section class="panel upload-panel">
             <h1 class="ingestion-title">Video Ingestion &amp; Indexing</h1>
+            <p id="uploadStatus" class="status"></p>
+            <div class="queue-summary-row">
+              <button id="indexQueueSummaryBtn" type="button" class="ghost queue-summary-btn" hidden>
+                0 files queued for indexing
+              </button>
+            </div>
             <div class="upload-controls">
               <input id="videoInput" type="file" multiple accept="video/*" />
               <label for="intervalInput">Frame Interval (s)</label>
@@ -103,16 +119,28 @@
                 </button>
               </div>
             </section>
-            <p id="uploadStatus" class="status"></p>
             <section id="taskProgress" class="task-progress" hidden>
               <div class="task-progress-head">
                 <span id="taskProgressLabel">Working...</span>
-                <span id="taskProgressPercent">0%</span>
+                <div class="task-progress-head-right">
+                  <button id="taskProgressStopBtn" type="button" class="ghost task-stop-btn" hidden>Stop</button>
+                  <span id="taskProgressPercent">0%</span>
+                </div>
               </div>
               <div class="task-progress-track">
                 <div id="taskProgressBar" class="task-progress-bar"></div>
               </div>
               <p id="taskProgressMeta" class="task-progress-meta">Preparing...</p>
+            </section>
+            <section id="videoBulkActions" class="video-bulk-actions">
+              <label class="video-select-all-label">
+                <input id="videoSelectAll" type="checkbox" />
+                Select All Videos
+              </label>
+              <button id="deleteSelectedVideosBtn" type="button" class="danger" disabled>
+                Delete Selected
+              </button>
+              <span id="videoSelectionMeta" class="analysis-note">0 selected</span>
             </section>
             <div id="videoList" class="video-list"></div>
           </section>
@@ -180,6 +208,11 @@
               <button id="runFacePeopleSelectedBtn" type="button" class="ghost">Run Face &amp; People For Selected</button>
             </div>
             <p id="analysisStatus" class="status"></p>
+            <div class="queue-summary-row">
+              <button id="facePeopleQueueSummaryBtn" type="button" class="ghost queue-summary-btn" hidden>
+                0 files queued for analysis
+              </button>
+            </div>
           </section>
 
           <section class="panel search-panel">
@@ -220,6 +253,11 @@
               <button id="runVehiclesSelectedBtn" type="button" class="ghost">Run Vehicle Analysis For Selected</button>
             </div>
             <p id="vehicleStatus" class="status"></p>
+            <div class="queue-summary-row">
+              <button id="vehicleQueueSummaryBtn" type="button" class="ghost queue-summary-btn" hidden>
+                0 files queued for analysis
+              </button>
+            </div>
           </section>
 
           <section class="panel search-panel">
@@ -258,6 +296,32 @@
         <p id="semanticPopupMeta" class="player-meta">Jump to a result to preview here.</p>
       </div>
     </div>
-    <script src="/static/script.js?v=20260507a"></script>
+    <div id="queueTaskPopup" class="video-popup" hidden>
+      <div id="queueTaskPopupBackdrop" class="video-popup-backdrop"></div>
+      <div class="video-popup-dialog panel queue-task-popup-dialog" role="dialog" aria-modal="true" aria-label="Queue task details">
+        <div class="video-popup-header">
+          <h2 id="queueTaskPopupTitle">Queue Task</h2>
+          <button id="queueTaskPopupCloseBtn" type="button" class="ghost">Close</button>
+        </div>
+        <p id="queueTaskPopupMeta" class="player-meta">Task details.</p>
+        <section id="queueTaskPopupRecovery" class="queue-task-recovery" hidden>
+          <div class="queue-task-recovery-controls">
+            <label class="queue-task-select-all">
+              <input id="queueTaskPopupSelectAll" type="checkbox" />
+              Select all files
+            </label>
+            <button id="queueTaskPopupRestartBtn" type="button">Restart Selected</button>
+            <button id="queueTaskPopupCancelBtn" type="button" class="danger">Cancel Selected</button>
+            <span id="queueTaskPopupSelectionMeta" class="queue-task-selection-meta">0 selected</span>
+          </div>
+          <p id="queueTaskPopupRecoveryStatus" class="status"></p>
+        </section>
+        <section class="queue-task-files-panel">
+          <h3>Files</h3>
+          <ul id="queueTaskPopupFiles" class="queue-task-files-list"></ul>
+        </section>
+      </div>
+    </div>
+    <script src="/static/script.js?v=20260508o"></script>
   </body>
 </html>

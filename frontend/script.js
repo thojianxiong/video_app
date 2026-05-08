@@ -4,6 +4,7 @@ let uploadBtn = null;
 let refreshBtn = null;
 let refreshTriageBtn = null;
 let uploadStatus = null;
+let indexQueueSummaryBtn = null;
 let preUploadIndexPanel = null;
 let preUploadSelectAll = null;
 let preUploadIndexList = null;
@@ -17,6 +18,10 @@ let taskProgressPercent = null;
 let taskProgressBar = null;
 let taskProgressMeta = null;
 let taskProgressStopBtn = null;
+let videoBulkActions = null;
+let videoSelectAll = null;
+let deleteSelectedVideosBtn = null;
+let videoSelectionMeta = null;
 let triageStatus = null;
 let triageList = null;
 let triageDetail = null;
@@ -26,8 +31,10 @@ let embeddingDeviceSelect = null;
 let saveEmbeddingSettingsBtn = null;
 let embeddingSettingsMeta = null;
 let analysisStatus = null;
+let facePeopleQueueSummaryBtn = null;
 let runFacePeopleSelectedBtn = null;
 let runVehiclesSelectedBtn = null;
+let vehicleQueueSummaryBtn = null;
 let mainTabTriageBtn = null;
 let mainTabSemanticBtn = null;
 let mainTabFacePeopleBtn = null;
@@ -35,6 +42,7 @@ let mainTabVehiclesBtn = null;
 let workspaceBackBtn = null;
 let workspaceAnalysisBtn = null;
 let workspaceReportBtn = null;
+let workspaceQueueBtn = null;
 let workspaceSettingsBtn = null;
 let workspaceExitBtn = null;
 let tabTriage = null;
@@ -60,6 +68,18 @@ let semanticPopupVideo = null;
 let semanticPopupMeta = null;
 let semanticPopupCloseBtn = null;
 let semanticPopupBackdrop = null;
+let queueTaskPopup = null;
+let queueTaskPopupBackdrop = null;
+let queueTaskPopupCloseBtn = null;
+let queueTaskPopupTitle = null;
+let queueTaskPopupMeta = null;
+let queueTaskPopupFiles = null;
+let queueTaskPopupRecovery = null;
+let queueTaskPopupSelectAll = null;
+let queueTaskPopupRestartBtn = null;
+let queueTaskPopupCancelBtn = null;
+let queueTaskPopupSelectionMeta = null;
+let queueTaskPopupRecoveryStatus = null;
 let queryInput = null;
 let topKInput = null;
 let searchBtn = null;
@@ -75,6 +95,10 @@ let appShell = null;
 let workspace = null;
 let workspaceSettingsPage = null;
 let workspaceReportPage = null;
+let workspaceQueuePage = null;
+let reportQueueRefreshBtn = null;
+let reportQueueStatus = null;
+let reportQueueList = null;
 let caseSidebar = null;
 let sidebarResizeHandle = null;
 
@@ -98,21 +122,36 @@ const triageCache = new Map();
 const triageLoading = new Set();
 const triageErrors = new Map();
 const triageSelection = new Map();
+const videoSelectionByCase = new Map();
 let pendingUploadItems = [];
 let triageRefreshToken = 0;
 let indexStatusPollToken = 0;
 let indexStatusPollCaseId = "";
+const ANALYSIS_CATEGORIES = ["face_people", "vehicles"];
+const analysisStatusPollStateByCategory = {
+  face_people: { token: 0, caseId: "", jobId: 0 },
+  vehicles: { token: 0, caseId: "", jobId: 0 },
+};
 let uploadFlowActive = false;
 let stopBackgroundIndexInFlight = false;
 let taskProgressStopCaseId = "";
 const backgroundIndexTerminalSeen = new Map();
 const backgroundIndexStatusByCase = new Map();
+let reportQueuePollToken = 0;
+let queueTaskPopupLoadToken = 0;
+let queueTaskPopupRecoveryContext = null;
+const analysisQueueStatusByCase = {
+  face_people: new Map(),
+  vehicles: new Map(),
+};
 const SIDEBAR_MIN_WIDTH = 220;
 const SIDEBAR_MAX_WIDTH = 560;
 const RESUMABLE_UPLOAD_STATE_KEY = "visiox_resumable_upload_v1";
 const DEFAULT_RESUMABLE_CHUNK_SIZE_BYTES = 8 * 1024 * 1024;
 const RESUMABLE_UPLOAD_CHUNK_RETRIES = 3;
 const RESUMABLE_UPLOAD_RETRY_DELAY_MS = 350;
+const DUPLICATE_FINGERPRINT_SAMPLE_BYTES = 1024 * 1024;
+const duplicateFingerprintPromiseCache = new WeakMap();
 
 function bindDomElements() {
   videoInput = document.getElementById("videoInput");
@@ -121,6 +160,7 @@ function bindDomElements() {
   refreshBtn = document.getElementById("refreshBtn");
   refreshTriageBtn = document.getElementById("refreshTriageBtn");
   uploadStatus = document.getElementById("uploadStatus");
+  indexQueueSummaryBtn = document.getElementById("indexQueueSummaryBtn");
   preUploadIndexPanel = document.getElementById("preUploadIndexPanel");
   preUploadSelectAll = document.getElementById("preUploadSelectAll");
   preUploadIndexList = document.getElementById("preUploadIndexList");
@@ -134,6 +174,10 @@ function bindDomElements() {
   taskProgressBar = document.getElementById("taskProgressBar");
   taskProgressMeta = document.getElementById("taskProgressMeta");
   taskProgressStopBtn = document.getElementById("taskProgressStopBtn");
+  videoBulkActions = document.getElementById("videoBulkActions");
+  videoSelectAll = document.getElementById("videoSelectAll");
+  deleteSelectedVideosBtn = document.getElementById("deleteSelectedVideosBtn");
+  videoSelectionMeta = document.getElementById("videoSelectionMeta");
   triageStatus = document.getElementById("triageStatus");
   triageList = document.getElementById("triageList");
   triageDetail = document.getElementById("triageDetail");
@@ -143,8 +187,10 @@ function bindDomElements() {
   saveEmbeddingSettingsBtn = document.getElementById("saveEmbeddingSettingsBtn");
   embeddingSettingsMeta = document.getElementById("embeddingSettingsMeta");
   analysisStatus = document.getElementById("analysisStatus");
+  facePeopleQueueSummaryBtn = document.getElementById("facePeopleQueueSummaryBtn");
   runFacePeopleSelectedBtn = document.getElementById("runFacePeopleSelectedBtn");
   runVehiclesSelectedBtn = document.getElementById("runVehiclesSelectedBtn");
+  vehicleQueueSummaryBtn = document.getElementById("vehicleQueueSummaryBtn");
   mainTabTriageBtn = document.getElementById("mainTabTriageBtn");
   mainTabSemanticBtn = document.getElementById("mainTabSemanticBtn");
   mainTabFacePeopleBtn = document.getElementById("mainTabFacePeopleBtn");
@@ -152,6 +198,7 @@ function bindDomElements() {
   workspaceBackBtn = document.getElementById("workspaceBackBtn");
   workspaceAnalysisBtn = document.getElementById("workspaceAnalysisBtn");
   workspaceReportBtn = document.getElementById("workspaceReportBtn");
+  workspaceQueueBtn = document.getElementById("workspaceQueueBtn");
   workspaceSettingsBtn = document.getElementById("workspaceSettingsBtn");
   workspaceExitBtn = document.getElementById("workspaceExitBtn");
   tabTriage = document.getElementById("tabTriage");
@@ -177,6 +224,18 @@ function bindDomElements() {
   semanticPopupMeta = document.getElementById("semanticPopupMeta");
   semanticPopupCloseBtn = document.getElementById("semanticPopupCloseBtn");
   semanticPopupBackdrop = document.getElementById("semanticPopupBackdrop");
+  queueTaskPopup = document.getElementById("queueTaskPopup");
+  queueTaskPopupBackdrop = document.getElementById("queueTaskPopupBackdrop");
+  queueTaskPopupCloseBtn = document.getElementById("queueTaskPopupCloseBtn");
+  queueTaskPopupTitle = document.getElementById("queueTaskPopupTitle");
+  queueTaskPopupMeta = document.getElementById("queueTaskPopupMeta");
+  queueTaskPopupFiles = document.getElementById("queueTaskPopupFiles");
+  queueTaskPopupRecovery = document.getElementById("queueTaskPopupRecovery");
+  queueTaskPopupSelectAll = document.getElementById("queueTaskPopupSelectAll");
+  queueTaskPopupRestartBtn = document.getElementById("queueTaskPopupRestartBtn");
+  queueTaskPopupCancelBtn = document.getElementById("queueTaskPopupCancelBtn");
+  queueTaskPopupSelectionMeta = document.getElementById("queueTaskPopupSelectionMeta");
+  queueTaskPopupRecoveryStatus = document.getElementById("queueTaskPopupRecoveryStatus");
   queryInput = document.getElementById("queryInput");
   topKInput = document.getElementById("topKInput");
   searchBtn = document.getElementById("searchBtn");
@@ -192,6 +251,10 @@ function bindDomElements() {
   workspace = document.querySelector(".workspace");
   workspaceSettingsPage = document.getElementById("workspaceSettingsPage");
   workspaceReportPage = document.getElementById("workspaceReportPage");
+  workspaceQueuePage = document.getElementById("workspaceQueuePage");
+  reportQueueRefreshBtn = document.getElementById("reportQueueRefreshBtn");
+  reportQueueStatus = document.getElementById("reportQueueStatus");
+  reportQueueList = document.getElementById("reportQueueList");
   caseSidebar = document.querySelector(".case-sidebar");
   sidebarResizeHandle = document.getElementById("sidebarResizeHandle");
 }
@@ -242,6 +305,14 @@ function setSemanticSearchMeta(message, kind = "") {
   }
   semanticSearchMeta.textContent = String(message || "");
   semanticSearchMeta.className = `status ${kind}`.trim();
+}
+
+function setReportQueueStatus(message, kind = "") {
+  if (!reportQueueStatus) {
+    return;
+  }
+  reportQueueStatus.textContent = String(message || "");
+  reportQueueStatus.className = `status ${kind}`.trim();
 }
 
 function formatProcessSummaryForConfirm(processPayload) {
@@ -329,6 +400,11 @@ function formatError(error) {
   }
 }
 
+function isExactNotFoundError(error) {
+  const message = String(formatError(error) || "").trim();
+  return message === "[404] Not Found";
+}
+
 function formatBytes(bytes) {
   if (!Number.isFinite(bytes) || bytes <= 0) {
     return "0 B";
@@ -349,6 +425,269 @@ function makePendingUploadSourceKey(file, sourceIndex) {
   const safeSize = Number(file?.size || 0);
   const safeModified = Number(file?.lastModified || 0);
   return `${safeIndex}::${safeName}::${safeSize}::${safeModified}`;
+}
+
+function normalizeDuplicateName(name) {
+  return String(name || "").trim().toLowerCase();
+}
+
+function normalizeDuplicateFingerprint(fingerprint) {
+  return String(fingerprint || "").trim().toLowerCase();
+}
+
+function getExistingUploadedFingerprintSet(caseId = null) {
+  const activeCaseId = String(caseId || state.activeCaseId || "").trim();
+  if (!activeCaseId) {
+    return new Set();
+  }
+  const videos = getCaseVideos(activeCaseId);
+  const existingFingerprints = new Set();
+
+  videos.forEach((video) => {
+    if (!video || typeof video !== "object") {
+      return;
+    }
+    const contract = video.media_contract && typeof video.media_contract === "object"
+      ? video.media_contract
+      : null;
+    const identity = contract && typeof contract.identity === "object"
+      ? contract.identity
+      : null;
+    const normalizedFingerprint = normalizeDuplicateFingerprint(
+      identity?.source_file_fingerprint_sha256 || "",
+    );
+    if (normalizedFingerprint) {
+      existingFingerprints.add(normalizedFingerprint);
+    }
+  });
+
+  return existingFingerprints;
+}
+
+function bytesToHex(bytes) {
+  return Array.from(bytes || [])
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+function concatUint8Arrays(arrays) {
+  const list = Array.isArray(arrays) ? arrays : [];
+  const totalBytes = list.reduce(
+    (sum, entry) => sum + (entry instanceof Uint8Array ? entry.byteLength : 0),
+    0,
+  );
+  const merged = new Uint8Array(totalBytes);
+  let offset = 0;
+  list.forEach((entry) => {
+    if (!(entry instanceof Uint8Array) || !entry.byteLength) {
+      return;
+    }
+    merged.set(entry, offset);
+    offset += entry.byteLength;
+  });
+  return merged;
+}
+
+async function computeDuplicateFileFingerprint(file) {
+  if (!(file instanceof Blob)) {
+    return "";
+  }
+  if (
+    typeof crypto === "undefined"
+    || !crypto.subtle
+    || typeof TextEncoder === "undefined"
+  ) {
+    return "";
+  }
+
+  const cachedPromise = duplicateFingerprintPromiseCache.get(file);
+  if (cachedPromise) {
+    return cachedPromise;
+  }
+
+  const fingerprintPromise = (async () => {
+    try {
+      const encoder = new TextEncoder();
+      const fileSize = Math.max(0, Number(file.size || 0));
+      const sampleSize = Math.max(4096, DUPLICATE_FINGERPRINT_SAMPLE_BYTES);
+      const parts = [encoder.encode(`size:${fileSize};`)];
+
+      const headEnd = Math.min(fileSize, sampleSize);
+      const headBuffer = await file.slice(0, headEnd).arrayBuffer();
+      if (headBuffer.byteLength > 0) {
+        parts.push(encoder.encode("head:"));
+        parts.push(new Uint8Array(headBuffer));
+      }
+
+      if (fileSize > sampleSize * 2) {
+        const middleStart = Math.max(0, Math.floor(fileSize / 2) - Math.floor(sampleSize / 2));
+        const middleEnd = Math.min(fileSize, middleStart + sampleSize);
+        const middleBuffer = await file.slice(middleStart, middleEnd).arrayBuffer();
+        if (middleBuffer.byteLength > 0) {
+          parts.push(encoder.encode(";middle:"));
+          parts.push(new Uint8Array(middleBuffer));
+        }
+      }
+
+      if (fileSize > sampleSize) {
+        const tailStart = Math.max(0, fileSize - sampleSize);
+        const tailBuffer = await file.slice(tailStart, fileSize).arrayBuffer();
+        if (tailBuffer.byteLength > 0) {
+          parts.push(encoder.encode(";tail:"));
+          parts.push(new Uint8Array(tailBuffer));
+        }
+      }
+
+      const fingerprintBytes = concatUint8Arrays(parts);
+      const digest = await crypto.subtle.digest("SHA-256", fingerprintBytes);
+      return bytesToHex(new Uint8Array(digest));
+    } catch (error) {
+      console.warn(
+        "Duplicate fingerprint computation failed:",
+        String(file?.name || ""),
+        error,
+      );
+      return "";
+    }
+  })();
+
+  duplicateFingerprintPromiseCache.set(file, fingerprintPromise);
+  return fingerprintPromise;
+}
+
+function getExistingUploadedNameSet(caseId = null) {
+  const activeCaseId = String(caseId || state.activeCaseId || "").trim();
+  if (!activeCaseId) {
+    return new Set();
+  }
+  const videos = getCaseVideos(activeCaseId);
+  const existingNames = new Set();
+
+  videos.forEach((video) => {
+    if (!video || typeof video !== "object") {
+      return;
+    }
+    const contract = video.media_contract && typeof video.media_contract === "object"
+      ? video.media_contract
+      : null;
+    const identity = contract && typeof contract.identity === "object"
+      ? contract.identity
+      : null;
+
+    const sourceName = normalizeDuplicateName(identity?.source_filename || "");
+    const storedName = normalizeDuplicateName(identity?.stored_filename || video.filename || "");
+    const listedName = normalizeDuplicateName(video.filename || "");
+
+    if (sourceName) {
+      existingNames.add(sourceName);
+    }
+    if (storedName) {
+      existingNames.add(storedName);
+    }
+    if (listedName) {
+      existingNames.add(listedName);
+    }
+  });
+
+  return existingNames;
+}
+
+function detectDuplicateUploadCandidates(files, caseId = null) {
+  const existingNames = getExistingUploadedNameSet(caseId);
+  if (!existingNames.size) {
+    return [];
+  }
+  const list = Array.isArray(files) ? files : [];
+  const duplicates = [];
+  list.forEach((file, sourceIndex) => {
+    const fileName = String(file?.name || "").trim();
+    const normalized = normalizeDuplicateName(fileName);
+    if (!fileName || !normalized) {
+      return;
+    }
+    if (existingNames.has(normalized)) {
+      duplicates.push({
+        sourceIndex: Number(sourceIndex),
+        name: fileName,
+      });
+    }
+  });
+  return duplicates;
+}
+
+async function detectDuplicateUploadCandidatesWithHash(files, caseId = null) {
+  const existingNames = getExistingUploadedNameSet(caseId);
+  const existingFingerprints = getExistingUploadedFingerprintSet(caseId);
+  if (!existingNames.size && !existingFingerprints.size) {
+    return [];
+  }
+
+  const list = Array.isArray(files) ? files : [];
+  const duplicates = [];
+
+  for (let sourceIndex = 0; sourceIndex < list.length; sourceIndex += 1) {
+    const file = list[sourceIndex];
+    const fileName = String(file?.name || "").trim();
+    const normalizedName = normalizeDuplicateName(fileName);
+    if (!fileName) {
+      continue;
+    }
+
+    let matchType = "";
+    if (existingFingerprints.size > 0) {
+      const fingerprint = normalizeDuplicateFingerprint(
+        await computeDuplicateFileFingerprint(file),
+      );
+      if (fingerprint && existingFingerprints.has(fingerprint)) {
+        matchType = "fingerprint";
+      }
+    }
+
+    if (!matchType && normalizedName && existingNames.has(normalizedName)) {
+      matchType = "name";
+    }
+
+    if (matchType) {
+      duplicates.push({
+        sourceIndex: Number(sourceIndex),
+        name: fileName,
+        matchType,
+      });
+    }
+  }
+
+  return duplicates;
+}
+
+function reviewDuplicateUploadCandidates(duplicateCandidates, files) {
+  const candidates = Array.isArray(duplicateCandidates) ? duplicateCandidates : [];
+  const allFiles = Array.isArray(files) ? files : [];
+  const skippedSourceIndices = new Set();
+  if (!candidates.length || !allFiles.length) {
+    return skippedSourceIndices;
+  }
+
+  for (let idx = 0; idx < candidates.length; idx += 1) {
+    const candidate = candidates[idx];
+    const sourceIndex = Number(candidate?.sourceIndex);
+    if (!Number.isFinite(sourceIndex) || sourceIndex < 0 || sourceIndex >= allFiles.length) {
+      continue;
+    }
+    const file = allFiles[sourceIndex];
+    const fileName = String(file?.name || candidate?.name || "").trim() || `File #${sourceIndex + 1}`;
+    const fileSizeLabel = formatBytes(Number(file?.size || 0));
+    const duplicateReason = String(candidate?.matchType || "") === "fingerprint"
+      ? "This file content already exists in this case (content hash match)."
+      : "This filename already exists in this case.";
+    const shouldUploadDuplicate = window.confirm(
+      `Duplicate file ${idx + 1}/${candidates.length}:\n\n${fileName}\n${fileSizeLabel}\n\n${duplicateReason}\n\nPress OK to upload this duplicate anyway.\nPress Cancel to skip this file.`,
+    );
+    if (!shouldUploadDuplicate) {
+      skippedSourceIndices.add(sourceIndex);
+    }
+  }
+
+  return skippedSourceIndices;
 }
 
 function syncPreUploadSelectAllControl() {
@@ -410,7 +749,12 @@ function renderPreUploadIndexSelection() {
 
     const status = document.createElement("div");
     status.className = "analysis-video-status";
-    status.textContent = formatBytes(item.sizeBytes);
+    if (item.isDuplicateExisting) {
+      status.classList.add("duplicate-existing");
+      status.textContent = `${formatBytes(item.sizeBytes)} | already in this case`;
+    } else {
+      status.textContent = formatBytes(item.sizeBytes);
+    }
 
     row.appendChild(label);
     row.appendChild(status);
@@ -422,6 +766,11 @@ function renderPreUploadIndexSelection() {
 
 function refreshPendingUploadItemsFromInput() {
   const files = Array.from(videoInput?.files || []);
+  const duplicateSet = new Set(
+    detectDuplicateUploadCandidates(files, state.activeCaseId).map(
+      (item) => Number(item.sourceIndex),
+    ),
+  );
   const previousSelection = new Map(
     pendingUploadItems.map((item) => [item.sourceKey, Boolean(item.selectedForIndex)]),
   );
@@ -435,6 +784,7 @@ function refreshPendingUploadItemsFromInput() {
       sourceKey,
       name: String(file?.name || ""),
       sizeBytes: Number(file?.size || 0),
+      isDuplicateExisting: duplicateSet.has(sourceIndex),
       selectedForIndex,
     };
   });
@@ -443,6 +793,24 @@ function refreshPendingUploadItemsFromInput() {
 
 function clearPendingUploadItems() {
   pendingUploadItems = [];
+  renderPreUploadIndexSelection();
+}
+
+function refreshPendingUploadDuplicateFlags(caseId = null) {
+  const activeCaseId = String(caseId || state.activeCaseId || "").trim();
+  if (!activeCaseId || !pendingUploadItems.length) {
+    return;
+  }
+  const files = Array.from(videoInput?.files || []);
+  if (!files.length) {
+    return;
+  }
+  const duplicateSet = new Set(
+    detectDuplicateUploadCandidates(files, activeCaseId).map((item) => Number(item.sourceIndex)),
+  );
+  pendingUploadItems.forEach((item) => {
+    item.isDuplicateExisting = duplicateSet.has(Number(item.sourceIndex));
+  });
   renderPreUploadIndexSelection();
 }
 
@@ -535,9 +903,72 @@ function resolveSelectedSemanticIndexTargets(uploadResult, selectedSourceIndices
 }
 
 function isVideoSemanticallyIndexed(video) {
+  const contract = video && typeof video.media_contract === "object" ? video.media_contract : null;
+  const lifecycle = contract && typeof contract.lifecycle === "object" ? contract.lifecycle : null;
+  if (lifecycle && typeof lifecycle.semantic_index_ready === "boolean") {
+    return lifecycle.semantic_index_ready;
+  }
   const indexedFrames = Math.max(0, Number(video?.indexed_frames || 0));
   const indexedWindows = Math.max(0, Number(video?.indexed_windows || 0));
   return indexedFrames > 0 || indexedWindows > 0;
+}
+
+function getCaseVideoSelection(caseId) {
+  const normalizedCaseId = String(caseId || "").trim();
+  if (!normalizedCaseId) {
+    return null;
+  }
+  let selection = videoSelectionByCase.get(normalizedCaseId);
+  if (!(selection instanceof Set)) {
+    selection = new Set();
+    videoSelectionByCase.set(normalizedCaseId, selection);
+  }
+  return selection;
+}
+
+function clearVideoSelection(caseId) {
+  const normalizedCaseId = String(caseId || "").trim();
+  if (!normalizedCaseId) {
+    return;
+  }
+  videoSelectionByCase.delete(normalizedCaseId);
+}
+
+function normalizeVideoFilenames(videos) {
+  const list = Array.isArray(videos) ? videos : [];
+  return list
+    .map((item) => String(item?.filename || "").trim())
+    .filter(Boolean);
+}
+
+function syncVideoSelectionControls(videos) {
+  if (!videoBulkActions || !videoSelectAll || !deleteSelectedVideosBtn || !videoSelectionMeta) {
+    return;
+  }
+  const activeCaseId = String(state.activeCaseId || "").trim();
+  const filenames = normalizeVideoFilenames(videos);
+  const hasVideos = filenames.length > 0;
+  const filenameSet = new Set(filenames);
+  const selection = getCaseVideoSelection(activeCaseId);
+
+  let selectedCount = 0;
+  if (selection instanceof Set) {
+    for (const name of Array.from(selection)) {
+      if (!filenameSet.has(name)) {
+        selection.delete(name);
+      }
+    }
+    selectedCount = selection.size;
+  }
+
+  videoBulkActions.hidden = !activeCaseId;
+  videoSelectAll.disabled = !activeCaseId || !hasVideos;
+  videoSelectAll.checked = hasVideos && selectedCount > 0 && selectedCount === filenames.length;
+  videoSelectAll.indeterminate = hasVideos && selectedCount > 0 && selectedCount < filenames.length;
+  deleteSelectedVideosBtn.disabled = !activeCaseId || selectedCount === 0;
+  videoSelectionMeta.textContent = activeCaseId
+    ? `${selectedCount} selected`
+    : "No active case";
 }
 
 function getExistingIndexCheckboxes() {
@@ -877,6 +1308,7 @@ function renderBackgroundIndexStatus(caseId, statusPayload) {
   if (!normalizedCaseId || state.activeCaseId !== normalizedCaseId) {
     return;
   }
+  updateIndexQueueSummaryButton(normalizedCaseId, statusPayload);
   if (uploadFlowActive) {
     return;
   }
@@ -989,6 +1421,9 @@ async function syncBackgroundIndexStatus(caseId) {
     stopBackgroundIndexPolling();
     hideTaskProgressUi();
     backgroundIndexStatusByCase.clear();
+    if (indexQueueSummaryBtn) {
+      indexQueueSummaryBtn.hidden = true;
+    }
     return null;
   }
 
@@ -1000,6 +1435,9 @@ async function syncBackgroundIndexStatus(caseId) {
     }
     if (state.activeCaseId === normalizedCaseId) {
       hideTaskProgressUi();
+      if (indexQueueSummaryBtn) {
+        indexQueueSummaryBtn.hidden = true;
+      }
     }
     return null;
   }
@@ -1010,12 +1448,705 @@ async function syncBackgroundIndexStatus(caseId) {
   }
 
   renderBackgroundIndexStatus(normalizedCaseId, statusPayload);
+  updateIndexQueueSummaryButton(normalizedCaseId, statusPayload);
   if (isBackgroundIndexRunning(statusPayload)) {
     startBackgroundIndexPolling(normalizedCaseId);
   } else if (indexStatusPollCaseId === normalizedCaseId) {
     stopBackgroundIndexPolling();
   }
   return statusPayload;
+}
+
+function hideQueueSummaryButtons() {
+  if (indexQueueSummaryBtn) {
+    indexQueueSummaryBtn.hidden = true;
+  }
+  if (facePeopleQueueSummaryBtn) {
+    facePeopleQueueSummaryBtn.hidden = true;
+  }
+  if (vehicleQueueSummaryBtn) {
+    vehicleQueueSummaryBtn.hidden = true;
+  }
+}
+
+function analysisStatusCacheMap(category) {
+  const normalizedCategory = normalizeAnalysisCategory(category);
+  return analysisQueueStatusByCase[normalizedCategory];
+}
+
+function setAnalysisQueueStatusCache(category, caseId, payload) {
+  const normalizedCaseId = String(caseId || "").trim();
+  const cache = analysisStatusCacheMap(category);
+  if (!cache || !normalizedCaseId) {
+    return;
+  }
+  if (!payload || typeof payload !== "object") {
+    cache.delete(normalizedCaseId);
+    return;
+  }
+  cache.set(normalizedCaseId, payload);
+}
+
+function getAnalysisQueueStatusCache(category, caseId) {
+  const normalizedCaseId = String(caseId || "").trim();
+  const cache = analysisStatusCacheMap(category);
+  if (!cache || !normalizedCaseId) {
+    return null;
+  }
+  return cache.get(normalizedCaseId) || null;
+}
+
+function activeCaseFilenamesFromPayload(payload) {
+  return Array.isArray(payload?.filenames)
+    ? payload.filenames
+        .map((item) => String(item || "").trim())
+        .filter((item) => item.length > 0)
+    : [];
+}
+
+function updateIndexQueueSummaryButton(caseId, statusPayload) {
+  if (!indexQueueSummaryBtn) {
+    return;
+  }
+  const normalizedCaseId = String(caseId || "").trim();
+  if (!normalizedCaseId || state.activeCaseId !== normalizedCaseId) {
+    indexQueueSummaryBtn.hidden = true;
+    return;
+  }
+  if (!statusPayload || typeof statusPayload !== "object") {
+    indexQueueSummaryBtn.hidden = true;
+    return;
+  }
+  const filenames = activeCaseFilenamesFromPayload(statusPayload);
+  const running = isBackgroundIndexRunning(statusPayload);
+  if (!running || !filenames.length) {
+    indexQueueSummaryBtn.hidden = true;
+    return;
+  }
+  const count = filenames.length;
+  indexQueueSummaryBtn.textContent = `${count} file${count === 1 ? "" : "s"} queued for indexing`;
+  indexQueueSummaryBtn.hidden = false;
+}
+
+function updateAnalysisQueueSummaryButton(category, caseId, statusPayload) {
+  const normalizedCategory = normalizeAnalysisCategory(category);
+  const button = normalizedCategory === "vehicles"
+    ? vehicleQueueSummaryBtn
+    : facePeopleQueueSummaryBtn;
+  if (!button) {
+    return;
+  }
+  const normalizedCaseId = String(caseId || "").trim();
+  if (!normalizedCaseId || state.activeCaseId !== normalizedCaseId) {
+    button.hidden = true;
+    return;
+  }
+  if (!statusPayload || typeof statusPayload !== "object") {
+    button.hidden = true;
+    return;
+  }
+  const queueJobId = Math.max(0, Number(statusPayload?.queue?.job_id || 0));
+  const running = isAnalysisQueueRunning(statusPayload, queueJobId);
+  const status = String(statusPayload?.status || statusPayload?.queue?.status || "").trim().toLowerCase();
+  const interrupted = status === "interrupted";
+  const filenames = activeCaseFilenamesFromPayload(statusPayload);
+  if ((!running && !interrupted) || !filenames.length) {
+    button.hidden = true;
+    return;
+  }
+  const count = filenames.length;
+  const label = analysisCategoryLabel(normalizedCategory);
+  button.textContent = interrupted
+    ? `${count} interrupted file${count === 1 ? "" : "s"} for ${label} analysis`
+    : `${count} file${count === 1 ? "" : "s"} queued for ${label} analysis`;
+  button.hidden = false;
+}
+
+function refreshQueueSummaryButtonsForActiveCase() {
+  const caseId = String(state.activeCaseId || "").trim();
+  if (!caseId) {
+    hideQueueSummaryButtons();
+    return;
+  }
+  const indexStatus = backgroundIndexStatusByCase.get(caseId) || null;
+  updateIndexQueueSummaryButton(caseId, indexStatus);
+  const faceStatus = getAnalysisQueueStatusCache("face_people", caseId);
+  const vehicleStatus = getAnalysisQueueStatusCache("vehicles", caseId);
+  updateAnalysisQueueSummaryButton("face_people", caseId, faceStatus);
+  updateAnalysisQueueSummaryButton("vehicles", caseId, vehicleStatus);
+}
+
+function openIndexQueueSummaryPopup() {
+  const caseId = String(state.activeCaseId || "").trim();
+  if (!caseId) {
+    setStatus("Select a case first.", "error");
+    return;
+  }
+  const payload = backgroundIndexStatusByCase.get(caseId);
+  if (!payload || typeof payload !== "object") {
+    setStatus("No active semantic indexing queue for this case.", "error");
+    return;
+  }
+  const filenames = activeCaseFilenamesFromPayload(payload);
+  if (!filenames.length) {
+    setStatus("No queued files found for semantic indexing.", "error");
+    return;
+  }
+  openQueueTaskPopup({
+    type: "background_index",
+    case_id: caseId,
+    status: String(payload.status || ""),
+    queue_job_id: Number(payload?.queue?.job_id || payload?.queue_job_id || 0),
+    job_kind: "semantic_index",
+    current_filename: String(payload.current_filename || ""),
+    current_video_processed_frames: Number(payload.current_video_processed_frames || 0),
+    current_video_total_frames: Number(payload.current_video_total_frames || 0),
+    current_video_progress_percent: Number(payload.current_video_progress_percent || 0),
+    filenames,
+    filenames_count: filenames.length,
+    file_progress: Array.isArray(payload.file_progress) ? payload.file_progress : [],
+  });
+}
+
+function openAnalysisQueueSummaryPopup(category) {
+  const normalizedCategory = normalizeAnalysisCategory(category);
+  const caseId = String(state.activeCaseId || "").trim();
+  if (!caseId) {
+    setStatus("Select a case first.", "error");
+    return;
+  }
+  const payload = getAnalysisQueueStatusCache(normalizedCategory, caseId);
+  if (!payload || typeof payload !== "object") {
+    setCategoryAnalysisStatus(normalizedCategory, "No active analysis queue for this case.", "error");
+    return;
+  }
+  const filenames = activeCaseFilenamesFromPayload(payload);
+  if (!filenames.length) {
+    setCategoryAnalysisStatus(normalizedCategory, "No queued files found for analysis.", "error");
+    return;
+  }
+  const queue = payload.queue && typeof payload.queue === "object" ? payload.queue : {};
+  const analysis = payload.analysis && typeof payload.analysis === "object" ? payload.analysis : {};
+  const facePeopleFilenames = Array.isArray(payload.analysis_face_people_filenames)
+    ? payload.analysis_face_people_filenames
+    : [];
+  const vehiclesFilenames = Array.isArray(payload.analysis_vehicles_filenames)
+    ? payload.analysis_vehicles_filenames
+    : [];
+  openQueueTaskPopup({
+    type: "queue_job",
+    case_id: caseId,
+    status: String(queue.status || payload.status || ""),
+    queue_job_id: Number(queue.job_id || 0),
+    job_kind: "analysis",
+    queue_position: Number(queue.position_ahead || 0),
+    priority: Number(queue.priority || 0),
+    attempt_count: Number(queue.attempt_count || 0),
+    filenames,
+    filenames_count: filenames.length,
+    metadata: {
+      analysis_face_people: Boolean(analysis.face_people),
+      analysis_vehicles: Boolean(analysis.vehicles),
+      analysis_face_people_filenames: facePeopleFilenames,
+      analysis_vehicles_filenames: vehiclesFilenames,
+    },
+    file_progress: Array.isArray(payload.file_progress) ? payload.file_progress : [],
+    recovery_category: normalizedCategory,
+    message: String(payload.message || ""),
+  });
+}
+
+function normalizeAnalysisCategory(category) {
+  return category === "vehicles" ? "vehicles" : "face_people";
+}
+
+function analysisCategoryLabel(category) {
+  return normalizeAnalysisCategory(category) === "vehicles" ? "Vehicles" : "Face & People";
+}
+
+function setCategoryAnalysisStatus(category, message, kind = "") {
+  if (normalizeAnalysisCategory(category) === "vehicles") {
+    setVehicleStatus(message, kind);
+  } else {
+    setAnalysisStatus(message, kind);
+  }
+}
+
+function pickFirstFiniteNumber(candidates, fallback = null) {
+  if (!Array.isArray(candidates)) {
+    return fallback;
+  }
+  for (const value of candidates) {
+    const numeric = Number(value);
+    if (Number.isFinite(numeric)) {
+      return numeric;
+    }
+  }
+  return fallback;
+}
+
+function getAnalysisQueueSnapshot(statusPayload, fallbackJobId = 0) {
+  const payload = statusPayload && typeof statusPayload === "object" ? statusPayload : {};
+  const queue = payload.queue && typeof payload.queue === "object" ? payload.queue : {};
+  const statusCandidates = [queue.status, payload.status, payload.state];
+  let status = "";
+  statusCandidates.forEach((item) => {
+    if (status) {
+      return;
+    }
+    const normalized = String(item || "").trim().toLowerCase();
+    if (normalized) {
+      status = normalized;
+    }
+  });
+
+  const jobIdCandidate = pickFirstFiniteNumber(
+    [queue.job_id, payload.job_id, payload.queue_job_id, fallbackJobId],
+    0,
+  );
+  const jobId = Number.isFinite(jobIdCandidate)
+    ? Math.max(0, Math.floor(jobIdCandidate))
+    : 0;
+
+  const queueAheadCandidate = pickFirstFiniteNumber(
+    [queue.position_ahead, queue.queue_position, payload.position_ahead, payload.queue_position],
+    null,
+  );
+  const queueAhead = Number.isFinite(queueAheadCandidate)
+    ? Math.max(0, Math.floor(queueAheadCandidate))
+    : null;
+
+  return { payload, queue, status, jobId, queueAhead };
+}
+
+function getAnalysisQueueProgress(statusPayload) {
+  const payload = statusPayload && typeof statusPayload === "object" ? statusPayload : {};
+  const progress = payload.progress && typeof payload.progress === "object" ? payload.progress : {};
+
+  const completedCandidate = pickFirstFiniteNumber(
+    [payload.completed, payload.processed, progress.completed, progress.processed, progress.done],
+    null,
+  );
+  const totalCandidate = pickFirstFiniteNumber(
+    [payload.total, progress.total, progress.count],
+    null,
+  );
+  const percentCandidate = pickFirstFiniteNumber(
+    [payload.progress_percent, payload.percent, progress.progress_percent, progress.percent],
+    null,
+  );
+
+  const hasCompleted = completedCandidate !== null;
+  const hasTotal = totalCandidate !== null;
+  const completed = hasCompleted ? Math.max(0, Math.floor(Number(completedCandidate))) : 0;
+  const total = hasTotal ? Math.max(0, Math.floor(Number(totalCandidate))) : 0;
+
+  let percent = null;
+  if (percentCandidate !== null) {
+    percent = clampPercent(percentCandidate);
+  } else if (hasTotal && total > 0) {
+    percent = clampPercent((completed / total) * 100);
+  }
+
+  return {
+    completed,
+    total,
+    percent: percent === null ? 0 : percent,
+    hasCompleted,
+    hasTotal,
+    hasPercent: percent !== null,
+    hasProgress: hasCompleted || hasTotal || percent !== null,
+  };
+}
+
+function isAnalysisQueueRunning(statusPayload, fallbackJobId = 0) {
+  const snapshot = getAnalysisQueueSnapshot(statusPayload, fallbackJobId);
+  const progress = getAnalysisQueueProgress(snapshot.payload);
+  const status = snapshot.status;
+
+  if (Boolean(snapshot.payload.running) || Boolean(snapshot.payload.queued)) {
+    return true;
+  }
+  if (
+    status === "queued"
+    || status === "running"
+    || status === "pending"
+    || status === "starting"
+    || status === "cancelling"
+    || status === "cancel_requested"
+  ) {
+    return true;
+  }
+  if (
+    status === "completed"
+    || status === "processed"
+    || status === "success"
+    || status === "succeeded"
+    || status === "completed_with_errors"
+    || status === "failed"
+    || status === "error"
+    || status === "cancelled"
+    || status === "canceled"
+    || status === "interrupted"
+    || status === "aborted"
+    || status === "idle"
+    || status === "skipped"
+    || status === "not_requested"
+  ) {
+    return false;
+  }
+  if (snapshot.queueAhead !== null && snapshot.queueAhead > 0) {
+    return true;
+  }
+  if (progress.hasTotal && progress.total > 0 && progress.completed < progress.total) {
+    return true;
+  }
+  return false;
+}
+
+function isAnalysisQueueErrorStatus(status) {
+  return (
+    status === "failed"
+    || status === "error"
+    || status === "cancelled"
+    || status === "canceled"
+    || status === "interrupted"
+    || status === "aborted"
+    || status === "completed_with_errors"
+  );
+}
+
+function analysisQueueStatusVerb(status, running) {
+  if (status === "queued" || status === "pending" || status === "starting") {
+    return "queued";
+  }
+  if (status === "running") {
+    return "running";
+  }
+  if (status === "cancelling" || status === "cancel_requested") {
+    return "cancelling";
+  }
+  if (
+    status === "completed"
+    || status === "processed"
+    || status === "success"
+    || status === "succeeded"
+  ) {
+    return "completed";
+  }
+  if (status === "completed_with_errors") {
+    return "completed with errors";
+  }
+  if (status === "failed" || status === "error") {
+    return "failed";
+  }
+  if (status === "cancelled" || status === "canceled") {
+    return "cancelled";
+  }
+  if (status === "interrupted" || status === "aborted") {
+    return "interrupted";
+  }
+  if (status === "idle") {
+    return running ? "running" : "completed";
+  }
+  return running ? "running" : "completed";
+}
+
+function analysisQueueStatusKind(statusPayload, fallbackJobId = 0) {
+  const snapshot = getAnalysisQueueSnapshot(statusPayload, fallbackJobId);
+  const running = isAnalysisQueueRunning(snapshot.payload, snapshot.jobId);
+  if (running) {
+    return "working";
+  }
+  if (isAnalysisQueueErrorStatus(snapshot.status)) {
+    return "error";
+  }
+  const failedCount = Math.max(
+    0,
+    Number(
+      pickFirstFiniteNumber(
+        [snapshot.payload.failed, snapshot.payload.error_count, snapshot.payload.errors],
+        0,
+      ),
+    ),
+  );
+  if (failedCount > 0) {
+    return "error";
+  }
+  return "ok";
+}
+
+function formatAnalysisQueueStatusMessage(category, statusPayload, options = {}) {
+  const normalizedCategory = normalizeAnalysisCategory(category);
+  const fallbackJobId = Math.max(0, Number(options?.jobId || 0));
+  const snapshot = getAnalysisQueueSnapshot(statusPayload, fallbackJobId);
+  const running = isAnalysisQueueRunning(snapshot.payload, snapshot.jobId);
+  const statusWord = analysisQueueStatusVerb(snapshot.status, running);
+  const progress = getAnalysisQueueProgress(snapshot.payload);
+  const currentFilename = String(snapshot.payload.current_filename || "").trim();
+  const payloadMessage = String(snapshot.payload.message || "").trim();
+  const parts = [`${analysisCategoryLabel(normalizedCategory)} analysis ${statusWord}.`];
+
+  if (snapshot.jobId > 0) {
+    parts.push(`Job #${snapshot.jobId}.`);
+  }
+  if (snapshot.queueAhead !== null) {
+    parts.push(`Queue ahead: ${snapshot.queueAhead}.`);
+  }
+  if (progress.hasProgress) {
+    const completedLabel = progress.hasCompleted ? String(progress.completed) : "?";
+    const totalLabel = progress.hasTotal ? String(progress.total) : "?";
+    const percentLabel = progress.hasPercent ? `${Math.round(progress.percent)}%` : "n/a";
+    parts.push(`Progress: ${completedLabel}/${totalLabel} (${percentLabel}).`);
+  }
+  if (currentFilename) {
+    parts.push(`Current: ${currentFilename}.`);
+  }
+  const analysisInfo = snapshot.payload.analysis && typeof snapshot.payload.analysis === "object"
+    ? snapshot.payload.analysis
+    : {};
+  const analysisModes = analysisModesLabelFromFlags(
+    Boolean(analysisInfo.face_people),
+    Boolean(analysisInfo.vehicles),
+  );
+  if (analysisModes) {
+    const sharedLabel = Boolean(analysisInfo.face_people) && Boolean(analysisInfo.vehicles)
+      ? " (shared job)"
+      : "";
+    parts.push(`Modes: ${analysisModes}${sharedLabel}.`);
+  }
+  if (payloadMessage) {
+    parts.push(payloadMessage);
+  }
+
+  return {
+    message: parts.join(" "),
+    kind: analysisQueueStatusKind(snapshot.payload, snapshot.jobId),
+    running,
+    jobId: snapshot.jobId,
+  };
+}
+
+function parseHttpStatusCode(error) {
+  const raw = formatError(error);
+  const match = /^\[(\d{3})\]/.exec(raw);
+  if (!match) {
+    return 0;
+  }
+  return Number(match[1] || 0);
+}
+
+function buildAnalysisQueueStatusUrl(caseId, category, jobId = 0) {
+  const normalizedCaseId = String(caseId || "").trim();
+  const normalizedCategory = normalizeAnalysisCategory(category);
+  const safeJobId = Math.max(0, Number(jobId || 0));
+  const params = new URLSearchParams();
+  params.set("case_id", normalizedCaseId);
+  params.set("category", normalizedCategory);
+  if (safeJobId > 0) {
+    params.set("job_id", String(Math.floor(safeJobId)));
+  }
+  return `/analysis/status?${params.toString()}`;
+}
+
+function stopAnalysisStatusPolling(category = null) {
+  if (!category) {
+    ANALYSIS_CATEGORIES.forEach((item) => {
+      stopAnalysisStatusPolling(item);
+    });
+    return;
+  }
+  const normalizedCategory = normalizeAnalysisCategory(category);
+  const pollState = analysisStatusPollStateByCategory[normalizedCategory];
+  if (!pollState) {
+    return;
+  }
+  pollState.token += 1;
+  pollState.caseId = "";
+  pollState.jobId = 0;
+}
+
+function renderAnalysisQueueStatus(category, caseId, statusPayload, options = {}) {
+  const normalizedCaseId = String(caseId || "").trim();
+  const normalizedCategory = normalizeAnalysisCategory(category);
+  if (!normalizedCaseId || state.activeCaseId !== normalizedCaseId) {
+    return { message: "", kind: "", running: false, jobId: 0 };
+  }
+
+  setAnalysisQueueStatusCache(normalizedCategory, normalizedCaseId, statusPayload);
+  updateAnalysisQueueSummaryButton(normalizedCategory, normalizedCaseId, statusPayload);
+
+  const formatted = formatAnalysisQueueStatusMessage(normalizedCategory, statusPayload, {
+    jobId: Math.max(0, Number(options?.jobId || 0)),
+  });
+  setCategoryAnalysisStatus(normalizedCategory, formatted.message, formatted.kind);
+  return formatted;
+}
+
+async function readAnalysisQueueStatus(caseId, category, options = {}) {
+  const normalizedCaseId = String(caseId || "").trim();
+  if (!normalizedCaseId) {
+    return null;
+  }
+  const normalizedCategory = normalizeAnalysisCategory(category);
+  const safeJobId = Math.max(0, Number(options?.jobId || 0));
+  return fetchJson(buildAnalysisQueueStatusUrl(normalizedCaseId, normalizedCategory, safeJobId));
+}
+
+async function syncAnalysisQueueStatus(caseId, category, options = {}) {
+  const normalizedCaseId = String(caseId || "").trim();
+  const normalizedCategory = normalizeAnalysisCategory(category);
+  if (!normalizedCaseId) {
+    setAnalysisQueueStatusCache(normalizedCategory, "", null);
+    updateAnalysisQueueSummaryButton(normalizedCategory, "", null);
+    return null;
+  }
+
+  let statusPayload = null;
+  try {
+    statusPayload = await readAnalysisQueueStatus(normalizedCaseId, normalizedCategory, {
+      jobId: Math.max(0, Number(options?.jobId || 0)),
+    });
+  } catch (error) {
+    const statusCode = parseHttpStatusCode(error);
+    if (statusCode === 404) {
+      setCategoryAnalysisStatus(
+        normalizedCategory,
+        `${analysisCategoryLabel(normalizedCategory)} analysis status endpoint unavailable: ${formatError(error)}`,
+        "error",
+      );
+    } else {
+      setCategoryAnalysisStatus(
+        normalizedCategory,
+        `Failed to load ${analysisCategoryLabel(normalizedCategory)} analysis queue status: ${formatError(error)}`,
+        "error",
+      );
+    }
+    setAnalysisQueueStatusCache(normalizedCategory, normalizedCaseId, null);
+    updateAnalysisQueueSummaryButton(normalizedCategory, normalizedCaseId, null);
+    stopAnalysisStatusPolling(normalizedCategory);
+    return null;
+  }
+
+  if (!statusPayload || typeof statusPayload !== "object") {
+    setAnalysisQueueStatusCache(normalizedCategory, normalizedCaseId, null);
+    updateAnalysisQueueSummaryButton(normalizedCategory, normalizedCaseId, null);
+    stopAnalysisStatusPolling(normalizedCategory);
+    return null;
+  }
+
+  const rendered = renderAnalysisQueueStatus(
+    normalizedCategory,
+    normalizedCaseId,
+    statusPayload,
+    { jobId: Math.max(0, Number(options?.jobId || 0)) },
+  );
+
+  if (rendered.running) {
+    startAnalysisStatusPolling(normalizedCaseId, normalizedCategory, { jobId: rendered.jobId });
+  } else {
+    stopAnalysisStatusPolling(normalizedCategory);
+  }
+  return statusPayload;
+}
+
+function startAnalysisStatusPolling(caseId, category, options = {}) {
+  const normalizedCaseId = String(caseId || "").trim();
+  if (!normalizedCaseId) {
+    return;
+  }
+  const normalizedCategory = normalizeAnalysisCategory(category);
+  const pollState = analysisStatusPollStateByCategory[normalizedCategory];
+  if (!pollState) {
+    return;
+  }
+
+  stopAnalysisStatusPolling(normalizedCategory);
+  pollState.caseId = normalizedCaseId;
+  pollState.jobId = Math.max(0, Number(options?.jobId || 0));
+  const pollToken = ++pollState.token;
+  let consecutiveFailures = 0;
+
+  const poll = async () => {
+    const latestState = analysisStatusPollStateByCategory[normalizedCategory];
+    if (pollToken !== latestState.token || latestState.caseId !== normalizedCaseId) {
+      return;
+    }
+    if (state.activeCaseId !== normalizedCaseId) {
+      stopAnalysisStatusPolling(normalizedCategory);
+      return;
+    }
+
+    let statusPayload = null;
+    try {
+      statusPayload = await readAnalysisQueueStatus(normalizedCaseId, normalizedCategory, {
+        jobId: latestState.jobId,
+      });
+      consecutiveFailures = 0;
+    } catch (error) {
+      const statusCode = parseHttpStatusCode(error);
+      if (statusCode === 404) {
+        setCategoryAnalysisStatus(
+          normalizedCategory,
+          `${analysisCategoryLabel(normalizedCategory)} analysis status endpoint unavailable: ${formatError(error)}`,
+          "error",
+        );
+        if (pollToken === latestState.token && latestState.caseId === normalizedCaseId) {
+          stopAnalysisStatusPolling(normalizedCategory);
+        }
+        return;
+      }
+      consecutiveFailures += 1;
+      if (consecutiveFailures >= 4) {
+        setCategoryAnalysisStatus(
+          normalizedCategory,
+          `${analysisCategoryLabel(normalizedCategory)} analysis status polling failed: ${formatError(error)}`,
+          "error",
+        );
+        if (pollToken === latestState.token && latestState.caseId === normalizedCaseId) {
+          stopAnalysisStatusPolling(normalizedCategory);
+        }
+        return;
+      }
+      window.setTimeout(poll, 1800);
+      return;
+    }
+
+    if (pollToken !== latestState.token || latestState.caseId !== normalizedCaseId) {
+      return;
+    }
+    if (!statusPayload || typeof statusPayload !== "object") {
+      window.setTimeout(poll, 1600);
+      return;
+    }
+
+    const rendered = renderAnalysisQueueStatus(
+      normalizedCategory,
+      normalizedCaseId,
+      statusPayload,
+      { jobId: latestState.jobId },
+    );
+    if (rendered.jobId > 0) {
+      latestState.jobId = rendered.jobId;
+    }
+    if (rendered.running) {
+      window.setTimeout(poll, 1300);
+      return;
+    }
+
+    if (state.activeCaseId === normalizedCaseId) {
+      try {
+        await refreshVideos(normalizedCaseId);
+      } catch (error) {
+        console.warn(`Refresh after analysis queue status failed: ${formatError(error)}`);
+      }
+    }
+    if (pollToken === latestState.token && latestState.caseId === normalizedCaseId) {
+      stopAnalysisStatusPolling(normalizedCategory);
+    }
+  };
+
+  void poll();
 }
 
 async function stopBackgroundIndexFromProgress() {
@@ -1174,6 +2305,1099 @@ function setCaseUrl(caseId) {
   history.replaceState({}, "", url);
 }
 
+function queueJobKindLabel(jobKind, processItem = null) {
+  const kind = String(jobKind || "").trim().toLowerCase();
+  if (kind === "semantic_index") {
+    return "Semantic Index";
+  }
+  if (kind === "triage_timeline") {
+    return "Triage Timeline";
+  }
+  if (kind === "analysis") {
+    const metadata = processItem && typeof processItem.metadata === "object" ? processItem.metadata : {};
+    const facePeople = Boolean(metadata.analysis_face_people);
+    const vehicles = Boolean(metadata.analysis_vehicles);
+    if (facePeople && vehicles) {
+      return "Analysis (Face & People + Vehicles)";
+    }
+    if (facePeople) {
+      return "Analysis (Face & People)";
+    }
+    if (vehicles) {
+      return "Analysis (Vehicles)";
+    }
+    return "Analysis";
+  }
+  if (!kind) {
+    return "Queue Job";
+  }
+  return kind;
+}
+
+function analysisModesLabelFromFlags(facePeople, vehicles) {
+  const hasFacePeople = Boolean(facePeople);
+  const hasVehicles = Boolean(vehicles);
+  if (hasFacePeople && hasVehicles) {
+    return "Face & People + Vehicles";
+  }
+  if (hasFacePeople) {
+    return "Face & People";
+  }
+  if (hasVehicles) {
+    return "Vehicles";
+  }
+  return "";
+}
+
+function queueTaskFilenames(item) {
+  const fullList = Array.isArray(item?.filenames)
+    ? item.filenames
+        .map((value) => String(value || "").trim())
+        .filter((value) => value.length > 0)
+    : [];
+  const fallbackPreview = Array.isArray(item?.filenames_preview)
+    ? item.filenames_preview
+        .map((value) => String(value || "").trim())
+        .filter((value) => value.length > 0)
+    : [];
+
+  const source = fullList.length ? fullList : fallbackPreview;
+  const deduped = [];
+  const seen = new Set();
+  source.forEach((name) => {
+    if (!name || seen.has(name)) {
+      return;
+    }
+    seen.add(name);
+    deduped.push(name);
+  });
+
+  const currentFilename = String(item?.current_filename || "").trim();
+  if (currentFilename && !seen.has(currentFilename)) {
+    deduped.unshift(currentFilename);
+  }
+  return deduped;
+}
+
+function queueTaskStageNameFromItem(item) {
+  const type = String(item?.type || "").trim().toLowerCase();
+  if (type === "background_index") {
+    return "base_index";
+  }
+  const kind = String(item?.job_kind || "").trim().toLowerCase();
+  if (kind === "semantic_index") {
+    return "base_index";
+  }
+  if (kind === "analysis") {
+    return "analysis";
+  }
+  if (kind === "triage_timeline") {
+    return "triage";
+  }
+  return "";
+}
+
+function queueTaskProgressFromStageStatus(status, fallbackPercent = 0) {
+  const normalized = String(status || "").trim().toLowerCase();
+  if (normalized === "completed" || normalized === "skipped") {
+    return 100;
+  }
+  if (normalized === "failed" || normalized === "interrupted") {
+    return 100;
+  }
+  if (normalized === "running") {
+    const numeric = Number(fallbackPercent);
+    if (Number.isFinite(numeric) && numeric > 0) {
+      return clampPercent(numeric);
+    }
+    return 50;
+  }
+  return 0;
+}
+
+function normalizeStringList(value) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  const output = [];
+  const seen = new Set();
+  value.forEach((item) => {
+    const safe = String(item || "").trim();
+    if (!safe || seen.has(safe)) {
+      return;
+    }
+    seen.add(safe);
+    output.push(safe);
+  });
+  return output;
+}
+
+function queueTaskAnalysisModesForFilename(item, filename) {
+  const metadata = item?.metadata && typeof item.metadata === "object" ? item.metadata : {};
+  const facePeopleSet = new Set(normalizeStringList(metadata.analysis_face_people_filenames));
+  const vehiclesSet = new Set(normalizeStringList(metadata.analysis_vehicles_filenames));
+  const hasPerFileLists = facePeopleSet.size > 0 || vehiclesSet.size > 0;
+  const hasFacePeople = Boolean(metadata.analysis_face_people);
+  const hasVehicles = Boolean(metadata.analysis_vehicles);
+
+  if (hasPerFileLists) {
+    const includeFacePeople = facePeopleSet.has(filename);
+    const includeVehicles = vehiclesSet.has(filename);
+    const modes = [];
+    if (includeFacePeople) {
+      modes.push({ label: "Face & People", key: "face_people" });
+    }
+    if (includeVehicles) {
+      modes.push({ label: "Vehicles", key: "vehicles" });
+    }
+    if (modes.length) {
+      return modes;
+    }
+    // Unknown membership for this filename even though lists exist; keep one row.
+    return [{ label: "Analysis", key: "analysis" }];
+  }
+
+  // No per-file mapping available; keep one row per file to avoid false duplication.
+  if (hasFacePeople && hasVehicles) {
+    return [{ label: "Face & People + Vehicles", key: "both" }];
+  }
+  if (hasFacePeople) {
+    return [{ label: "Face & People", key: "face_people" }];
+  }
+  if (hasVehicles) {
+    return [{ label: "Vehicles", key: "vehicles" }];
+  }
+
+  return [{ label: "", key: "" }];
+}
+
+function expandQueueRowsByAnalysisModes(item, rows) {
+  const safeRows = Array.isArray(rows) ? rows : [];
+  const jobKind = String(item?.job_kind || "").trim().toLowerCase();
+  if (jobKind !== "analysis") {
+    return safeRows;
+  }
+
+  const expanded = [];
+  safeRows.forEach((row) => {
+    if (!row || typeof row !== "object") {
+      return;
+    }
+    const filename = String(row.filename || "").trim();
+    if (!filename) {
+      expanded.push(row);
+      return;
+    }
+    const modes = queueTaskAnalysisModesForFilename(item, filename);
+    modes.forEach((mode) => {
+      expanded.push({
+        ...row,
+        analysisModeLabel: String(mode?.label || ""),
+        analysisModeKey: String(mode?.key || ""),
+      });
+    });
+  });
+  return expanded;
+}
+
+function queueTaskStageStatusLabel(status) {
+  const normalized = String(status || "").trim().toLowerCase();
+  if (!normalized) {
+    return "pending";
+  }
+  return normalized.replaceAll("_", " ");
+}
+
+function normalizeQueueTaskRecoveryCategory(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (normalized === "vehicles") {
+    return "vehicles";
+  }
+  if (normalized === "face_people") {
+    return "face_people";
+  }
+  return "";
+}
+
+function isQueueTaskRecoveryAvailable(item) {
+  const status = String(item?.status || "").trim().toLowerCase();
+  if (status !== "interrupted") {
+    return false;
+  }
+  const category = normalizeQueueTaskRecoveryCategory(item?.recovery_category);
+  if (!category) {
+    return false;
+  }
+  const filenames = queueTaskFilenames(item);
+  return filenames.length > 0;
+}
+
+function queueTaskPopupSetRecoveryStatus(message, kind = "") {
+  if (!queueTaskPopupRecoveryStatus) {
+    return;
+  }
+  queueTaskPopupRecoveryStatus.textContent = String(message || "");
+  queueTaskPopupRecoveryStatus.className = `status ${kind}`.trim();
+}
+
+function queueTaskPopupResetRecovery() {
+  queueTaskPopupRecoveryContext = null;
+  if (queueTaskPopupRecovery) {
+    queueTaskPopupRecovery.setAttribute("hidden", "");
+  }
+  if (queueTaskPopupSelectAll) {
+    queueTaskPopupSelectAll.checked = false;
+    queueTaskPopupSelectAll.indeterminate = false;
+  }
+  if (queueTaskPopupSelectionMeta) {
+    queueTaskPopupSelectionMeta.textContent = "0 selected";
+  }
+  queueTaskPopupSetRecoveryStatus("", "");
+}
+
+function queueTaskPopupUpdateRecoverySelectionMeta() {
+  if (!queueTaskPopupSelectionMeta || !queueTaskPopupSelectAll) {
+    return;
+  }
+  const context = queueTaskPopupRecoveryContext;
+  if (!context || !Array.isArray(context.filenames)) {
+    queueTaskPopupSelectionMeta.textContent = "0 selected";
+    queueTaskPopupSelectAll.checked = false;
+    queueTaskPopupSelectAll.indeterminate = false;
+    return;
+  }
+  const total = context.filenames.length;
+  const selectedCount = context.selected instanceof Set ? context.selected.size : 0;
+  queueTaskPopupSelectionMeta.textContent = `${selectedCount} selected`;
+  queueTaskPopupSelectAll.checked = total > 0 && selectedCount === total;
+  queueTaskPopupSelectAll.indeterminate = selectedCount > 0 && selectedCount < total;
+}
+
+function queueTaskPopupConfigureRecovery(item, rows) {
+  queueTaskPopupResetRecovery();
+  if (!queueTaskPopupRecovery || !isQueueTaskRecoveryAvailable(item)) {
+    return;
+  }
+  const category = normalizeQueueTaskRecoveryCategory(item?.recovery_category);
+  if (!category) {
+    return;
+  }
+  const uniqueFilenames = [];
+  const seen = new Set();
+  (Array.isArray(rows) ? rows : []).forEach((row) => {
+    const safe = String(row?.filename || "").trim();
+    if (!safe || seen.has(safe)) {
+      return;
+    }
+    seen.add(safe);
+    uniqueFilenames.push(safe);
+  });
+  if (!uniqueFilenames.length) {
+    return;
+  }
+
+  queueTaskPopupRecoveryContext = {
+    caseId: String(item?.case_id || "").trim(),
+    category,
+    jobId: Math.max(0, Number(item?.queue_job_id || 0)),
+    filenames: uniqueFilenames,
+    selected: new Set(uniqueFilenames),
+  };
+  queueTaskPopupRecovery.removeAttribute("hidden");
+  queueTaskPopupUpdateRecoverySelectionMeta();
+  queueTaskPopupSetRecoveryStatus(
+    `Interrupted ${analysisCategoryLabel(category)} analysis: select files to restart or cancel.`,
+    "working",
+  );
+}
+
+function queueTaskProgressRowsFromItem(item) {
+  const rawRows = Array.isArray(item?.file_progress) ? item.file_progress : [];
+  if (!rawRows.length) {
+    return [];
+  }
+
+  const output = [];
+  rawRows.forEach((rawRow) => {
+    if (!rawRow || typeof rawRow !== "object") {
+      return;
+    }
+    const filename = String(rawRow.filename || "").trim();
+    if (!filename) {
+      return;
+    }
+    const status = String(rawRow.status || "").trim().toLowerCase();
+    const processedFrames = Math.max(0, Number(rawRow.processed_frames || 0));
+    const estimatedTotalFrames = Math.max(0, Number(rawRow.estimated_total_frames || 0));
+    let progressPercent = Number(rawRow.progress_percent);
+    if (!Number.isFinite(progressPercent)) {
+      if (estimatedTotalFrames > 0) {
+        progressPercent = (processedFrames / estimatedTotalFrames) * 100;
+      } else {
+        progressPercent = queueTaskProgressFromStageStatus(status, 0);
+      }
+    }
+    progressPercent = clampPercent(progressPercent);
+
+    let meta = `${Math.round(progressPercent)}%`;
+    if (processedFrames > 0 || estimatedTotalFrames > 0) {
+      const totalLabel = estimatedTotalFrames > 0 ? String(estimatedTotalFrames) : "?";
+      meta += ` | frames: ${processedFrames}/${totalLabel}`;
+    }
+    if (Boolean(rawRow.is_current)) {
+      meta += " | active";
+    }
+
+    output.push({
+      filename,
+      status: queueTaskStageStatusLabel(status),
+      progressPercent,
+      meta,
+      analysisModeLabel: "",
+      analysisModeKey: "",
+    });
+  });
+
+  return expandQueueRowsByAnalysisModes(item, output);
+}
+
+function buildPipelineSnapshotMap(pipelinePayload) {
+  const snapshots = Array.isArray(pipelinePayload?.pipelines) ? pipelinePayload.pipelines : [];
+  const byFilename = new Map();
+  snapshots.forEach((snapshot) => {
+    if (!snapshot || typeof snapshot !== "object") {
+      return;
+    }
+    const filename = String(snapshot.filename || "").trim();
+    if (!filename) {
+      return;
+    }
+    byFilename.set(filename, snapshot);
+  });
+  return byFilename;
+}
+
+function buildQueueTaskProgressRows(item, pipelinePayload) {
+  const directRows = queueTaskProgressRowsFromItem(item);
+  if (directRows.length) {
+    return directRows;
+  }
+
+  const filenames = queueTaskFilenames(item);
+  const byFilename = buildPipelineSnapshotMap(pipelinePayload);
+  const stageName = queueTaskStageNameFromItem(item);
+  const fallbackStatus = String(item?.status || "").trim().toLowerCase();
+  const currentFilename = String(item?.current_filename || "").trim();
+  const currentPercent = Number(item?.current_video_progress_percent || 0);
+  const currentProcessedFrames = Math.max(0, Number(item?.current_video_processed_frames || 0));
+  const currentTotalFrames = Math.max(0, Number(item?.current_video_total_frames || 0));
+
+  const rows = filenames.map((filename) => {
+    const snapshot = byFilename.get(filename);
+    const stage = (
+      snapshot
+      && snapshot.stages
+      && typeof snapshot.stages === "object"
+      && stageName
+      && snapshot.stages[stageName]
+      && typeof snapshot.stages[stageName] === "object"
+    )
+      ? snapshot.stages[stageName]
+      : null;
+
+    let status = stage ? String(stage.status || "").trim().toLowerCase() : "";
+    if (!status) {
+      status = fallbackStatus || "pending";
+    }
+
+    const isCurrent = currentFilename && filename === currentFilename;
+    const details = stage && stage.details && typeof stage.details === "object" ? stage.details : {};
+    let processedFrames = Math.max(0, Number(details.processed_frames || 0));
+    let estimatedTotalFrames = Math.max(0, Number(details.estimated_total_frames || 0));
+    if (isCurrent) {
+      processedFrames = Math.max(processedFrames, currentProcessedFrames);
+      estimatedTotalFrames = Math.max(estimatedTotalFrames, currentTotalFrames);
+    }
+    if (estimatedTotalFrames > 0 && estimatedTotalFrames < processedFrames) {
+      estimatedTotalFrames = processedFrames;
+    }
+
+    let progressPercent = Number(details.progress_percent);
+    if (estimatedTotalFrames > 0) {
+      progressPercent = (processedFrames / estimatedTotalFrames) * 100;
+    } else if (!Number.isFinite(progressPercent)) {
+      progressPercent = queueTaskProgressFromStageStatus(status, isCurrent ? currentPercent : 0);
+    }
+    progressPercent = clampPercent(progressPercent);
+
+    let meta = `${Math.round(progressPercent)}%`;
+    if (isCurrent && Number.isFinite(currentPercent) && currentPercent > 0) {
+      meta = `${Math.round(clampPercent(currentPercent))}%`;
+    }
+    if (processedFrames > 0 || estimatedTotalFrames > 0) {
+      const totalLabel = estimatedTotalFrames > 0 ? String(estimatedTotalFrames) : "?";
+      meta += ` | frames: ${processedFrames}/${totalLabel}`;
+    }
+    if (isCurrent) {
+      meta += " | active";
+    }
+    return {
+      filename,
+      status: queueTaskStageStatusLabel(status),
+      progressPercent,
+      meta,
+      analysisModeLabel: "",
+      analysisModeKey: "",
+    };
+  });
+  return expandQueueRowsByAnalysisModes(item, rows);
+}
+
+function renderQueueTaskProgressRows(rows, options = {}) {
+  if (!queueTaskPopupFiles) {
+    return;
+  }
+  queueTaskPopupFiles.innerHTML = "";
+
+  const list = Array.isArray(rows) ? rows : [];
+  if (!list.length) {
+    const li = document.createElement("li");
+    li.className = "queue-task-file-row";
+    const text = document.createElement("div");
+    text.className = "queue-task-file-name";
+    text.textContent = options.emptyMessage || "No file list reported yet.";
+    li.appendChild(text);
+    queueTaskPopupFiles.appendChild(li);
+    return;
+  }
+
+  list.forEach((rowData) => {
+    const li = document.createElement("li");
+    li.className = "queue-task-file-row";
+
+    const head = document.createElement("div");
+    head.className = "queue-task-file-head";
+
+    const name = document.createElement("div");
+    name.className = "queue-task-file-name";
+    name.textContent = String(rowData.filename || "");
+
+    const status = document.createElement("div");
+    status.className = "queue-task-file-status";
+    status.textContent = String(rowData.status || "pending");
+
+    const right = document.createElement("div");
+    right.className = "queue-task-file-right";
+    if (rowData.analysisModeLabel) {
+      const mode = document.createElement("div");
+      mode.className = "queue-task-file-mode";
+      mode.classList.add(`mode-${String(rowData.analysisModeKey || "shared")}`);
+      mode.textContent = String(rowData.analysisModeLabel);
+      right.appendChild(mode);
+    }
+    right.appendChild(status);
+
+    const selectable = Boolean(options.selectable);
+    if (selectable) {
+      const left = document.createElement("div");
+      left.className = "queue-task-file-left";
+      const checkbox = document.createElement("input");
+      checkbox.type = "checkbox";
+      checkbox.className = "queue-task-file-select";
+      checkbox.dataset.filename = String(rowData.filename || "");
+      const selectedSet = options.selected instanceof Set ? options.selected : new Set();
+      checkbox.checked = selectedSet.has(String(rowData.filename || ""));
+      checkbox.addEventListener("change", () => {
+        if (typeof options.onToggle === "function") {
+          options.onToggle(String(rowData.filename || ""), Boolean(checkbox.checked));
+        }
+      });
+      left.appendChild(checkbox);
+      left.appendChild(name);
+      head.appendChild(left);
+    } else {
+      head.appendChild(name);
+    }
+    head.appendChild(right);
+
+    const track = document.createElement("div");
+    track.className = "queue-task-file-track";
+
+    const bar = document.createElement("div");
+    bar.className = "queue-task-file-bar";
+    const safePercent = clampPercent(rowData.progressPercent || 0);
+    bar.style.width = `${safePercent.toFixed(1)}%`;
+    track.appendChild(bar);
+
+    const meta = document.createElement("div");
+    meta.className = "queue-task-file-meta";
+    meta.textContent = String(rowData.meta || `${Math.round(safePercent)}%`);
+
+    li.appendChild(head);
+    li.appendChild(track);
+    li.appendChild(meta);
+    queueTaskPopupFiles.appendChild(li);
+  });
+}
+
+async function loadQueueTaskProgressRows(item) {
+  const directRows = queueTaskProgressRowsFromItem(item);
+  if (directRows.length) {
+    return directRows;
+  }
+
+  const caseId = String(item?.case_id || "").trim();
+  const filenames = queueTaskFilenames(item);
+  if (!caseId || !filenames.length) {
+    return buildQueueTaskProgressRows(item, { pipelines: [] });
+  }
+  const pipelinePayload = await fetchJson(withCaseQuery("/pipeline/status", caseId));
+  return buildQueueTaskProgressRows(item, pipelinePayload);
+}
+
+function closeQueueTaskPopup() {
+  if (!queueTaskPopup) {
+    return;
+  }
+  queueTaskPopupLoadToken += 1;
+  queueTaskPopup.classList.remove("open");
+  queueTaskPopup.setAttribute("hidden", "");
+  queueTaskPopupResetRecovery();
+}
+
+function openQueueTaskPopup(item) {
+  if (!queueTaskPopup || !queueTaskPopupTitle || !queueTaskPopupMeta || !queueTaskPopupFiles) {
+    return;
+  }
+
+  const type = String(item?.type || "").trim();
+  const status = String(item?.status || "").trim() || "unknown";
+  const caseId = String(item?.case_id || "").trim() || "n/a";
+  const recoveryEnabled = isQueueTaskRecoveryAvailable(item);
+  queueTaskPopupResetRecovery();
+
+  if (type === "background_index") {
+    queueTaskPopupTitle.textContent = "Background Index Worker";
+    const completed = Math.max(0, Number(item?.completed || 0));
+    const total = Math.max(0, Number(item?.total || 0));
+    const progressPercent = Number(item?.progress_percent || 0);
+    queueTaskPopupMeta.textContent =
+      `case: ${caseId} | status: ${status} | progress: ${completed}/${total} (${Number.isFinite(progressPercent) ? progressPercent.toFixed(1) : "0.0"}%)`;
+  } else if (type === "analysis_interrupted") {
+    const queueJobId = Math.max(0, Number(item?.queue_job_id || 0));
+    const categoryLabel = analysisCategoryLabel(item?.recovery_category);
+    queueTaskPopupTitle.textContent = queueJobId > 0
+      ? `Interrupted ${categoryLabel} Analysis #${queueJobId}`
+      : `Interrupted ${categoryLabel} Analysis`;
+    const filesCount = Math.max(0, Number(item?.filenames_count || 0));
+    const interruptedMessage = String(item?.message || "").trim();
+    queueTaskPopupMeta.textContent =
+      `case: ${caseId} | status: interrupted | files: ${filesCount}${interruptedMessage ? ` | ${interruptedMessage}` : ""}`;
+  } else {
+    const queueJobId = Math.max(0, Number(item?.queue_job_id || 0));
+    const jobKindLabel = queueJobKindLabel(item?.job_kind, item);
+    queueTaskPopupTitle.textContent = queueJobId > 0 ? `${jobKindLabel} #${queueJobId}` : jobKindLabel;
+
+    const queuePosition = Math.max(0, Number(item?.queue_position || 0));
+    const priority = Math.max(0, Number(item?.priority || 0));
+    const attempts = Math.max(0, Number(item?.attempt_count || 0));
+    const filesCount = Math.max(0, Number(item?.filenames_count || 0));
+    const metadata = item?.metadata && typeof item.metadata === "object" ? item.metadata : {};
+    const analysisModes = analysisModesLabelFromFlags(
+      Boolean(metadata.analysis_face_people),
+      Boolean(metadata.analysis_vehicles),
+    );
+    const analysisModePart = analysisModes ? ` | modes: ${analysisModes}` : "";
+    queueTaskPopupMeta.textContent =
+      `case: ${caseId} | status: ${status} | queue ahead: ${queuePosition} | priority: ${priority} | files: ${filesCount} | attempts: ${attempts}${analysisModePart}`;
+  }
+
+  const filenames = queueTaskFilenames(item);
+  renderQueueTaskProgressRows(
+    filenames.map((filename) => ({
+      filename,
+      status: "loading",
+      progressPercent: 0,
+      meta: "Loading per-file progress...",
+    })),
+    {
+      emptyMessage: "No file list reported yet.",
+      selectable: recoveryEnabled,
+      selected: queueTaskPopupRecoveryContext?.selected || new Set(),
+      onToggle: (filename, checked) => {
+        const context = queueTaskPopupRecoveryContext;
+        if (!context || !(context.selected instanceof Set)) {
+          return;
+        }
+        if (checked) {
+          context.selected.add(filename);
+        } else {
+          context.selected.delete(filename);
+        }
+        queueTaskPopupUpdateRecoverySelectionMeta();
+      },
+    },
+  );
+
+  queueTaskPopup.removeAttribute("hidden");
+  queueTaskPopup.classList.add("open");
+
+  const loadToken = ++queueTaskPopupLoadToken;
+  void loadQueueTaskProgressRows(item)
+    .then((rows) => {
+      if (
+        loadToken !== queueTaskPopupLoadToken
+        || !queueTaskPopup
+        || queueTaskPopup.hasAttribute("hidden")
+      ) {
+        return;
+      }
+      if (recoveryEnabled) {
+        queueTaskPopupConfigureRecovery(item, rows);
+      }
+      renderQueueTaskProgressRows(rows, {
+        emptyMessage: "No file list reported yet.",
+        selectable: recoveryEnabled,
+        selected: queueTaskPopupRecoveryContext?.selected || new Set(),
+        onToggle: (filename, checked) => {
+          const context = queueTaskPopupRecoveryContext;
+          if (!context || !(context.selected instanceof Set)) {
+            return;
+          }
+          if (checked) {
+            context.selected.add(filename);
+          } else {
+            context.selected.delete(filename);
+          }
+          queueTaskPopupUpdateRecoverySelectionMeta();
+        },
+      });
+    })
+    .catch((error) => {
+      if (
+        loadToken !== queueTaskPopupLoadToken
+        || !queueTaskPopup
+        || queueTaskPopup.hasAttribute("hidden")
+      ) {
+        return;
+      }
+      if (recoveryEnabled) {
+        queueTaskPopupConfigureRecovery(item, filenames.map((filename) => ({ filename })));
+      }
+      renderQueueTaskProgressRows([], {
+        emptyMessage: `Unable to load per-file progress: ${formatError(error)}`,
+        selectable: recoveryEnabled,
+        selected: queueTaskPopupRecoveryContext?.selected || new Set(),
+        onToggle: (filename, checked) => {
+          const context = queueTaskPopupRecoveryContext;
+          if (!context || !(context.selected instanceof Set)) {
+            return;
+          }
+          if (checked) {
+            context.selected.add(filename);
+          } else {
+            context.selected.delete(filename);
+          }
+          queueTaskPopupUpdateRecoverySelectionMeta();
+        },
+      });
+    });
+}
+
+async function listInterruptedAnalysisQueueItems(caseId) {
+  const normalizedCaseId = String(caseId || "").trim();
+  if (!normalizedCaseId) {
+    return [];
+  }
+
+  const output = [];
+  for (const category of ANALYSIS_CATEGORIES) {
+    const normalizedCategory = normalizeAnalysisCategory(category);
+    let payload = null;
+    try {
+      payload = await readAnalysisQueueStatus(normalizedCaseId, normalizedCategory);
+    } catch (error) {
+      console.warn(
+        `Interrupted analysis status lookup failed for ${normalizedCategory}: ${formatError(error)}`,
+      );
+      continue;
+    }
+    if (!payload || typeof payload !== "object") {
+      continue;
+    }
+
+    const status = String(payload.status || payload?.queue?.status || "").trim().toLowerCase();
+    const filenames = activeCaseFilenamesFromPayload(payload);
+    if (status !== "interrupted" || !filenames.length) {
+      continue;
+    }
+    const queue = payload.queue && typeof payload.queue === "object" ? payload.queue : {};
+    const analysis = payload.analysis && typeof payload.analysis === "object" ? payload.analysis : {};
+    const facePeopleFilenames = Array.isArray(payload.analysis_face_people_filenames)
+      ? payload.analysis_face_people_filenames
+      : [];
+    const vehiclesFilenames = Array.isArray(payload.analysis_vehicles_filenames)
+      ? payload.analysis_vehicles_filenames
+      : [];
+    output.push({
+      type: "analysis_interrupted",
+      case_id: normalizedCaseId,
+      status: "interrupted",
+      queue_job_id: Number(queue.job_id || 0),
+      job_kind: "analysis",
+      queue_position: Number(queue.position_ahead || 0),
+      priority: Number(queue.priority || 0),
+      attempt_count: Number(queue.attempt_count || 0),
+      filenames,
+      filenames_count: filenames.length,
+      metadata: {
+        analysis_face_people: Boolean(analysis.face_people),
+        analysis_vehicles: Boolean(analysis.vehicles),
+        analysis_face_people_filenames: facePeopleFilenames,
+        analysis_vehicles_filenames: vehiclesFilenames,
+      },
+      file_progress: Array.isArray(payload.file_progress) ? payload.file_progress : [],
+      recovery_category: normalizedCategory,
+      message: String(payload.message || ""),
+    });
+  }
+  return output;
+}
+
+function renderReportQueueList(processesPayload) {
+  if (!reportQueueList) {
+    return;
+  }
+  reportQueueList.innerHTML = "";
+
+  const processItems = Array.isArray(processesPayload?.processes) ? processesPayload.processes : [];
+  if (!processItems.length) {
+    const empty = document.createElement("div");
+    empty.className = "empty";
+    empty.textContent = "No active background tasks.";
+    reportQueueList.appendChild(empty);
+    return;
+  }
+
+  processItems.forEach((item) => {
+    const row = document.createElement("div");
+    row.className = "report-queue-item";
+    row.classList.add("clickable");
+    row.tabIndex = 0;
+    row.setAttribute("role", "button");
+    row.setAttribute("aria-label", "Open queue task details");
+
+    const head = document.createElement("div");
+    head.className = "report-queue-item-head";
+
+    const title = document.createElement("div");
+    title.className = "report-queue-title";
+
+    const badge = document.createElement("span");
+    badge.className = "report-queue-badge";
+
+    const type = String(item?.type || "").trim();
+    const caseId = String(item?.case_id || "").trim() || "n/a";
+    const status = String(item?.status || "").trim() || "unknown";
+
+    if (type === "background_index") {
+      title.textContent = "Background Index Worker";
+      badge.textContent = status;
+      const completed = Math.max(0, Number(item?.completed || 0));
+      const total = Math.max(0, Number(item?.total || 0));
+      const progress = Number(item?.progress_percent || 0);
+      const meta = document.createElement("div");
+      meta.className = "report-queue-meta";
+      const filename = String(item?.current_filename || "").trim();
+      const filePart = filename ? ` | file: ${filename}` : "";
+      meta.textContent =
+        `case: ${caseId} | progress: ${completed}/${total} (${Number.isFinite(progress) ? progress.toFixed(1) : "0.0"}%)${filePart}`;
+      row.appendChild(meta);
+    } else if (type === "analysis_interrupted") {
+      const queueJobId = Math.max(0, Number(item?.queue_job_id || 0));
+      const categoryLabel = analysisCategoryLabel(item?.recovery_category);
+      title.textContent = queueJobId > 0
+        ? `Interrupted ${categoryLabel} Analysis #${queueJobId}`
+        : `Interrupted ${categoryLabel} Analysis`;
+      badge.textContent = "interrupted";
+      const filesCount = Math.max(0, Number(item?.filenames_count || 0));
+      const interruptedMessage = String(item?.message || "").trim();
+      const meta = document.createElement("div");
+      meta.className = "report-queue-meta";
+      meta.textContent =
+        `case: ${caseId} | files: ${filesCount}${interruptedMessage ? ` | ${interruptedMessage}` : ""}`;
+      row.appendChild(meta);
+    } else {
+      const queueJobId = Math.max(0, Number(item?.queue_job_id || 0));
+      const jobKind = queueJobKindLabel(item?.job_kind, item);
+      title.textContent = queueJobId > 0 ? `${jobKind} #${queueJobId}` : jobKind;
+      badge.textContent = status;
+      const queuePosition = Math.max(0, Number(item?.queue_position || 0));
+      const priority = Math.max(0, Number(item?.priority || 0));
+      const attempts = Math.max(0, Number(item?.attempt_count || 0));
+      const filesCount = Math.max(0, Number(item?.filenames_count || 0));
+      const preview = Array.isArray(item?.filenames_preview)
+        ? item.filenames_preview
+            .map((value) => String(value || "").trim())
+            .filter((value) => value.length > 0)
+        : [];
+      const previewSuffix = preview.length ? ` | sample: ${preview.join(", ")}` : "";
+      const meta = document.createElement("div");
+      meta.className = "report-queue-meta";
+      const metadata = item?.metadata && typeof item.metadata === "object" ? item.metadata : {};
+      const analysisModes = analysisModesLabelFromFlags(
+        Boolean(metadata.analysis_face_people),
+        Boolean(metadata.analysis_vehicles),
+      );
+      const analysisModePart = analysisModes ? ` | modes: ${analysisModes}` : "";
+      meta.textContent =
+        `case: ${caseId} | queue ahead: ${queuePosition} | priority: ${priority} | files: ${filesCount} | attempts: ${attempts}${analysisModePart}${previewSuffix}`;
+      row.appendChild(meta);
+    }
+
+    head.appendChild(title);
+    head.appendChild(badge);
+    row.prepend(head);
+
+    const openDetails = () => {
+      openQueueTaskPopup(item);
+    };
+    row.addEventListener("click", openDetails);
+    row.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        openDetails();
+      }
+    });
+
+    reportQueueList.appendChild(row);
+  });
+}
+
+function dedupeReportQueueItems(processItems) {
+  const items = Array.isArray(processItems) ? processItems : [];
+  if (!items.length) {
+    return [];
+  }
+
+  const semanticQueueCaseIds = new Set(
+    items
+      .filter((item) => {
+        const type = String(item?.type || "").trim().toLowerCase();
+        const kind = String(item?.job_kind || "").trim().toLowerCase();
+        return type === "queue_job" && kind === "semantic_index";
+      })
+      .map((item) => String(item?.case_id || "").trim())
+      .filter((caseId) => caseId.length > 0),
+  );
+
+  if (!semanticQueueCaseIds.size) {
+    return items;
+  }
+
+  return items.filter((item) => {
+    const type = String(item?.type || "").trim().toLowerCase();
+    if (type !== "background_index") {
+      return true;
+    }
+    const caseId = String(item?.case_id || "").trim();
+    if (!caseId) {
+      return true;
+    }
+    // A semantic queue job card already carries the same runtime progress context.
+    return !semanticQueueCaseIds.has(caseId);
+  });
+}
+
+async function refreshReportQueue(options = {}) {
+  const silent = Boolean(options?.silent);
+  if (!reportQueueList) {
+    return;
+  }
+
+  if (!silent) {
+    setReportQueueStatus("Loading queue status...", "working");
+  }
+
+  const payload = await fetchJson("/processes");
+  const processItemsRaw = Array.isArray(payload?.processes) ? payload.processes : [];
+  const processItems = dedupeReportQueueItems(processItemsRaw);
+  let interruptedItems = [];
+  const activeCaseId = String(state.activeCaseId || "").trim();
+  if (activeCaseId) {
+    interruptedItems = await listInterruptedAnalysisQueueItems(activeCaseId);
+  }
+  const mergedItems = [...processItems, ...interruptedItems];
+  const count = mergedItems.length;
+  renderReportQueueList({
+    ...payload,
+    count,
+    processes: mergedItems,
+  });
+  setReportQueueStatus(
+    count > 0 ? `${count} active/recovery background task(s).` : "No active background tasks.",
+    "ok",
+  );
+}
+
+function queueTaskPopupSelectedFilenames() {
+  const context = queueTaskPopupRecoveryContext;
+  if (!context || !(context.selected instanceof Set)) {
+    return [];
+  }
+  return Array.from(context.selected)
+    .map((item) => String(item || "").trim())
+    .filter((item) => item.length > 0);
+}
+
+async function restartInterruptedAnalysisFromPopup() {
+  const context = queueTaskPopupRecoveryContext;
+  if (!context) {
+    return;
+  }
+  const caseId = String(context.caseId || "").trim();
+  const category = normalizeQueueTaskRecoveryCategory(context.category);
+  const filenames = queueTaskPopupSelectedFilenames();
+  if (!caseId || !category) {
+    queueTaskPopupSetRecoveryStatus("Recovery context is invalid.", "error");
+    return;
+  }
+  if (!filenames.length) {
+    queueTaskPopupSetRecoveryStatus("Select one or more files first.", "error");
+    return;
+  }
+  const label = analysisCategoryLabel(category);
+  const confirmed = window.confirm(`Restart ${label} analysis for ${filenames.length} selected interrupted file(s)?`);
+  if (!confirmed) {
+    return;
+  }
+
+  const frameInterval = Number.parseFloat(intervalInput?.value || "1");
+  const safeFrameInterval = Number.isFinite(frameInterval) && frameInterval > 0 ? frameInterval : 2;
+  try {
+    queueTaskPopupSetRecoveryStatus(`Queueing restart for ${filenames.length} file(s)...`, "working");
+    const payload = await fetchJson("/analysis/start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        case_id: caseId,
+        filenames,
+        frame_interval_seconds: safeFrameInterval,
+        batch_size: 32,
+        force: false,
+        analysis_face_people: category === "face_people",
+        analysis_vehicles: category === "vehicles",
+      }),
+    });
+    const queueJobId = Math.max(0, Number(payload?.queue?.job_id || payload?.job_id || 0));
+    await syncAnalysisQueueStatus(caseId, category, { jobId: queueJobId });
+    if (state.workspaceView === "queue") {
+      await refreshReportQueue({ silent: true });
+    }
+    queueTaskPopupSetRecoveryStatus("Restart queued successfully.", "ok");
+    closeQueueTaskPopup();
+  } catch (error) {
+    queueTaskPopupSetRecoveryStatus(`Restart failed: ${formatError(error)}`, "error");
+  }
+}
+
+async function cancelInterruptedAnalysisFromPopup() {
+  const context = queueTaskPopupRecoveryContext;
+  if (!context) {
+    return;
+  }
+  const caseId = String(context.caseId || "").trim();
+  const category = normalizeQueueTaskRecoveryCategory(context.category);
+  const filenames = queueTaskPopupSelectedFilenames();
+  if (!caseId || !category) {
+    queueTaskPopupSetRecoveryStatus("Recovery context is invalid.", "error");
+    return;
+  }
+  if (!filenames.length) {
+    queueTaskPopupSetRecoveryStatus("Select one or more files first.", "error");
+    return;
+  }
+  const label = analysisCategoryLabel(category);
+  const confirmed = window.confirm(`Cancel interrupted ${label} analysis for ${filenames.length} selected file(s)?`);
+  if (!confirmed) {
+    return;
+  }
+
+  try {
+    queueTaskPopupSetRecoveryStatus(`Cancelling ${filenames.length} interrupted file(s)...`, "working");
+    const payload = await fetchJson("/analysis/interrupted/cancel", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        case_id: caseId,
+        category,
+        filenames,
+      }),
+    });
+    const cancelledCount = Math.max(0, Number(payload?.cancelled_count || 0));
+    const alreadyResolvedCount = Math.max(0, Number((payload?.not_interrupted_filenames || []).length));
+    const mismatchCount = Math.max(0, Number((payload?.skipped_filenames || []).length));
+    await syncAnalysisQueueStatus(caseId, category);
+    if (state.workspaceView === "queue") {
+      await refreshReportQueue({ silent: true });
+    }
+    if (cancelledCount <= 0) {
+      queueTaskPopupSetRecoveryStatus(
+        `No files were cancelled. Already resolved: ${alreadyResolvedCount}, category-mismatched: ${mismatchCount}.`,
+        "ok",
+      );
+      return;
+    }
+    queueTaskPopupSetRecoveryStatus(
+      `Cancelled ${cancelledCount} file(s). Already resolved: ${alreadyResolvedCount}, category-mismatched: ${mismatchCount}.`,
+      "ok",
+    );
+    closeQueueTaskPopup();
+  } catch (error) {
+    const errorText = formatError(error);
+    if (/\[404\]\s*Not Found/i.test(errorText)) {
+      queueTaskPopupSetRecoveryStatus(
+        "Cancel failed: backend route is missing. Restart backend to load latest routes, then retry.",
+        "error",
+      );
+      return;
+    }
+    queueTaskPopupSetRecoveryStatus(`Cancel failed: ${errorText}`, "error");
+  }
+}
+
+function stopReportQueuePolling() {
+  reportQueuePollToken += 1;
+}
+
+function startReportQueuePolling() {
+  stopReportQueuePolling();
+  const pollToken = ++reportQueuePollToken;
+
+  const poll = async () => {
+    if (pollToken !== reportQueuePollToken) {
+      return;
+    }
+    if (state.workspaceView !== "queue") {
+      return;
+    }
+    if (!state.activeCaseId) {
+      return;
+    }
+    try {
+      await refreshReportQueue({ silent: true });
+    } catch (error) {
+      setReportQueueStatus(`Queue refresh failed: ${formatError(error)}`, "error");
+    }
+    if (pollToken !== reportQueuePollToken) {
+      return;
+    }
+    window.setTimeout(poll, 1500);
+  };
+
+  void poll();
+}
+
 function renderMainTabs() {
   const triageActive = state.activeMainTab === "triage";
   const semanticActive = state.activeMainTab === "semantic";
@@ -1194,13 +3418,18 @@ function renderMainTabs() {
 function applyWorkspaceView() {
   const settingsActive = state.workspaceView === "settings" && Boolean(state.activeCaseId);
   const reportActive = state.workspaceView === "report" && Boolean(state.activeCaseId);
+  const queueActive = state.workspaceView === "queue" && Boolean(state.activeCaseId);
   workspace?.classList.toggle("show-settings", settingsActive);
   workspace?.classList.toggle("show-report", reportActive);
+  workspace?.classList.toggle("show-queue", queueActive);
   if (workspaceSettingsPage) {
     workspaceSettingsPage.hidden = !settingsActive;
   }
   if (workspaceReportPage) {
     workspaceReportPage.hidden = !reportActive;
+  }
+  if (workspaceQueuePage) {
+    workspaceQueuePage.hidden = !queueActive;
   }
   if (workspaceSettingsBtn) {
     workspaceSettingsBtn.classList.toggle("active", settingsActive);
@@ -1211,15 +3440,30 @@ function applyWorkspaceView() {
     workspaceReportBtn.setAttribute("aria-pressed", reportActive ? "true" : "false");
   }
   if (workspaceAnalysisBtn) {
-    const analysisActive = !settingsActive && !reportActive && Boolean(state.activeCaseId);
+    const analysisActive = !settingsActive && !reportActive && !queueActive && Boolean(state.activeCaseId);
     workspaceAnalysisBtn.classList.toggle("active", analysisActive);
     workspaceAnalysisBtn.setAttribute("aria-pressed", analysisActive ? "true" : "false");
+  }
+  if (workspaceQueueBtn) {
+    workspaceQueueBtn.classList.toggle("active", queueActive);
+    workspaceQueueBtn.setAttribute("aria-pressed", queueActive ? "true" : "false");
+  }
+  if (!queueActive) {
+    closeQueueTaskPopup();
+  }
+
+  if (queueActive) {
+    startReportQueuePolling();
+  } else {
+    stopReportQueuePolling();
   }
 }
 
 function setWorkspaceView(viewKey) {
   if (viewKey === "settings") {
     state.workspaceView = "settings";
+  } else if (viewKey === "queue") {
+    state.workspaceView = "queue";
   } else if (viewKey === "report") {
     state.workspaceView = "report";
   } else {
@@ -1816,7 +4060,9 @@ function syncWorkspaceVisibility() {
   const hasActiveCase = Boolean(state.activeCaseId);
   if (!hasActiveCase) {
     stopBackgroundIndexPolling();
+    stopAnalysisStatusPolling();
     hideTaskProgressUi();
+    hideQueueSummaryButtons();
   }
   if (appShell) {
     appShell.classList.toggle("repository-mode", !hasActiveCase);
@@ -1826,6 +4072,9 @@ function syncWorkspaceVisibility() {
     state.workspaceView = "analysis";
   }
   applyWorkspaceView();
+  if (hasActiveCase) {
+    refreshQueueSummaryButtonsForActiveCase();
+  }
   renderMainTabs();
   if (activeCaseMeta) {
     if (!hasActiveCase) {
@@ -1847,6 +4096,7 @@ function syncWorkspaceVisibility() {
 function backToCaseRepository() {
   if (!state.activeCaseId) {
     stopBackgroundIndexPolling();
+    stopAnalysisStatusPolling();
     hideTaskProgressUi();
     setWorkspaceView("analysis");
     syncWorkspaceVisibility();
@@ -1854,6 +4104,7 @@ function backToCaseRepository() {
   }
   saveActiveCasePlaybackSnapshot();
   stopBackgroundIndexPolling();
+  stopAnalysisStatusPolling();
   hideTaskProgressUi();
   state.activeCaseId = null;
   setWorkspaceView("analysis");
@@ -2265,9 +4516,15 @@ function renderCaseList() {
     const caseName = document.createElement("span");
     caseName.className = "case-item-name";
     caseName.textContent = item.name;
-    caseButton.title = item.case_id;
+    caseButton.title = `${item.name} (${item.case_id})`;
+
+    const caseId = document.createElement("span");
+    caseId.className = "case-item-id";
+    caseId.textContent = item.case_id;
+    caseId.title = item.case_id;
 
     caseButton.appendChild(caseName);
+    caseButton.appendChild(caseId);
     caseButton.addEventListener("click", () => {
       selectCase(item.case_id);
     });
@@ -2357,6 +4614,11 @@ async function loadCases() {
       state.caseVideos.delete(cachedCaseId);
     }
   }
+  for (const cachedCaseId of videoSelectionByCase.keys()) {
+    if (!validCaseIds.has(cachedCaseId)) {
+      videoSelectionByCase.delete(cachedCaseId);
+    }
+  }
   for (const cachedCaseId of triageCache.keys()) {
     if (!validCaseIds.has(cachedCaseId)) {
       triageCache.delete(cachedCaseId);
@@ -2376,6 +4638,17 @@ async function loadCases() {
   for (const cachedCaseId of backgroundIndexStatusByCase.keys()) {
     if (!validCaseIds.has(cachedCaseId)) {
       backgroundIndexStatusByCase.delete(cachedCaseId);
+    }
+  }
+  for (const category of ANALYSIS_CATEGORIES) {
+    const cache = analysisStatusCacheMap(category);
+    if (!(cache instanceof Map)) {
+      continue;
+    }
+    for (const cachedCaseId of cache.keys()) {
+      if (!validCaseIds.has(cachedCaseId)) {
+        cache.delete(cachedCaseId);
+      }
     }
   }
 
@@ -2400,23 +4673,67 @@ async function loadCasesWithRetry(maxAttempts = 3) {
 }
 
 function renderVideoList(videos) {
+  const list = Array.isArray(videos) ? videos : [];
+  const activeCaseId = String(state.activeCaseId || "").trim();
+  const caseSelection = getCaseVideoSelection(activeCaseId);
+
   if (!videoList) {
-    renderExistingIndexSelectionList(Array.isArray(videos) ? videos : []);
+    renderExistingIndexSelectionList(list);
+    syncVideoSelectionControls(list);
     return;
   }
   videoList.innerHTML = "";
-  if (!videos.length) {
+  if (!list.length) {
     const empty = document.createElement("div");
     empty.className = "empty";
     empty.textContent = "No uploaded videos yet.";
     videoList.appendChild(empty);
-    renderExistingIndexSelectionList(videos);
+    clearVideoSelection(activeCaseId);
+    renderExistingIndexSelectionList(list);
+    syncVideoSelectionControls(list);
     return;
   }
 
-  videos.forEach((video) => {
+  const availableFilenames = new Set(normalizeVideoFilenames(list));
+  if (caseSelection instanceof Set) {
+    for (const filename of Array.from(caseSelection)) {
+      if (!availableFilenames.has(filename)) {
+        caseSelection.delete(filename);
+      }
+    }
+  }
+
+  list.forEach((video) => {
+    const filename = String(video?.filename || "").trim();
+    const isSelected = Boolean(caseSelection instanceof Set && caseSelection.has(filename));
     const row = document.createElement("div");
     row.className = "video-row";
+    row.classList.toggle("selected", isSelected);
+
+    const selectCell = document.createElement("div");
+    selectCell.className = "video-select-cell";
+
+    const selectInput = document.createElement("input");
+    selectInput.type = "checkbox";
+    selectInput.className = "video-select-checkbox";
+    selectInput.dataset.filename = filename;
+    selectInput.checked = isSelected;
+    selectInput.title = `Select ${filename}`;
+    selectInput.setAttribute("aria-label", `Select ${filename}`);
+    selectInput.addEventListener("change", () => {
+      const selection = getCaseVideoSelection(activeCaseId);
+      if (!(selection instanceof Set)) {
+        return;
+      }
+      if (selectInput.checked) {
+        selection.add(filename);
+      } else {
+        selection.delete(filename);
+      }
+      row.classList.toggle("selected", selectInput.checked);
+      syncVideoSelectionControls(list);
+    });
+    selectCell.appendChild(selectInput);
 
     const meta = document.createElement("div");
     meta.className = "video-meta";
@@ -2456,11 +4773,13 @@ function renderVideoList(videos) {
     actions.appendChild(openBtn);
     actions.appendChild(deleteBtn);
 
+    row.appendChild(selectCell);
     row.appendChild(meta);
     row.appendChild(actions);
     videoList.appendChild(row);
   });
-  renderExistingIndexSelectionList(videos);
+  renderExistingIndexSelectionList(list);
+  syncVideoSelectionControls(list);
 }
 
 function playFromVideoList(video) {
@@ -2598,6 +4917,35 @@ function getSelectedTriageVideo(caseId = null) {
     return null;
   }
   return videos.find((item) => item && item.filename === selectedFilename) || null;
+}
+
+function isVideoTriageReady(video) {
+  if (!video || typeof video !== "object") {
+    return false;
+  }
+
+  const mediaContract = video.media_contract;
+  if (mediaContract && typeof mediaContract === "object") {
+    const lifecycle = mediaContract.lifecycle;
+    if (lifecycle && typeof lifecycle === "object" && lifecycle.triage_ready === true) {
+      return true;
+    }
+  }
+
+  const pipeline = video.pipeline;
+  if (!pipeline || typeof pipeline !== "object") {
+    return false;
+  }
+  const stages = pipeline.stages;
+  if (!stages || typeof stages !== "object") {
+    return false;
+  }
+  const triageStage = stages.triage;
+  if (!triageStage || typeof triageStage !== "object") {
+    return false;
+  }
+  const status = String(triageStage.status || "").trim().toLowerCase();
+  return status === "completed" || status === "skipped";
 }
 
 function triageIntensityColor(intensity, kind = "activity") {
@@ -3173,6 +5521,7 @@ function renderTriageList() {
     const triageKey = makeTriageKey(state.activeCaseId, video.filename);
     const cached = getTriagePayload(state.activeCaseId, video.filename);
     const loading = triageLoading.has(triageKey);
+    const triageReady = isVideoTriageReady(video);
     const sub = document.createElement("div");
     sub.className = "triage-video-sub";
     if (cached) {
@@ -3180,6 +5529,8 @@ function renderTriageList() {
       sub.textContent = `Ready | ${durationLabel}`;
     } else if (loading) {
       sub.textContent = "Loading timeline...";
+    } else if (triageReady) {
+      sub.textContent = "Ready";
     } else {
       sub.textContent = "Timeline not loaded";
     }
@@ -3208,6 +5559,7 @@ function renderTriageDetail() {
   const loading = triageLoading.has(triageKey);
   const error = triageErrors.get(triageKey);
   const cached = getTriagePayload(state.activeCaseId, selectedVideo.filename);
+  const triageReady = isVideoTriageReady(selectedVideo);
 
   const header = document.createElement("div");
   header.className = "triage-detail-head";
@@ -3220,6 +5572,8 @@ function renderTriageDetail() {
     sub.textContent = `Duration ${formatTime(Number(cached.duration_seconds || 0))} | Buckets ${Number(cached.bucket_count || 0)} | 1s`;
   } else if (loading) {
     sub.textContent = "Building timelines...";
+  } else if (triageReady) {
+    sub.textContent = "Ready (click Refresh Timelines to load now)";
   } else {
     sub.textContent = "Timeline not generated yet.";
   }
@@ -3397,6 +5751,7 @@ async function loadTriageForVideo(caseId, filename, force = false) {
   if (normalizedCaseId === state.activeCaseId) {
     renderTriagePanels();
   }
+  let deferLoadingClear = false;
   try {
     const payload = await fetchJson("/triage_timeline", {
       method: "POST",
@@ -3408,6 +5763,61 @@ async function loadTriageForVideo(caseId, filename, force = false) {
         force: Boolean(force),
       }),
     });
+    const cacheStatus = String(payload?.cache_status || "").toLowerCase();
+    if (cacheStatus === "queued" || payload?.queued === true) {
+      deferLoadingClear = true;
+      triageErrors.delete(key);
+      if (normalizedCaseId === state.activeCaseId) {
+        renderTriagePanels();
+      }
+      void (async () => {
+        const maxAttempts = 240;
+        for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+          await new Promise((resolve) => {
+            window.setTimeout(resolve, 1000);
+          });
+          try {
+            const persisted = await fetchJson("/triage_timeline_cached", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                case_id: normalizedCaseId,
+                filename: normalizedFilename,
+                bucket_seconds: 1.0,
+                force: false,
+              }),
+            });
+            const persistedStatus = String(persisted?.cache_status || "").toLowerCase();
+            if (persistedStatus === "hit" || persisted?.cached === true) {
+              setTriagePayload(normalizedCaseId, normalizedFilename, persisted);
+              triageErrors.delete(key);
+              triageLoading.delete(key);
+              if (normalizedCaseId === state.activeCaseId) {
+                renderTriagePanels();
+              }
+              return;
+            }
+          } catch (error) {
+            const message = formatError(error);
+            if (message.includes("[404]") || message.includes("[400]")) {
+              triageErrors.set(key, message);
+              triageLoading.delete(key);
+              if (normalizedCaseId === state.activeCaseId) {
+                renderTriagePanels();
+              }
+              return;
+            }
+          }
+        }
+        triageLoading.delete(key);
+        triageErrors.set(key, "Timed out waiting for timeline job. Try Refresh Timelines.");
+        if (normalizedCaseId === state.activeCaseId) {
+          renderTriagePanels();
+        }
+      })();
+      return payload;
+    }
+
     setTriagePayload(normalizedCaseId, normalizedFilename, payload);
     triageErrors.delete(key);
     return payload;
@@ -3415,7 +5825,9 @@ async function loadTriageForVideo(caseId, filename, force = false) {
     triageErrors.set(key, formatError(error));
     return null;
   } finally {
-    triageLoading.delete(key);
+    if (!deferLoadingClear) {
+      triageLoading.delete(key);
+    }
     if (normalizedCaseId === state.activeCaseId) {
       renderTriagePanels();
     }
@@ -3475,6 +5887,10 @@ async function refreshTriageList(force = false) {
     return;
   }
   const cacheStatus = String(payload.cache_status || "").toLowerCase();
+  if (cacheStatus === "queued" || payload.queued === true) {
+    setTriageStatus(`Timeline queued for ${selected}. Waiting for worker...`, "working");
+    return;
+  }
   if (cacheStatus === "hit" || payload.cached === true) {
     setTriageStatus(`Triage loaded from saved cache for ${selected}.`, "ok");
   } else {
@@ -4042,6 +6458,7 @@ async function refreshVideos(caseId = null, expectedSwitchVersion = null, option
   const videos = Array.isArray(payload.videos) ? payload.videos : [];
   state.caseVideos.set(String(resolvedCaseId), videos);
   renderVideoList(videos);
+  refreshPendingUploadDuplicateFlags(resolvedCaseId);
   renderTriagePanels();
   if (!skipFollowups && resolvedCaseId === state.activeCaseId) {
     renderAnalysisSelectionLists();
@@ -4167,6 +6584,7 @@ async function selectCase(caseId) {
 
   saveActiveCasePlaybackSnapshot();
   stopBackgroundIndexPolling();
+  stopAnalysisStatusPolling();
   state.activeCaseId = nextCaseId;
   setWorkspaceView("analysis");
   markCaseStateChanged();
@@ -4186,12 +6604,14 @@ async function selectCase(caseId) {
     }
     restorePlaybackForCase(nextCaseId, videos);
     const indexStatus = await syncBackgroundIndexStatus(nextCaseId);
+    await Promise.all([
+      syncAnalysisQueueStatus(nextCaseId, "face_people"),
+      syncAnalysisQueueStatus(nextCaseId, "vehicles"),
+    ]);
     const backgroundRunning = isBackgroundIndexRunning(indexStatus);
     if (state.activeMainTab === "triage") {
       setTriageStatus(`Case ${nextCaseId}: triage timelines ready.`, "ok");
     }
-    setAnalysisStatus("Face & People tab: select videos to run analysis.", "ok");
-    setVehicleStatus("Vehicle tab: select videos to run analysis.", "ok");
     if (!backgroundRunning) {
       setStatus(`Case ${nextCaseId} ready.`, "ok");
     }
@@ -4203,6 +6623,50 @@ async function selectCase(caseId) {
     setAnalysisStatus(`Case switch failed: ${formatError(error)}`, "error");
     setVehicleStatus(`Case switch failed: ${formatError(error)}`, "error");
     setStatus(`Case switch failed: ${formatError(error)}`, "error");
+  }
+}
+
+async function deleteVideoInternal(caseId, safeFilename, options = {}) {
+  const normalizedCaseId = String(caseId || "").trim();
+  const normalizedFilename = String(safeFilename || "").trim();
+  const refreshAfter = options.refreshAfter !== false;
+  if (!normalizedCaseId || !normalizedFilename) {
+    return;
+  }
+
+  setStatus(`Preparing ${normalizedFilename} for delete...`, "working");
+  await releaseVideoPlaybackLocks(normalizedCaseId, normalizedFilename);
+  setStatus(`Deleting ${normalizedFilename} from ${normalizedCaseId}...`, "working");
+  const url = `${withCaseQuery("/videos", normalizedCaseId)}&filename=${encodeURIComponent(normalizedFilename)}`;
+  await fetchJson(url, { method: "DELETE" });
+
+  const playback = playbackCache.get(normalizedCaseId);
+  if (playback && playback.filename === normalizedFilename) {
+    clearPlaybackCache(normalizedCaseId);
+  }
+  if (
+    videoPlayer
+    && videoPlayer.dataset.caseId === normalizedCaseId
+    && videoPlayer.dataset.filename === normalizedFilename
+  ) {
+    resetPlayerForCase(normalizedCaseId);
+    setCaseUrl(normalizedCaseId);
+  }
+
+  removeVideoFromSearchCache(normalizedCaseId, normalizedFilename);
+  const caseTriageCache = ensureCaseTriageCache(normalizedCaseId);
+  caseTriageCache?.delete(normalizedFilename);
+  triageErrors.delete(makeTriageKey(normalizedCaseId, normalizedFilename));
+  restoreSearchForCase(normalizedCaseId);
+  clearCaseTriageCache(normalizedCaseId);
+
+  const selection = getCaseVideoSelection(normalizedCaseId);
+  if (selection instanceof Set) {
+    selection.delete(normalizedFilename);
+  }
+
+  if (refreshAfter) {
+    await refreshVideos(normalizedCaseId);
   }
 }
 
@@ -4221,36 +6685,73 @@ async function deleteVideo(filename) {
   }
 
   try {
-    setStatus(`Preparing ${safeFilename} for delete...`, "working");
-    await releaseVideoPlaybackLocks(caseId, safeFilename);
-    setStatus(`Deleting ${safeFilename} from ${caseId}...`, "working");
-    const url = `${withCaseQuery("/videos", caseId)}&filename=${encodeURIComponent(safeFilename)}`;
-    await fetchJson(url, { method: "DELETE" });
-
-    const playback = playbackCache.get(caseId);
-    if (playback && playback.filename === safeFilename) {
-      clearPlaybackCache(caseId);
-    }
-    if (
-      videoPlayer
-      && videoPlayer.dataset.caseId === caseId
-      && videoPlayer.dataset.filename === safeFilename
-    ) {
-      resetPlayerForCase(caseId);
-      setCaseUrl(caseId);
-    }
-
-    removeVideoFromSearchCache(caseId, safeFilename);
-    const caseTriageCache = ensureCaseTriageCache(caseId);
-    caseTriageCache?.delete(safeFilename);
-    triageErrors.delete(makeTriageKey(caseId, safeFilename));
-    restoreSearchForCase(caseId);
-    clearCaseTriageCache(caseId);
-    await refreshVideos(caseId);
+    await deleteVideoInternal(caseId, safeFilename, { refreshAfter: true });
     setStatus(`Deleted ${safeFilename} from ${caseId}.`, "ok");
   } catch (error) {
     setStatus(`Delete video failed: ${formatError(error)}`, "error");
   }
+}
+
+async function deleteSelectedVideos() {
+  let caseId = "";
+  try {
+    caseId = ensureActiveCaseId();
+  } catch (error) {
+    setStatus(formatError(error), "error");
+    return;
+  }
+
+  const videos = getCaseVideos(caseId);
+  const selection = getCaseVideoSelection(caseId);
+  if (!(selection instanceof Set) || !selection.size) {
+    setStatus("Select one or more videos to delete.", "error");
+    return;
+  }
+
+  const filenames = normalizeVideoFilenames(videos).filter((name) => selection.has(name));
+  if (!filenames.length) {
+    setStatus("No selected videos found in current list.", "error");
+    return;
+  }
+
+  const confirmed = window.confirm(
+    `Delete ${filenames.length} selected video(s) from ${caseId}? This removes videos, embeddings, and thumbnails for each selected item.`,
+  );
+  if (!confirmed) {
+    return;
+  }
+
+  let deletedCount = 0;
+  const failures = [];
+
+  for (let index = 0; index < filenames.length; index += 1) {
+    const name = filenames[index];
+    try {
+      setStatus(
+        `Deleting selected videos (${index + 1}/${filenames.length}): ${name}...`,
+        "working",
+      );
+      await deleteVideoInternal(caseId, name, { refreshAfter: false });
+      deletedCount += 1;
+    } catch (error) {
+      failures.push(`${name}: ${formatError(error)}`);
+    }
+  }
+
+  try {
+    await refreshVideos(caseId);
+  } catch (error) {
+    failures.push(`refresh: ${formatError(error)}`);
+  }
+
+  if (failures.length) {
+    setStatus(
+      `Deleted ${deletedCount}/${filenames.length} selected videos. Errors: ${failures.join(" | ")}`,
+      "error",
+    );
+    return;
+  }
+  setStatus(`Deleted ${deletedCount} selected videos from ${caseId}.`, "ok");
 }
 
 async function renameCase(caseId) {
@@ -4341,6 +6842,7 @@ async function deleteCase(caseId) {
     playbackCache.delete(targetCaseId);
     searchCache.delete(targetCaseId);
     state.caseVideos.delete(targetCaseId);
+    videoSelectionByCase.delete(targetCaseId);
     clearCaseTriageCache(targetCaseId);
     backgroundIndexTerminalSeen.delete(targetCaseId);
     markCaseStateChanged();
@@ -4376,8 +6878,8 @@ async function deleteCase(caseId) {
 }
 
 async function uploadAndIndex() {
-  const files = Array.from(videoInput.files || []);
-  if (!files.length) {
+  const allFiles = Array.from(videoInput.files || []);
+  if (!allFiles.length) {
     hideTaskProgressUi();
     setStatus("Select one or more video files first.", "error");
     return;
@@ -4390,13 +6892,58 @@ async function uploadAndIndex() {
     return;
   }
 
-  const selectedSourceIndices = getSelectedPendingUploadSourceIndices(files);
-  const selectedForIndexCount = selectedSourceIndices.size;
-
   try {
     uploadFlowActive = true;
     stopBackgroundIndexPolling();
     const caseId = ensureActiveCaseId();
+    const selectedSourceIndicesOriginal = getSelectedPendingUploadSourceIndices(allFiles);
+    let files = allFiles;
+    let selectedSourceIndices = new Set(selectedSourceIndicesOriginal);
+    let duplicateSkippedCount = 0;
+
+    setStatus("Checking selected files for duplicates...", "working");
+    const duplicateCandidates = await detectDuplicateUploadCandidatesWithHash(allFiles, caseId);
+    if (duplicateCandidates.length > 0) {
+      const duplicateIndexSet = reviewDuplicateUploadCandidates(duplicateCandidates, allFiles);
+      if (duplicateIndexSet.size > 0) {
+        const filteredFiles = [];
+        const filteredSelectedIndices = new Set();
+        for (let originalIndex = 0; originalIndex < allFiles.length; originalIndex += 1) {
+          if (duplicateIndexSet.has(originalIndex)) {
+            duplicateSkippedCount += 1;
+            continue;
+          }
+          const nextIndex = filteredFiles.length;
+          filteredFiles.push(allFiles[originalIndex]);
+          if (selectedSourceIndicesOriginal.has(originalIndex)) {
+            filteredSelectedIndices.add(nextIndex);
+          }
+        }
+        files = filteredFiles;
+        selectedSourceIndices = filteredSelectedIndices;
+
+        if (pendingUploadItems.length === allFiles.length) {
+          pendingUploadItems.forEach((item) => {
+            const itemIndex = Number(item.sourceIndex);
+            if (duplicateIndexSet.has(itemIndex)) {
+              item.selectedForIndex = false;
+            }
+          });
+          renderPreUploadIndexSelection();
+        }
+
+        if (!files.length) {
+          hideTaskProgressUi();
+          setStatus(
+            "All selected files are duplicates of videos already in this case. No upload started.",
+            "ok",
+          );
+          return;
+        }
+      }
+    }
+
+    const selectedForIndexCount = selectedSourceIndices.size;
     const engineLabel = getLoadedEmbeddingEngineLabel();
     const totalUploadBytes = files.reduce((sum, file) => sum + Number(file.size || 0), 0);
     const uploadStartedAt = Date.now();
@@ -4659,8 +7206,11 @@ async function uploadAndIndex() {
     }
 
     const summary = `Case ${caseId}: uploaded ${uploaded.length}, transcoded ${transcoded.length}, selected for semantic indexing ${selectedIndexTargets.length}, engine ${engineLabel}. ${backgroundMessage}`;
+    const duplicateNote = duplicateSkippedCount > 0
+      ? ` Skipped duplicate uploads: ${duplicateSkippedCount}.`
+      : "";
     const errorNote = allErrors.length ? ` Errors: ${allErrors.join(" | ")}` : "";
-    setStatus(`${summary}${errorNote}`, allErrors.length ? "error" : "ok");
+    setStatus(`${summary}${duplicateNote}${errorNote}`, allErrors.length ? "error" : "ok");
     const progressMeta = uploaded.length > 0
       ? backgroundMessage
       : "No new videos were uploaded. You can continue triage immediately.";
@@ -4757,17 +7307,13 @@ async function runExistingSemanticIndex() {
 }
 
 async function runSelectedAnalysisForCategory(category) {
-  const normalizedCategory = category === "vehicles" ? "vehicles" : "face_people";
+  const normalizedCategory = normalizeAnalysisCategory(category);
   const setCategoryStatus = (message, kind = "") => {
-    if (normalizedCategory === "vehicles") {
-      setVehicleStatus(message, kind);
-    } else {
-      setAnalysisStatus(message, kind);
-    }
+    setCategoryAnalysisStatus(normalizedCategory, message, kind);
   };
   const filenames = getSelectedInsightFilenames(normalizedCategory);
   if (!filenames.length) {
-    const label = normalizedCategory === "vehicles" ? "Vehicles" : "Face & People";
+    const label = analysisCategoryLabel(normalizedCategory);
     setCategoryStatus(`Select one or more videos in the ${label} tab first.`, "error");
     return;
   }
@@ -4780,71 +7326,124 @@ async function runSelectedAnalysisForCategory(category) {
     return;
   }
 
-  const label = normalizedCategory === "vehicles" ? "Vehicles" : "Face & People";
+  const label = analysisCategoryLabel(normalizedCategory);
   const confirmed = window.confirm(`Run ${label} analysis for ${filenames.length} selected video(s)?`);
   if (!confirmed) {
     return;
   }
 
-  try {
-    const frameInterval = Number.parseFloat(intervalInput?.value || "1");
-    const safeFrameInterval = Number.isFinite(frameInterval) && frameInterval > 0 ? frameInterval : 2;
-    let processed = 0;
-    let skipped = 0;
-    const warnings = [];
-    const analysisStartedAt = Date.now();
+  const frameInterval = Number.parseFloat(intervalInput?.value || "1");
+  const safeFrameInterval = Number.isFinite(frameInterval) && frameInterval > 0 ? frameInterval : 2;
 
-    for (let i = 0; i < filenames.length; i += 1) {
-      const filename = filenames[i];
-      const etaBefore = estimateEtaSeconds(analysisStartedAt, i, filenames.length);
-      const percentBefore = clampPercent((i / filenames.length) * 100);
+  try {
+    setCategoryStatus(
+      `Queueing ${label} analysis for ${filenames.length} selected video(s)...`,
+      "working",
+    );
+    const payload = await fetchJson("/analysis/start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        case_id: caseId,
+        filenames,
+        frame_interval_seconds: safeFrameInterval,
+        batch_size: 32,
+        force: false,
+        analysis_face_people: normalizedCategory === "face_people",
+        analysis_vehicles: normalizedCategory === "vehicles",
+      }),
+    });
+    const queue = payload && typeof payload.queue === "object" ? payload.queue : {};
+    const queueAheadCandidate = pickFirstFiniteNumber(
+      [queue.position_ahead, queue.queue_position, payload?.position_ahead],
+      null,
+    );
+    const queueAhead = Number.isFinite(queueAheadCandidate)
+      ? Math.max(0, Math.floor(Number(queueAheadCandidate)))
+      : null;
+    const queueIdCandidate = pickFirstFiniteNumber([queue.job_id, payload?.job_id], 0);
+    const queueId = Number.isFinite(queueIdCandidate)
+      ? Math.max(0, Math.floor(Number(queueIdCandidate)))
+      : 0;
+    const started = Boolean(payload?.started);
+    const message = String(payload?.message || "");
+
+    const summaryParts = [];
+    if (message) {
+      summaryParts.push(message);
+    } else if (started) {
+      summaryParts.push(`${label} analysis queued.`);
+    } else {
+      summaryParts.push(`${label} analysis queue updated.`);
+    }
+    if (queueAhead !== null) {
+      summaryParts.push(`Queue ahead: ${queueAhead}.`);
+    }
+    if (queueId > 0) {
+      summaryParts.push(`Job #${queueId}.`);
+    }
+    setCategoryStatus(summaryParts.join(" "), "working");
+    startAnalysisStatusPolling(caseId, normalizedCategory, { jobId: queueId });
+    await refreshVideos(caseId);
+  } catch (error) {
+    if (isExactNotFoundError(error)) {
       setCategoryStatus(
-        `Running ${label} analysis for ${filename} (${i + 1}/${filenames.length}) | ${Math.round(percentBefore)}% | ${formatEtaLabel(etaBefore)}...`,
+        "Queue endpoint missing on current backend build. Running direct analysis fallback...",
         "working",
       );
-      try {
-        const payload = await fetchJson("/process_video", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            case_id: caseId,
-            filename,
-            frame_interval_seconds: safeFrameInterval,
-            batch_size: 32,
-            force: false,
-            analysis_face_people: normalizedCategory === "face_people",
-            analysis_vehicles: normalizedCategory === "vehicles",
-            analysis_only: true,
-          }),
-        });
-        const analysisPayload =
-          payload.analysis && typeof payload.analysis === "object" ? payload.analysis : {};
-        const status = String(analysisPayload.status || "");
-        if (status === "processed") {
-          processed += 1;
-        } else if (status === "skipped" || status === "not_requested") {
-          skipped += 1;
-        } else {
-          warnings.push(`${filename}: ${analysisPayload.reason || "analysis unavailable"}`);
+      let processedCount = 0;
+      let skippedCount = 0;
+      const failures = [];
+      for (let index = 0; index < filenames.length; index += 1) {
+        const filename = String(filenames[index] || "").trim();
+        if (!filename) {
+          continue;
         }
-      } catch (error) {
-        warnings.push(`${filename}: ${formatError(error)}`);
+        setCategoryStatus(
+          `Running ${label} analysis (${index + 1}/${filenames.length})...`,
+          "working",
+        );
+        try {
+          const payload = await fetchJson("/process_video", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              case_id: caseId,
+              filename,
+              frame_interval_seconds: safeFrameInterval,
+              batch_size: 32,
+              force: false,
+              analysis_face_people: normalizedCategory === "face_people",
+              analysis_vehicles: normalizedCategory === "vehicles",
+              analysis_only: true,
+            }),
+          });
+          const analysisPayload = payload && typeof payload.analysis === "object" ? payload.analysis : {};
+          const status = String(analysisPayload.status || payload?.status || "")
+            .trim()
+            .toLowerCase();
+          if (status === "skipped" || status === "not_requested" || status === "analysis_only") {
+            skippedCount += 1;
+          } else {
+            processedCount += 1;
+          }
+        } catch (innerError) {
+          failures.push(`${filename}: ${formatError(innerError)}`);
+        }
       }
 
-      const completed = i + 1;
-      const percentAfter = clampPercent((completed / filenames.length) * 100);
-      const etaAfter = estimateEtaSeconds(analysisStartedAt, completed, filenames.length);
-      setCategoryStatus(
-        `${label}: ${completed}/${filenames.length} completed | ${Math.round(percentAfter)}% | ${formatEtaLabel(etaAfter)}.`,
-        "working",
-      );
+      await refreshVideos(caseId);
+      await refreshInsightWalls();
+
+      const summary = `${label} analysis fallback completed: processed ${processedCount}, skipped ${skippedCount}, failed ${failures.length}.`;
+      if (failures.length) {
+        setCategoryStatus(`${summary} Errors: ${failures.join(" | ")}`, "error");
+      } else {
+        setCategoryStatus(summary, "ok");
+      }
+      return;
     }
 
-    await refreshVideos(caseId);
-    const summary = `${label}: processed ${processed}, skipped ${skipped}, warnings ${warnings.length}.`;
-    const warningText = warnings.length ? ` ${warnings.join(" | ")}` : "";
-    setCategoryStatus(`${summary}${warningText}`, warnings.length ? "error" : "ok");
-  } catch (error) {
     setCategoryStatus(`Run ${label} analysis failed: ${formatError(error)}`, "error");
   }
 }
@@ -5000,6 +7599,29 @@ function setupListeners() {
     }
     setWorkspaceView("report");
   });
+  workspaceQueueBtn?.addEventListener("click", () => {
+    if (!state.activeCaseId) {
+      setStatus("Select a case from Case Repository first.", "error");
+      return;
+    }
+    setWorkspaceView("queue");
+  });
+  reportQueueRefreshBtn?.addEventListener("click", async () => {
+    try {
+      await refreshReportQueue({ silent: false });
+    } catch (error) {
+      setReportQueueStatus(`Queue refresh failed: ${formatError(error)}`, "error");
+    }
+  });
+  indexQueueSummaryBtn?.addEventListener("click", () => {
+    openIndexQueueSummaryPopup();
+  });
+  facePeopleQueueSummaryBtn?.addEventListener("click", () => {
+    openAnalysisQueueSummaryPopup("face_people");
+  });
+  vehicleQueueSummaryBtn?.addEventListener("click", () => {
+    openAnalysisQueueSummaryPopup("vehicles");
+  });
   workspaceSettingsBtn?.addEventListener("click", () => {
     if (!state.activeCaseId) {
       setStatus("Select a case from Case Repository first.", "error");
@@ -5020,6 +7642,28 @@ function setupListeners() {
   });
   existingIndexSelectAll?.addEventListener("change", () => {
     setAllExistingIndexSelection(Boolean(existingIndexSelectAll.checked));
+  });
+  videoSelectAll?.addEventListener("change", () => {
+    const activeCaseId = String(state.activeCaseId || "").trim();
+    if (!activeCaseId) {
+      syncVideoSelectionControls([]);
+      return;
+    }
+    const selection = getCaseVideoSelection(activeCaseId);
+    if (!(selection instanceof Set)) {
+      syncVideoSelectionControls([]);
+      return;
+    }
+    const videos = getCaseVideos(activeCaseId);
+    const filenames = normalizeVideoFilenames(videos);
+    selection.clear();
+    if (Boolean(videoSelectAll.checked)) {
+      filenames.forEach((name) => selection.add(name));
+    }
+    renderVideoList(videos);
+  });
+  deleteSelectedVideosBtn?.addEventListener("click", () => {
+    deleteSelectedVideos();
   });
   runExistingIndexBtn?.addEventListener("click", () => {
     runExistingSemanticIndex();
@@ -5121,9 +7765,47 @@ function setupListeners() {
   semanticPopupBackdrop?.addEventListener("click", () => {
     closeSemanticPopup();
   });
+  queueTaskPopupCloseBtn?.addEventListener("click", () => {
+    closeQueueTaskPopup();
+  });
+  queueTaskPopupBackdrop?.addEventListener("click", () => {
+    closeQueueTaskPopup();
+  });
+  queueTaskPopupSelectAll?.addEventListener("change", () => {
+    const context = queueTaskPopupRecoveryContext;
+    if (!context || !(context.selected instanceof Set) || !Array.isArray(context.filenames)) {
+      queueTaskPopupUpdateRecoverySelectionMeta();
+      return;
+    }
+    context.selected.clear();
+    if (Boolean(queueTaskPopupSelectAll.checked)) {
+      context.filenames.forEach((name) => context.selected.add(name));
+    }
+    const checkboxes = queueTaskPopupFiles
+      ? Array.from(queueTaskPopupFiles.querySelectorAll("input.queue-task-file-select"))
+      : [];
+    checkboxes.forEach((checkbox) => {
+      const filename = String(checkbox.dataset.filename || "").trim();
+      checkbox.checked = context.selected.has(filename);
+    });
+    queueTaskPopupUpdateRecoverySelectionMeta();
+  });
+  queueTaskPopupRestartBtn?.addEventListener("click", () => {
+    void restartInterruptedAnalysisFromPopup();
+  });
+  queueTaskPopupCancelBtn?.addEventListener("click", () => {
+    void cancelInterruptedAnalysisFromPopup();
+  });
   window.addEventListener("keydown", (event) => {
-    if (event.key === "Escape" && semanticPopup && !semanticPopup.hasAttribute("hidden")) {
+    if (event.key !== "Escape") {
+      return;
+    }
+    if (semanticPopup && !semanticPopup.hasAttribute("hidden")) {
       closeSemanticPopup();
+      return;
+    }
+    if (queueTaskPopup && !queueTaskPopup.hasAttribute("hidden")) {
+      closeQueueTaskPopup();
     }
   });
 
