@@ -25,10 +25,58 @@ class ProcessControlServiceTests(unittest.IsolatedAsyncioTestCase):
         class _FakeQueueStore:
             def __init__(self) -> None:
                 self.calls: list[tuple[str, str]] = []
+                self.remove_calls: list[tuple[int, tuple[str, ...]]] = []
 
             def cancel_case_active(self, case_id: str, *, reason: str = "") -> int:
                 self.calls.append((str(case_id), str(reason)))
                 return 1 if str(case_id) == "case_running" else 0
+
+            def remove_files_from_job(
+                self,
+                *,
+                job_id: int,
+                filenames: list[str],
+                allow_running: bool = False,
+                reason: str = "",
+            ) -> dict:
+                self.remove_calls.append((int(job_id), tuple(str(item) for item in filenames)))
+                if int(job_id) == 404:
+                    return {
+                        "job_id": int(job_id),
+                        "found": False,
+                        "removed_count": 0,
+                        "remaining_count": 0,
+                        "removed_filenames": [],
+                        "remaining_filenames": [],
+                        "not_found_filenames": list(filenames),
+                        "deleted_job": False,
+                        "blocked_running": False,
+                    }
+                return {
+                    "job_id": int(job_id),
+                    "found": True,
+                    "case_id": "case_done",
+                    "job_kind": "semantic_index",
+                    "status": "queued",
+                    "removed_count": 1,
+                    "remaining_count": 1,
+                    "removed_filenames": [str(filenames[0])],
+                    "remaining_filenames": ["keep.mp4"],
+                    "not_found_filenames": [],
+                    "deleted_job": False,
+                    "blocked_running": False,
+                    "job": {
+                        "job_id": int(job_id),
+                        "job_kind": "semantic_index",
+                        "priority": 50,
+                        "status": "queued",
+                        "queue_position": 0,
+                        "attempt_count": 0,
+                        "enqueued_at": "2026-01-01T00:00:00+00:00",
+                        "started_at": "",
+                        "updated_at": "2026-01-01T00:01:00+00:00",
+                    },
+                }
 
         state = SimpleNamespace()
         state.index_jobs = {
@@ -95,6 +143,19 @@ class ProcessControlServiceTests(unittest.IsolatedAsyncioTestCase):
     def test_cancel_case_index_jobs_sync_requires_case_id(self) -> None:
         with self.assertRaises(ValueError):
             self.service.cancel_case_index_jobs_sync(case_id="  ")
+
+    def test_remove_queue_job_files_sync_updates_semantic_snapshot(self) -> None:
+        payload = self.service.remove_queue_job_files_sync(
+            job_id=99,
+            filenames=["drop.mp4"],
+        )
+        self.assertEqual(payload["removed_count"], 1)
+        self.assertEqual(payload["remaining_filenames"], ["keep.mp4"])
+        updated = self.app.state.index_jobs["case_done"]
+        self.assertEqual(updated["status"], "queued")
+        self.assertEqual(updated["filenames"], ["keep.mp4"])
+        self.assertEqual(updated["total"], 1)
+        self.assertEqual(len(self.app.state.index_queue_store.remove_calls), 1)
 
     async def test_graceful_shutdown_sets_state(self) -> None:
         # Prevent signal-based exit scheduling during test runs.

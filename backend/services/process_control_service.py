@@ -541,6 +541,104 @@ class ProcessControlService:
             "message": "Queue items updated.",
         }
 
+    def remove_queue_job_files_sync(
+        self,
+        *,
+        job_id: int,
+        filenames: list[str],
+    ) -> dict:
+        queue_store = getattr(self.app.state, "index_queue_store", None)
+        if queue_store is None or not hasattr(queue_store, "remove_files_from_job"):
+            raise ValueError("Queue store is unavailable.")
+
+        result = queue_store.remove_files_from_job(
+            job_id=int(job_id),
+            filenames=filenames,
+            allow_running=False,
+            reason="Selected files removed from queue by user request.",
+        )
+        if not isinstance(result, dict):
+            raise ValueError("Queue store returned an invalid response.")
+
+        found = bool(result.get("found", False))
+        if not found:
+            raise ValueError("Queue job not found.")
+        if bool(result.get("blocked_running", False)):
+            raise ValueError("Queue job is running. Stop it first, then remove files.")
+
+        case_id = str(result.get("case_id") or "").strip()
+        job_kind = str(result.get("job_kind") or "").strip().lower()
+        deleted_job = bool(result.get("deleted_job", False))
+        remaining_filenames = self._normalize_filenames(result.get("remaining_filenames"))
+        updated_queue_job = (
+            result.get("job")
+            if isinstance(result.get("job"), dict)
+            else {}
+        )
+
+        if case_id and job_kind == "semantic_index":
+            jobs: dict[str, dict] = self.app.state.index_jobs
+            lock: Lock = self.app.state.index_jobs_lock
+            now = self.utc_now_iso()
+            with lock:
+                job = jobs.get(case_id)
+                if isinstance(job, dict) and not bool(job.get("running")):
+                    if deleted_job or not remaining_filenames:
+                        job["status"] = "idle"
+                        job["running"] = False
+                        job["cancel_requested"] = False
+                        job["queue_job_id"] = 0
+                        job["queue_job_kind"] = ""
+                        job["queue_priority"] = 0
+                        job["filenames"] = []
+                        job["total"] = 0
+                        job["updated_at"] = now
+                    else:
+                        job["status"] = "queued"
+                        job["running"] = False
+                        job["cancel_requested"] = False
+                        job["queue_job_id"] = int(updated_queue_job.get("job_id", job_id))
+                        job["queue_job_kind"] = str(
+                            updated_queue_job.get("job_kind")
+                            or job_kind
+                            or "semantic_index"
+                        )
+                        job["queue_priority"] = int(
+                            updated_queue_job.get("priority", job.get("queue_priority", 50))
+                        )
+                        job["filenames"] = list(remaining_filenames)
+                        job["total"] = len(remaining_filenames)
+                        job["updated_at"] = now
+
+        queue_payload = {}
+        if isinstance(updated_queue_job, dict):
+            queue_payload = {
+                "job_id": int(updated_queue_job.get("job_id", 0)),
+                "job_kind": str(updated_queue_job.get("job_kind") or ""),
+                "priority": int(updated_queue_job.get("priority", 0)),
+                "status": str(updated_queue_job.get("status") or ""),
+                "position_ahead": int(updated_queue_job.get("queue_position", 0)),
+                "attempt_count": int(updated_queue_job.get("attempt_count", 0)),
+                "enqueued_at": str(updated_queue_job.get("enqueued_at") or ""),
+                "started_at": str(updated_queue_job.get("started_at") or ""),
+                "updated_at": str(updated_queue_job.get("updated_at") or ""),
+            }
+
+        return {
+            "job_id": int(result.get("job_id", job_id)),
+            "case_id": case_id,
+            "job_kind": job_kind,
+            "deleted_job": deleted_job,
+            "requested_count": int(result.get("requested_count", 0)),
+            "removed_count": int(result.get("removed_count", 0)),
+            "remaining_count": int(result.get("remaining_count", 0)),
+            "removed_filenames": result.get("removed_filenames") or [],
+            "remaining_filenames": remaining_filenames,
+            "not_found_filenames": result.get("not_found_filenames") or [],
+            "queue": queue_payload,
+            "message": str(result.get("message") or "Queue item updated."),
+        }
+
     async def delete_queue_jobs(
         self,
         *,
@@ -551,6 +649,18 @@ class ProcessControlService:
             self.delete_queue_jobs_sync,
             job_ids=job_ids,
             cancel_running=cancel_running,
+        )
+
+    async def remove_queue_job_files(
+        self,
+        *,
+        job_id: int,
+        filenames: list[str],
+    ) -> dict:
+        return await asyncio.to_thread(
+            self.remove_queue_job_files_sync,
+            job_id=job_id,
+            filenames=filenames,
         )
 
     async def graceful_shutdown(self, *, confirm: bool) -> dict:

@@ -83,6 +83,7 @@ let queueTaskPopupRecovery = null;
 let queueTaskPopupSelectAll = null;
 let queueTaskPopupRestartBtn = null;
 let queueTaskPopupCancelBtn = null;
+let queueTaskPopupRemoveFilesBtn = null;
 let queueTaskPopupDeleteBtn = null;
 let queueTaskPopupSelectionMeta = null;
 let queueTaskPopupRecoveryStatus = null;
@@ -255,6 +256,7 @@ function bindDomElements() {
   queueTaskPopupSelectAll = document.getElementById("queueTaskPopupSelectAll");
   queueTaskPopupRestartBtn = document.getElementById("queueTaskPopupRestartBtn");
   queueTaskPopupCancelBtn = document.getElementById("queueTaskPopupCancelBtn");
+  queueTaskPopupRemoveFilesBtn = document.getElementById("queueTaskPopupRemoveFilesBtn");
   queueTaskPopupDeleteBtn = document.getElementById("queueTaskPopupDeleteBtn");
   queueTaskPopupSelectionMeta = document.getElementById("queueTaskPopupSelectionMeta");
   queueTaskPopupRecoveryStatus = document.getElementById("queueTaskPopupRecoveryStatus");
@@ -2578,6 +2580,46 @@ function isQueueTaskRecoveryAvailable(item) {
   return filenames.length > 0;
 }
 
+function isQueueTaskFileRemovalAvailable(item) {
+  const type = String(item?.type || "").trim().toLowerCase();
+  if (type !== "queue_job") {
+    return false;
+  }
+  const status = String(item?.status || "").trim().toLowerCase();
+  if (status !== "queued") {
+    return false;
+  }
+  const jobId = queueTaskPopupResolveJobId(item);
+  if (!jobId) {
+    return false;
+  }
+  return queueTaskFilenames(item).length > 0;
+}
+
+function formatQueueTimestamp(value) {
+  const raw = String(value || "").trim();
+  if (!raw) {
+    return "n/a";
+  }
+  const parsed = new Date(raw);
+  if (Number.isNaN(parsed.getTime())) {
+    return raw;
+  }
+  return parsed.toLocaleString();
+}
+
+function queueTaskPopupConfigureActionButtons(options = {}) {
+  if (queueTaskPopupRestartBtn) {
+    queueTaskPopupRestartBtn.hidden = !Boolean(options.restart);
+  }
+  if (queueTaskPopupCancelBtn) {
+    queueTaskPopupCancelBtn.hidden = !Boolean(options.cancel);
+  }
+  if (queueTaskPopupRemoveFilesBtn) {
+    queueTaskPopupRemoveFilesBtn.hidden = !Boolean(options.removeFiles);
+  }
+}
+
 function queueTaskPopupSetRecoveryStatus(message, kind = "") {
   if (!queueTaskPopupRecoveryStatus) {
     return;
@@ -2592,6 +2634,11 @@ function queueTaskPopupResetRecovery() {
   if (queueTaskPopupRecovery) {
     queueTaskPopupRecovery.setAttribute("hidden", "");
   }
+  queueTaskPopupConfigureActionButtons({
+    restart: false,
+    cancel: false,
+    removeFiles: false,
+  });
   if (queueTaskPopupDeleteBtn) {
     queueTaskPopupDeleteBtn.setAttribute("hidden", "");
     queueTaskPopupDeleteBtn.textContent = "Delete Queue Item";
@@ -2713,8 +2760,30 @@ function queueTaskPopupUpdateRecoverySelectionMeta() {
   queueTaskPopupSelectAll.indeterminate = selectedCount > 0 && selectedCount < total;
 }
 
+function syncQueueTaskPopupCheckboxesForFilename(filename, checked) {
+  const safeFilename = String(filename || "").trim();
+  if (!safeFilename || !queueTaskPopupFiles) {
+    return;
+  }
+  const checkboxes = Array.from(queueTaskPopupFiles.querySelectorAll("input.queue-task-file-select"));
+  checkboxes.forEach((checkbox) => {
+    if (String(checkbox.dataset.filename || "").trim() === safeFilename) {
+      checkbox.checked = Boolean(checked);
+    }
+  });
+}
+
 function queueTaskPopupConfigureRecovery(item, rows) {
-  queueTaskPopupResetRecovery();
+  queueTaskPopupRecoveryContext = null;
+  if (queueTaskPopupRecovery) {
+    queueTaskPopupRecovery.setAttribute("hidden", "");
+  }
+  queueTaskPopupConfigureActionButtons({
+    restart: false,
+    cancel: false,
+    removeFiles: false,
+  });
+  queueTaskPopupSetRecoveryStatus("", "");
   if (!queueTaskPopupRecovery || !isQueueTaskRecoveryAvailable(item)) {
     return;
   }
@@ -2737,16 +2806,72 @@ function queueTaskPopupConfigureRecovery(item, rows) {
   }
 
   queueTaskPopupRecoveryContext = {
+    mode: "analysis_recovery",
     caseId: String(item?.case_id || "").trim(),
     category,
     jobId: Math.max(0, Number(item?.queue_job_id || 0)),
     filenames: uniqueFilenames,
     selected: new Set(uniqueFilenames),
   };
+  queueTaskPopupConfigureActionButtons({
+    restart: true,
+    cancel: true,
+    removeFiles: false,
+  });
   queueTaskPopupRecovery.removeAttribute("hidden");
   queueTaskPopupUpdateRecoverySelectionMeta();
   queueTaskPopupSetRecoveryStatus(
     `Interrupted ${analysisCategoryLabel(category)} analysis: select files to restart or cancel.`,
+    "working",
+  );
+}
+
+function queueTaskPopupConfigureFileRemoval(item, rows) {
+  queueTaskPopupRecoveryContext = null;
+  if (queueTaskPopupRecovery) {
+    queueTaskPopupRecovery.setAttribute("hidden", "");
+  }
+  queueTaskPopupConfigureActionButtons({
+    restart: false,
+    cancel: false,
+    removeFiles: false,
+  });
+  queueTaskPopupSetRecoveryStatus("", "");
+  if (!queueTaskPopupRecovery || !isQueueTaskFileRemovalAvailable(item)) {
+    return;
+  }
+
+  const uniqueFilenames = [];
+  const seen = new Set();
+  (Array.isArray(rows) ? rows : []).forEach((row) => {
+    const safe = String(row?.filename || "").trim();
+    if (!safe || seen.has(safe)) {
+      return;
+    }
+    seen.add(safe);
+    uniqueFilenames.push(safe);
+  });
+  if (!uniqueFilenames.length) {
+    return;
+  }
+
+  queueTaskPopupRecoveryContext = {
+    mode: "remove_queue_files",
+    caseId: String(item?.case_id || "").trim(),
+    category: "",
+    jobId: Math.max(0, Number(item?.queue_job_id || 0)),
+    filenames: uniqueFilenames,
+    selected: new Set(uniqueFilenames),
+  };
+  queueTaskPopupConfigureActionButtons({
+    restart: false,
+    cancel: false,
+    removeFiles: true,
+  });
+  queueTaskPopupRecovery.removeAttribute("hidden");
+  queueTaskPopupUpdateRecoverySelectionMeta();
+  queueTaskPopupSetRecoveryStatus(
+    "Select queued files to remove from this queue item.",
     "working",
   );
 }
@@ -3014,6 +3139,7 @@ function openQueueTaskPopup(item) {
   const status = String(item?.status || "").trim() || "unknown";
   const caseId = String(item?.case_id || "").trim() || "n/a";
   const recoveryEnabled = isQueueTaskRecoveryAvailable(item);
+  const fileRemovalEnabled = isQueueTaskFileRemovalAvailable(item);
   queueTaskPopupResetRecovery();
   queueTaskPopupCurrentItem = item && typeof item === "object" ? { ...item } : null;
   queueTaskPopupConfigureDelete(queueTaskPopupCurrentItem);
@@ -3023,8 +3149,9 @@ function openQueueTaskPopup(item) {
     const completed = Math.max(0, Number(item?.completed || 0));
     const total = Math.max(0, Number(item?.total || 0));
     const progressPercent = Number(item?.progress_percent || 0);
+    const startedLabel = formatQueueTimestamp(item?.started_at || item?.enqueued_at || "");
     queueTaskPopupMeta.textContent =
-      `case: ${caseId} | status: ${status} | progress: ${completed}/${total} (${Number.isFinite(progressPercent) ? progressPercent.toFixed(1) : "0.0"}%)`;
+      `case: ${caseId} | status: ${status} | progress: ${completed}/${total} (${Number.isFinite(progressPercent) ? progressPercent.toFixed(1) : "0.0"}%) | started: ${startedLabel}`;
   } else if (type === "analysis_interrupted") {
     const queueJobId = Math.max(0, Number(item?.queue_job_id || 0));
     const categoryLabel = analysisCategoryLabel(item?.recovery_category);
@@ -3033,8 +3160,9 @@ function openQueueTaskPopup(item) {
       : `Interrupted ${categoryLabel} Analysis`;
     const filesCount = Math.max(0, Number(item?.filenames_count || 0));
     const interruptedMessage = String(item?.message || "").trim();
+    const addedLabel = formatQueueTimestamp(item?.enqueued_at || "");
     queueTaskPopupMeta.textContent =
-      `case: ${caseId} | status: interrupted | files: ${filesCount}${interruptedMessage ? ` | ${interruptedMessage}` : ""}`;
+      `case: ${caseId} | status: interrupted | files: ${filesCount} | added: ${addedLabel}${interruptedMessage ? ` | ${interruptedMessage}` : ""}`;
   } else {
     const queueJobId = Math.max(0, Number(item?.queue_job_id || 0));
     const jobKindLabel = queueJobKindLabel(item?.job_kind, item);
@@ -3050,8 +3178,9 @@ function openQueueTaskPopup(item) {
       Boolean(metadata.analysis_vehicles),
     );
     const analysisModePart = analysisModes ? ` | modes: ${analysisModes}` : "";
+    const addedLabel = formatQueueTimestamp(item?.enqueued_at || "");
     queueTaskPopupMeta.textContent =
-      `case: ${caseId} | status: ${status} | queue ahead: ${queuePosition} | priority: ${priority} | files: ${filesCount} | attempts: ${attempts}${analysisModePart}`;
+      `case: ${caseId} | status: ${status} | queue ahead: ${queuePosition} | priority: ${priority} | files: ${filesCount} | attempts: ${attempts} | added: ${addedLabel}${analysisModePart}`;
   }
 
   const filenames = queueTaskFilenames(item);
@@ -3064,7 +3193,7 @@ function openQueueTaskPopup(item) {
     })),
     {
       emptyMessage: "No file list reported yet.",
-      selectable: recoveryEnabled,
+      selectable: recoveryEnabled || fileRemovalEnabled,
       selected: queueTaskPopupRecoveryContext?.selected || new Set(),
       onToggle: (filename, checked) => {
         const context = queueTaskPopupRecoveryContext;
@@ -3076,6 +3205,7 @@ function openQueueTaskPopup(item) {
         } else {
           context.selected.delete(filename);
         }
+        syncQueueTaskPopupCheckboxesForFilename(filename, checked);
         queueTaskPopupUpdateRecoverySelectionMeta();
       },
     },
@@ -3096,10 +3226,12 @@ function openQueueTaskPopup(item) {
       }
       if (recoveryEnabled) {
         queueTaskPopupConfigureRecovery(item, rows);
+      } else if (fileRemovalEnabled) {
+        queueTaskPopupConfigureFileRemoval(item, rows);
       }
       renderQueueTaskProgressRows(rows, {
         emptyMessage: "No file list reported yet.",
-        selectable: recoveryEnabled,
+        selectable: recoveryEnabled || fileRemovalEnabled,
         selected: queueTaskPopupRecoveryContext?.selected || new Set(),
         onToggle: (filename, checked) => {
           const context = queueTaskPopupRecoveryContext;
@@ -3111,6 +3243,7 @@ function openQueueTaskPopup(item) {
           } else {
             context.selected.delete(filename);
           }
+          syncQueueTaskPopupCheckboxesForFilename(filename, checked);
           queueTaskPopupUpdateRecoverySelectionMeta();
         },
       });
@@ -3125,10 +3258,12 @@ function openQueueTaskPopup(item) {
       }
       if (recoveryEnabled) {
         queueTaskPopupConfigureRecovery(item, filenames.map((filename) => ({ filename })));
+      } else if (fileRemovalEnabled) {
+        queueTaskPopupConfigureFileRemoval(item, filenames.map((filename) => ({ filename })));
       }
       renderQueueTaskProgressRows([], {
         emptyMessage: `Unable to load per-file progress: ${formatError(error)}`,
-        selectable: recoveryEnabled,
+        selectable: recoveryEnabled || fileRemovalEnabled,
         selected: queueTaskPopupRecoveryContext?.selected || new Set(),
         onToggle: (filename, checked) => {
           const context = queueTaskPopupRecoveryContext;
@@ -3140,6 +3275,7 @@ function openQueueTaskPopup(item) {
           } else {
             context.selected.delete(filename);
           }
+          syncQueueTaskPopupCheckboxesForFilename(filename, checked);
           queueTaskPopupUpdateRecoverySelectionMeta();
         },
       });
@@ -3190,6 +3326,7 @@ async function listInterruptedAnalysisQueueItems(caseId) {
       queue_position: Number(queue.position_ahead || 0),
       priority: Number(queue.priority || 0),
       attempt_count: Number(queue.attempt_count || 0),
+      enqueued_at: String(queue.enqueued_at || ""),
       filenames,
       filenames_count: filenames.length,
       metadata: {
@@ -3505,6 +3642,69 @@ async function cancelInterruptedAnalysisFromPopup() {
       return;
     }
     queueTaskPopupSetRecoveryStatus(`Cancel failed: ${errorText}`, "error");
+  }
+}
+
+async function removeSelectedQueueFilesFromPopup() {
+  const context = queueTaskPopupRecoveryContext;
+  if (!context || String(context.mode || "") !== "remove_queue_files") {
+    return;
+  }
+  const jobId = Math.max(0, Number(context.jobId || 0));
+  const filenames = queueTaskPopupSelectedFilenames();
+  if (!jobId) {
+    queueTaskPopupSetRecoveryStatus("Queue job is missing from popup context.", "error");
+    return;
+  }
+  if (!filenames.length) {
+    queueTaskPopupSetRecoveryStatus("Select one or more files first.", "error");
+    return;
+  }
+
+  const confirmed = window.confirm(`Remove ${filenames.length} selected file(s) from queue job #${jobId}?`);
+  if (!confirmed) {
+    return;
+  }
+
+  try {
+    queueTaskPopupSetRecoveryStatus(`Removing ${filenames.length} file(s) from queue...`, "working");
+    const payload = await fetchJson("/processes/queue/remove_files", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        job_id: jobId,
+        filenames,
+      }),
+    });
+
+    const removedCount = Math.max(0, Number(payload?.removed_count || 0));
+    const remainingCount = Math.max(0, Number(payload?.remaining_count || 0));
+    const deletedJob = Boolean(payload?.deleted_job);
+    const notFoundCount = Math.max(0, Number((payload?.not_found_filenames || []).length));
+    const caseId = String(payload?.case_id || context.caseId || "").trim();
+
+    if (caseId) {
+      await syncBackgroundIndexStatus(caseId);
+      await Promise.all([
+        syncAnalysisQueueStatus(caseId, "face_people"),
+        syncAnalysisQueueStatus(caseId, "vehicles"),
+      ]);
+    }
+    if (state.workspaceView === "queue") {
+      await refreshReportQueue({ silent: true });
+    }
+
+    const summary = deletedJob
+      ? `Removed ${removedCount} file(s). Queue job deleted.`
+      : `Removed ${removedCount} file(s). ${remainingCount} file(s) remain in queue item.`;
+    const extra = notFoundCount > 0 ? ` (${notFoundCount} selection(s) were no longer present.)` : "";
+    queueTaskPopupSetRecoveryStatus(`${summary}${extra}`, "ok");
+    setStatus(`${summary}${extra}`, "ok");
+    closeQueueTaskPopup();
+  } catch (error) {
+    const errorText = formatError(error);
+    queueTaskPopupSetRecoveryStatus(`Remove selected failed: ${errorText}`, "error");
+    setStatus(`Remove selected failed: ${errorText}`, "error");
   }
 }
 
@@ -8322,6 +8522,9 @@ function setupListeners() {
   });
   queueTaskPopupCancelBtn?.addEventListener("click", () => {
     void cancelInterruptedAnalysisFromPopup();
+  });
+  queueTaskPopupRemoveFilesBtn?.addEventListener("click", () => {
+    void removeSelectedQueueFilesFromPopup();
   });
   queueTaskPopupDeleteBtn?.addEventListener("click", () => {
     void deleteQueueItemFromPopup();

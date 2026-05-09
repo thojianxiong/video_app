@@ -209,6 +209,80 @@ class IndexQueueStoreTests(unittest.TestCase):
         self.assertIsNotNone(running_lookup)
         self.assertEqual(str(running_lookup.get("status")), "cancelled")
 
+    def test_remove_files_from_job_updates_payload_and_analysis_metadata(self) -> None:
+        queued = self.store.enqueue_or_get_active(
+            case_id="case_a",
+            filenames=["a.mp4", "b.mp4", "c.mp4"],
+            frame_interval_seconds=1.0,
+            batch_size=32,
+            force=False,
+            job_kind="analysis",
+            metadata={
+                "analysis_face_people": True,
+                "analysis_vehicles": True,
+                "analysis_face_people_filenames": ["a.mp4", "b.mp4"],
+                "analysis_vehicles_filenames": ["b.mp4", "c.mp4"],
+            },
+        )
+        result = self.store.remove_files_from_job(
+            job_id=int(queued["job_id"]),
+            filenames=["b.mp4"],
+        )
+        self.assertTrue(bool(result.get("found")))
+        self.assertEqual(int(result.get("removed_count", 0)), 1)
+        self.assertEqual(result.get("remaining_filenames"), ["a.mp4", "c.mp4"])
+        self.assertFalse(bool(result.get("deleted_job")))
+
+        refreshed = self.store.get_job(int(queued["job_id"]))
+        self.assertIsNotNone(refreshed)
+        payload = refreshed.get("payload") if isinstance(refreshed.get("payload"), dict) else {}
+        metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+        self.assertEqual(payload.get("filenames"), ["a.mp4", "c.mp4"])
+        self.assertEqual(metadata.get("analysis_face_people_filenames"), ["a.mp4"])
+        self.assertEqual(metadata.get("analysis_vehicles_filenames"), ["c.mp4"])
+        self.assertTrue(bool(metadata.get("analysis_face_people")))
+        self.assertTrue(bool(metadata.get("analysis_vehicles")))
+
+    def test_remove_files_from_job_deletes_queued_job_when_empty(self) -> None:
+        queued = self.store.enqueue_or_get_active(
+            case_id="case_a",
+            filenames=["a.mp4", "b.mp4"],
+            frame_interval_seconds=1.0,
+            batch_size=32,
+            force=False,
+            job_kind="semantic_index",
+        )
+        result = self.store.remove_files_from_job(
+            job_id=int(queued["job_id"]),
+            filenames=["a.mp4", "b.mp4"],
+        )
+        self.assertTrue(bool(result.get("deleted_job")))
+        self.assertEqual(int(result.get("remaining_count", 0)), 0)
+        self.assertIsNone(self.store.get_job(int(queued["job_id"])))
+
+    def test_remove_files_from_job_blocks_running_job(self) -> None:
+        queued = self.store.enqueue_or_get_active(
+            case_id="case_a",
+            filenames=["a.mp4", "b.mp4"],
+            frame_interval_seconds=1.0,
+            batch_size=32,
+            force=False,
+            job_kind="semantic_index",
+        )
+        claimed = self.store.claim_next_queued(job_kinds={"semantic_index"})
+        self.assertIsNotNone(claimed)
+        self.assertEqual(int(claimed["job_id"]), int(queued["job_id"]))
+
+        result = self.store.remove_files_from_job(
+            job_id=int(queued["job_id"]),
+            filenames=["b.mp4"],
+        )
+        self.assertTrue(bool(result.get("blocked_running")))
+        self.assertEqual(int(result.get("removed_count", 0)), 0)
+        running = self.store.get_job(int(queued["job_id"]))
+        self.assertIsNotNone(running)
+        self.assertEqual(str(running.get("status")), "running")
+
     def test_clear_case(self) -> None:
         self.store.enqueue_or_get_active(
             case_id="case_a",

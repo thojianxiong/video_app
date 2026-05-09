@@ -15,3 +15,8 @@ class CancelIndexRequest(BaseModel):
 class DeleteQueueJobsRequest(BaseModel):
     job_ids: list[int]
     cancel_running: bool = True
+
+
+class RemoveQueueJobFilesRequest(BaseModel):
+    job_id: int
+    filenames: list[str]

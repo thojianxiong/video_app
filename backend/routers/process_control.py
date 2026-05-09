@@ -5,6 +5,7 @@ from fastapi import APIRouter, HTTPException
 from backend.schemas.process_control import (
     CancelIndexRequest,
     DeleteQueueJobsRequest,
+    RemoveQueueJobFilesRequest,
     ShutdownRequest,
 )
 from backend.services.process_control_service import ProcessControlService
@@ -51,6 +52,18 @@ def build_process_control_router(
             return await process_control_service.delete_queue_jobs(
                 job_ids=request.job_ids,
                 cancel_running=request.cancel_running,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc))
+
+    @router.post("/processes/queue/remove_files")
+    async def remove_queue_job_files(request: RemoveQueueJobFilesRequest) -> dict:
+        try:
+            return await process_control_service.remove_queue_job_files(
+                job_id=request.job_id,
+                filenames=request.filenames,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))

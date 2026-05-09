@@ -165,6 +165,22 @@ class IndexQueueStore:
         return output
 
     @staticmethod
+    def _normalize_optional_filenames(
+        filenames: list[str] | tuple[str, ...] | set[str] | None,
+    ) -> list[str]:
+        output: list[str] = []
+        seen: set[str] = set()
+        if not filenames:
+            return output
+        for item in filenames:
+            name = str(item or "").strip()
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            output.append(name)
+        return output
+
+    @staticmethod
     def _merge_unique_filenames(existing: list[str], incoming: list[str]) -> tuple[list[str], list[str]]:
         merged: list[str] = []
         seen: set[str] = set()
@@ -830,6 +846,303 @@ class IndexQueueStore:
             for job in jobs:
                 job["queue_position"] = self.queue_position(int(job.get("job_id", 0)), _conn=conn)
             return jobs
+
+    def remove_files_from_job(
+        self,
+        *,
+        job_id: int,
+        filenames: list[str] | tuple[str, ...] | set[str],
+        allow_running: bool = False,
+        reason: str = "Removed selected files from queue by user request.",
+    ) -> dict[str, Any]:
+        target_job_id = int(job_id or 0)
+        selected_filenames = self._normalize_optional_filenames(filenames)
+        if target_job_id <= 0:
+            raise ValueError("job_id must be greater than 0")
+        if not selected_filenames:
+            raise ValueError("filenames is required")
+
+        selected_set = set(selected_filenames)
+        now = self._utc_now_iso()
+        safe_reason = str(reason or "").strip() or "Removed selected files from queue by user request."
+
+        with self._lock, self._managed_connection() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM index_job_queue
+                WHERE id = ?
+                LIMIT 1
+                """,
+                (target_job_id,),
+            ).fetchone()
+            if row is None:
+                return {
+                    "job_id": target_job_id,
+                    "found": False,
+                    "deleted_job": False,
+                    "blocked_running": False,
+                    "requested_count": len(selected_filenames),
+                    "removed_count": 0,
+                    "remaining_count": 0,
+                    "removed_filenames": [],
+                    "remaining_filenames": [],
+                    "not_found_filenames": list(selected_filenames),
+                    "message": "Queue job not found.",
+                }
+
+            job = self._row_to_job(row)
+            status = str(job.get("status") or "").strip().lower()
+            case_id = str(job.get("case_id") or "").strip()
+            job_kind = self._normalize_job_kind(str(job.get("job_kind") or self.DEFAULT_JOB_KIND))
+            payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
+            payload = dict(payload)
+            payload["job_kind"] = job_kind
+            existing_filenames = self._normalize_optional_filenames(payload.get("filenames"))
+            existing_set = set(existing_filenames)
+            removed_filenames = [name for name in existing_filenames if name in selected_set]
+            remaining_filenames = [name for name in existing_filenames if name not in selected_set]
+            not_found_filenames = [name for name in selected_filenames if name not in existing_set]
+
+            if status == "running" and not bool(allow_running):
+                return {
+                    "job_id": target_job_id,
+                    "case_id": case_id,
+                    "job_kind": job_kind,
+                    "status": status,
+                    "found": True,
+                    "deleted_job": False,
+                    "blocked_running": True,
+                    "requested_count": len(selected_filenames),
+                    "removed_count": 0,
+                    "remaining_count": len(existing_filenames),
+                    "removed_filenames": [],
+                    "remaining_filenames": existing_filenames,
+                    "not_found_filenames": not_found_filenames,
+                    "queue_position": 0,
+                    "message": "Cannot remove files from a running queue job.",
+                }
+
+            if not removed_filenames:
+                queue_position = self.queue_position(target_job_id, _conn=conn) if status == "queued" else 0
+                return {
+                    "job_id": target_job_id,
+                    "case_id": case_id,
+                    "job_kind": job_kind,
+                    "status": status,
+                    "found": True,
+                    "deleted_job": False,
+                    "blocked_running": False,
+                    "requested_count": len(selected_filenames),
+                    "removed_count": 0,
+                    "remaining_count": len(existing_filenames),
+                    "removed_filenames": [],
+                    "remaining_filenames": existing_filenames,
+                    "not_found_filenames": not_found_filenames,
+                    "queue_position": queue_position,
+                    "message": "No matching filenames found in queue job.",
+                }
+
+            metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+            metadata = dict(metadata)
+            remaining_set = set(remaining_filenames)
+
+            if metadata:
+                for key in (
+                    "analysis_face_people_filenames",
+                    "analysis_vehicles_filenames",
+                ):
+                    if key not in metadata:
+                        continue
+                    normalized = self._normalize_optional_filenames(metadata.get(key))
+                    filtered = [name for name in normalized if name in remaining_set]
+                    if filtered:
+                        metadata[key] = filtered
+                    else:
+                        metadata.pop(key, None)
+
+                if job_kind == "analysis":
+                    face_people_enabled = bool(metadata.get("analysis_face_people", False))
+                    vehicles_enabled = bool(metadata.get("analysis_vehicles", False))
+                    face_people_key_present = "analysis_face_people_filenames" in metadata
+                    vehicles_key_present = "analysis_vehicles_filenames" in metadata
+
+                    if face_people_key_present and not metadata.get("analysis_face_people_filenames"):
+                        face_people_enabled = False
+                    if vehicles_key_present and not metadata.get("analysis_vehicles_filenames"):
+                        vehicles_enabled = False
+
+                    metadata["analysis_face_people"] = bool(face_people_enabled)
+                    metadata["analysis_vehicles"] = bool(vehicles_enabled)
+
+                    effective_targets: list[str] = []
+                    if face_people_enabled:
+                        if face_people_key_present:
+                            effective_targets.extend(
+                                self._normalize_optional_filenames(metadata.get("analysis_face_people_filenames"))
+                            )
+                        else:
+                            effective_targets.extend(remaining_filenames)
+                    if vehicles_enabled:
+                        if vehicles_key_present:
+                            effective_targets.extend(
+                                self._normalize_optional_filenames(metadata.get("analysis_vehicles_filenames"))
+                            )
+                        else:
+                            effective_targets.extend(remaining_filenames)
+
+                    normalized_targets = self._normalize_optional_filenames(effective_targets)
+                    if normalized_targets:
+                        target_set = set(normalized_targets)
+                        remaining_filenames = [name for name in remaining_filenames if name in target_set]
+                        remaining_set = set(remaining_filenames)
+
+                        for key in (
+                            "analysis_face_people_filenames",
+                            "analysis_vehicles_filenames",
+                        ):
+                            if key not in metadata:
+                                continue
+                            normalized = self._normalize_optional_filenames(metadata.get(key))
+                            filtered = [name for name in normalized if name in remaining_set]
+                            if filtered:
+                                metadata[key] = filtered
+                            else:
+                                metadata.pop(key, None)
+                    else:
+                        remaining_filenames = []
+                        remaining_set = set()
+
+                if not metadata:
+                    payload.pop("metadata", None)
+                else:
+                    payload["metadata"] = metadata
+
+            payload["filenames"] = remaining_filenames
+
+            if not remaining_filenames:
+                if status == "running":
+                    conn.execute(
+                        """
+                        UPDATE index_job_queue
+                        SET status = 'cancelled',
+                            error = CASE
+                                WHEN error = '' THEN ?
+                                ELSE error
+                            END,
+                            finished_at = CASE
+                                WHEN finished_at = '' THEN ?
+                                ELSE finished_at
+                            END,
+                            updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (safe_reason, now, now, target_job_id),
+                    )
+                    refreshed_row = conn.execute(
+                        """
+                        SELECT *
+                        FROM index_job_queue
+                        WHERE id = ?
+                        """,
+                        (target_job_id,),
+                    ).fetchone()
+                    conn.commit()
+                    refreshed_job = self._row_to_job(refreshed_row) if refreshed_row is not None else None
+                    return {
+                        "job_id": target_job_id,
+                        "case_id": case_id,
+                        "job_kind": job_kind,
+                        "status": "cancelled",
+                        "found": True,
+                        "deleted_job": False,
+                        "blocked_running": False,
+                        "requested_count": len(selected_filenames),
+                        "removed_count": len(removed_filenames),
+                        "remaining_count": 0,
+                        "removed_filenames": removed_filenames,
+                        "remaining_filenames": [],
+                        "not_found_filenames": not_found_filenames,
+                        "queue_position": 0,
+                        "job": refreshed_job,
+                        "message": "Running queue job cancelled after removing all files.",
+                    }
+
+                conn.execute(
+                    """
+                    DELETE FROM index_job_queue
+                    WHERE id = ?
+                    """,
+                    (target_job_id,),
+                )
+                conn.commit()
+                return {
+                    "job_id": target_job_id,
+                    "case_id": case_id,
+                    "job_kind": job_kind,
+                    "status": status,
+                    "found": True,
+                    "deleted_job": True,
+                    "blocked_running": False,
+                    "requested_count": len(selected_filenames),
+                    "removed_count": len(removed_filenames),
+                    "remaining_count": 0,
+                    "removed_filenames": removed_filenames,
+                    "remaining_filenames": [],
+                    "not_found_filenames": not_found_filenames,
+                    "queue_position": 0,
+                    "job": None,
+                    "message": "Queue job removed after removing all files.",
+                }
+
+            updated_dedupe_key = self._dedupe_key(payload)
+            conn.execute(
+                """
+                UPDATE index_job_queue
+                SET payload_json = ?,
+                    dedupe_key = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    json.dumps(payload, ensure_ascii=True),
+                    updated_dedupe_key,
+                    now,
+                    target_job_id,
+                ),
+            )
+            refreshed_row = conn.execute(
+                """
+                SELECT *
+                FROM index_job_queue
+                WHERE id = ?
+                """,
+                (target_job_id,),
+            ).fetchone()
+            conn.commit()
+            refreshed_job = self._row_to_job(refreshed_row) if refreshed_row is not None else None
+            queue_position = self.queue_position(target_job_id, _conn=conn) if status == "queued" else 0
+            if isinstance(refreshed_job, dict):
+                refreshed_job["queue_position"] = queue_position
+
+            return {
+                "job_id": target_job_id,
+                "case_id": case_id,
+                "job_kind": job_kind,
+                "status": status,
+                "found": True,
+                "deleted_job": False,
+                "blocked_running": False,
+                "requested_count": len(selected_filenames),
+                "removed_count": len(removed_filenames),
+                "remaining_count": len(remaining_filenames),
+                "removed_filenames": removed_filenames,
+                "remaining_filenames": remaining_filenames,
+                "not_found_filenames": not_found_filenames,
+                "queue_position": queue_position,
+                "job": refreshed_job,
+                "message": "Queue job updated.",
+            }
 
     def delete_jobs(
         self,
