@@ -120,6 +120,38 @@ class FaceIdentityStore:
                 return False
             return any(int(item_id) in self.entries for item_id in ids if isinstance(item_id, int))
 
+    def count_video_entries(self, video_filename: str) -> int:
+        safe_name = str(video_filename or "").strip()
+        if not safe_name:
+            return 0
+        with self._lock:
+            ids = self.video_entries.get(safe_name, [])
+            if not isinstance(ids, list) or not ids:
+                return 0
+            count = 0
+            for item_id in ids:
+                if not isinstance(item_id, int):
+                    continue
+                if int(item_id) in self.entries:
+                    count += 1
+            return int(count)
+
+    def counts_by_video_filename(self) -> dict[str, int]:
+        with self._lock:
+            output: dict[str, int] = {}
+            for raw_name, raw_ids in self.video_entries.items():
+                safe_name = str(raw_name or "").strip()
+                if not safe_name or not isinstance(raw_ids, list):
+                    continue
+                count = 0
+                for item_id in raw_ids:
+                    if not isinstance(item_id, int):
+                        continue
+                    if int(item_id) in self.entries:
+                        count += 1
+                output[safe_name] = int(count)
+            return output
+
     def delete_video(self, video_filename: str) -> dict[str, int]:
         safe_name = str(video_filename or "").strip()
         if not safe_name:

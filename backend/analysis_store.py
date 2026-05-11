@@ -282,6 +282,43 @@ class AnalysisCropStore:
                     break
             return results
 
+    def list_video_items(
+        self,
+        *,
+        category: str,
+        video_filename: str,
+        limit: int = 4000,
+        kind: str | None = None,
+    ) -> list[dict[str, Any]]:
+        normalized_category = self._normalize_category(category)
+        target_video = str(video_filename or "").strip()
+        normalized_kind = self._normalize_kind(kind)
+        if not target_video:
+            return []
+
+        safe_limit = max(1, min(100000, int(limit)))
+        with self._lock:
+            state = self._states[normalized_category]
+            candidate_ids = [
+                int(item_id)
+                for item_id in (state.video_entries.get(target_video) or [])
+                if isinstance(item_id, int)
+            ]
+            if not candidate_ids:
+                return []
+
+            results: list[dict[str, Any]] = []
+            for vector_id in sorted(candidate_ids):
+                item = state.entries.get(int(vector_id))
+                if not isinstance(item, dict):
+                    continue
+                if normalized_kind and str(item.get("kind", "")).lower() != normalized_kind:
+                    continue
+                results.append(dict(item))
+                if len(results) >= safe_limit:
+                    break
+            return results
+
     def search(
         self,
         *,

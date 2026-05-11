@@ -71,6 +71,7 @@ def build_media_router(*, media_service: MediaService) -> APIRouter:
             force=request.force,
             analysis_face_people=request.analysis_face_people,
             analysis_vehicles=request.analysis_vehicles,
+            analysis_face_identity=request.analysis_face_identity,
             analysis_only=request.analysis_only,
         )
 
@@ -94,6 +95,7 @@ def build_media_router(*, media_service: MediaService) -> APIRouter:
             force=request.force,
             analysis_face_people=request.analysis_face_people,
             analysis_vehicles=request.analysis_vehicles,
+            analysis_face_identity=request.analysis_face_identity,
         )
 
     @router.get("/index/status")
@@ -104,8 +106,9 @@ def build_media_router(*, media_service: MediaService) -> APIRouter:
     async def get_background_analysis_status(
         case_id: str | None = None,
         category: str | None = Query(default=None),
+        job_id: int | None = Query(default=None, ge=1),
     ) -> dict:
-        return await media_service.get_background_analysis_status(case_id, category)
+        return await media_service.get_background_analysis_status(case_id, category, job_id)
 
     # Compatibility alias for older frontend builds.
     @router.post("/analysis/interrupted/cancel_selected")

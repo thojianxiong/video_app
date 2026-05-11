@@ -30,11 +30,19 @@ let embeddingProfileSelect = null;
 let embeddingDeviceSelect = null;
 let saveEmbeddingSettingsBtn = null;
 let embeddingSettingsMeta = null;
+let faceIdentityEnabledToggle = null;
+let saveFaceIdentitySettingsBtn = null;
+let faceIdentitySettingsMeta = null;
+let faceIdentityToggleState = null;
 let analysisStatus = null;
 let facePeopleQueueSummaryBtn = null;
 let runFacePeopleSelectedBtn = null;
 let runVehiclesSelectedBtn = null;
 let vehicleQueueSummaryBtn = null;
+let facePeopleAnalysisSelectAll = null;
+let vehicleAnalysisSelectAll = null;
+let facePeopleAnalysisSelectionMeta = null;
+let vehicleAnalysisSelectionMeta = null;
 let mainTabTriageBtn = null;
 let mainTabSemanticBtn = null;
 let mainTabFacePeopleBtn = null;
@@ -84,6 +92,8 @@ let queueTaskPopupSelectAll = null;
 let queueTaskPopupRestartBtn = null;
 let queueTaskPopupCancelBtn = null;
 let queueTaskPopupRemoveFilesBtn = null;
+let queueTaskPopupRunBtn = null;
+let queueTaskPopupStopBtn = null;
 let queueTaskPopupDeleteBtn = null;
 let queueTaskPopupSelectionMeta = null;
 let queueTaskPopupRecoveryStatus = null;
@@ -114,6 +124,8 @@ let workspaceQueuePage = null;
 let reportQueueRefreshBtn = null;
 let reportQueueStatus = null;
 let reportQueueList = null;
+let reportQueueBlocker = null;
+let reportQueueCompletedList = null;
 let caseSidebar = null;
 let sidebarResizeHandle = null;
 
@@ -125,6 +137,7 @@ const state = {
   workspaceView: "analysis",
   embeddingProfiles: [],
   embeddingSettings: null,
+  analysisSettings: null,
   searchSettings: null,
 };
 let caseSwitchVersion = 0;
@@ -169,6 +182,7 @@ const RESUMABLE_UPLOAD_CHUNK_RETRIES = 3;
 const RESUMABLE_UPLOAD_RETRY_DELAY_MS = 350;
 const DUPLICATE_FINGERPRINT_SAMPLE_BYTES = 1024 * 1024;
 const duplicateFingerprintPromiseCache = new WeakMap();
+const ANALYSIS_SETTINGS_ENDPOINT = "/settings/analysis";
 
 function bindDomElements() {
   videoInput = document.getElementById("videoInput");
@@ -203,11 +217,19 @@ function bindDomElements() {
   embeddingDeviceSelect = document.getElementById("embeddingDeviceSelect");
   saveEmbeddingSettingsBtn = document.getElementById("saveEmbeddingSettingsBtn");
   embeddingSettingsMeta = document.getElementById("embeddingSettingsMeta");
+  faceIdentityEnabledToggle = document.getElementById("faceIdentityEnabledToggle");
+  saveFaceIdentitySettingsBtn = document.getElementById("saveFaceIdentitySettingsBtn");
+  faceIdentitySettingsMeta = document.getElementById("faceIdentitySettingsMeta");
+  faceIdentityToggleState = document.getElementById("faceIdentityToggleState");
   analysisStatus = document.getElementById("analysisStatus");
   facePeopleQueueSummaryBtn = document.getElementById("facePeopleQueueSummaryBtn");
   runFacePeopleSelectedBtn = document.getElementById("runFacePeopleSelectedBtn");
   runVehiclesSelectedBtn = document.getElementById("runVehiclesSelectedBtn");
   vehicleQueueSummaryBtn = document.getElementById("vehicleQueueSummaryBtn");
+  facePeopleAnalysisSelectAll = document.getElementById("facePeopleAnalysisSelectAll");
+  vehicleAnalysisSelectAll = document.getElementById("vehicleAnalysisSelectAll");
+  facePeopleAnalysisSelectionMeta = document.getElementById("facePeopleAnalysisSelectionMeta");
+  vehicleAnalysisSelectionMeta = document.getElementById("vehicleAnalysisSelectionMeta");
   mainTabTriageBtn = document.getElementById("mainTabTriageBtn");
   mainTabSemanticBtn = document.getElementById("mainTabSemanticBtn");
   mainTabFacePeopleBtn = document.getElementById("mainTabFacePeopleBtn");
@@ -257,6 +279,8 @@ function bindDomElements() {
   queueTaskPopupRestartBtn = document.getElementById("queueTaskPopupRestartBtn");
   queueTaskPopupCancelBtn = document.getElementById("queueTaskPopupCancelBtn");
   queueTaskPopupRemoveFilesBtn = document.getElementById("queueTaskPopupRemoveFilesBtn");
+  queueTaskPopupRunBtn = document.getElementById("queueTaskPopupRunBtn");
+  queueTaskPopupStopBtn = document.getElementById("queueTaskPopupStopBtn");
   queueTaskPopupDeleteBtn = document.getElementById("queueTaskPopupDeleteBtn");
   queueTaskPopupSelectionMeta = document.getElementById("queueTaskPopupSelectionMeta");
   queueTaskPopupRecoveryStatus = document.getElementById("queueTaskPopupRecoveryStatus");
@@ -287,6 +311,8 @@ function bindDomElements() {
   reportQueueRefreshBtn = document.getElementById("reportQueueRefreshBtn");
   reportQueueStatus = document.getElementById("reportQueueStatus");
   reportQueueList = document.getElementById("reportQueueList");
+  reportQueueBlocker = document.getElementById("reportQueueBlocker");
+  reportQueueCompletedList = document.getElementById("reportQueueCompletedList");
   caseSidebar = document.querySelector(".case-sidebar");
   sidebarResizeHandle = document.getElementById("sidebarResizeHandle");
 }
@@ -305,6 +331,37 @@ function setEmbeddingStatus(message, kind = "") {
   }
   embeddingSettingsMeta.textContent = message;
   embeddingSettingsMeta.className = `status ${kind}`.trim();
+}
+
+function setFaceIdentitySettingsStatus(message, kind = "") {
+  if (!faceIdentitySettingsMeta) {
+    return;
+  }
+  faceIdentitySettingsMeta.textContent = String(message || "");
+  faceIdentitySettingsMeta.className = `status ${kind}`.trim();
+}
+
+function setFaceIdentityToggleStateDisplay(options = {}) {
+  if (!faceIdentityToggleState) {
+    return;
+  }
+  const savedEnabled = Boolean(options.savedEnabled);
+  const toggleEnabled = options.toggleEnabled === undefined
+    ? Boolean(faceIdentityEnabledToggle?.checked)
+    : Boolean(options.toggleEnabled);
+  const hasUnsavedChange = toggleEnabled !== savedEnabled;
+
+  faceIdentityToggleState.className = "face-identity-toggle-state";
+  faceIdentityToggleState.classList.add(toggleEnabled ? "state-on" : "state-off");
+  if (hasUnsavedChange) {
+    faceIdentityToggleState.classList.add("state-pending");
+  }
+
+  let text = `Current state: ${toggleEnabled ? "on" : "off"}`;
+  if (hasUnsavedChange) {
+    text += " (not saved)";
+  }
+  faceIdentityToggleState.textContent = text;
 }
 
 function setAnalysisStatus(message, kind = "") {
@@ -361,6 +418,20 @@ function setReportQueueStatus(message, kind = "") {
   }
   reportQueueStatus.textContent = String(message || "");
   reportQueueStatus.className = `status ${kind}`.trim();
+}
+
+function setReportQueueBlocker(message = "") {
+  if (!reportQueueBlocker) {
+    return;
+  }
+  const text = String(message || "").trim();
+  if (!text) {
+    reportQueueBlocker.textContent = "";
+    reportQueueBlocker.setAttribute("hidden", "");
+    return;
+  }
+  reportQueueBlocker.textContent = text;
+  reportQueueBlocker.removeAttribute("hidden");
 }
 
 function formatProcessSummaryForConfirm(processPayload) {
@@ -1675,11 +1746,15 @@ function openAnalysisQueueSummaryPopup(category) {
   }
   const queue = payload.queue && typeof payload.queue === "object" ? payload.queue : {};
   const analysis = payload.analysis && typeof payload.analysis === "object" ? payload.analysis : {};
+  const analysisFaceIdentity = Boolean(analysis.face_identity);
   const facePeopleFilenames = Array.isArray(payload.analysis_face_people_filenames)
     ? payload.analysis_face_people_filenames
     : [];
   const vehiclesFilenames = Array.isArray(payload.analysis_vehicles_filenames)
     ? payload.analysis_vehicles_filenames
+    : [];
+  const faceIdentityFilenames = Array.isArray(payload.analysis_face_identity_filenames)
+    ? payload.analysis_face_identity_filenames
     : [];
   openQueueTaskPopup({
     type: "queue_job",
@@ -1695,8 +1770,10 @@ function openAnalysisQueueSummaryPopup(category) {
     metadata: {
       analysis_face_people: Boolean(analysis.face_people),
       analysis_vehicles: Boolean(analysis.vehicles),
+      analysis_face_identity: analysisFaceIdentity,
       analysis_face_people_filenames: facePeopleFilenames,
       analysis_vehicles_filenames: vehiclesFilenames,
+      analysis_face_identity_filenames: faceIdentityFilenames,
     },
     file_progress: Array.isArray(payload.file_progress) ? payload.file_progress : [],
     recovery_category: normalizedCategory,
@@ -1956,9 +2033,12 @@ function formatAnalysisQueueStatusMessage(category, statusPayload, options = {})
   const analysisModes = analysisModesLabelFromFlags(
     Boolean(analysisInfo.face_people),
     Boolean(analysisInfo.vehicles),
+    Boolean(analysisInfo.face_identity),
   );
   if (analysisModes) {
-    const sharedLabel = Boolean(analysisInfo.face_people) && Boolean(analysisInfo.vehicles)
+    const sharedLabel = (
+      Boolean(analysisInfo.face_people) && Boolean(analysisInfo.vehicles)
+    )
       ? " (shared job)"
       : "";
     parts.push(`Modes: ${analysisModes}${sharedLabel}.`);
@@ -2276,6 +2356,82 @@ function normalizedVideoAnalysis(video) {
   };
 }
 
+function normalizedFaceIdentityAnalysis(video) {
+  const payload = video && typeof video.analysis === "object" ? video.analysis : {};
+  const faceIdentity =
+    payload.face_identity && typeof payload.face_identity === "object" ? payload.face_identity : {};
+  const pipeline = video && typeof video.pipeline === "object" ? video.pipeline : {};
+  const stages = pipeline && typeof pipeline.stages === "object" ? pipeline.stages : {};
+  const analysisStage =
+    stages && stages.analysis && typeof stages.analysis === "object" ? stages.analysis : {};
+  const details = analysisStage && typeof analysisStage.details === "object" ? analysisStage.details : {};
+  const metadata = pipeline && typeof pipeline.metadata === "object" ? pipeline.metadata : {};
+
+  const stageStatus = String(analysisStage.status || "").trim().toLowerCase();
+  const explicitStatus = String(faceIdentity.status || details.face_identity_status || "").trim().toLowerCase();
+  const requestedFromDetails = Boolean(details.analysis_face_identity);
+  const requestedFromMetadata = Boolean(metadata.analysis_face_identity);
+  const requestedFromStatus = Boolean(explicitStatus && explicitStatus !== "not_requested");
+  const requested = requestedFromDetails || requestedFromMetadata || requestedFromStatus;
+
+  let status = explicitStatus;
+  if (!status) {
+    status = requested ? (stageStatus || "pending") : "off";
+  }
+  if (status === "analysis_only") {
+    status = "completed";
+  }
+
+  const indexedRaw = Number(faceIdentity.indexed ?? details.face_identity_indexed ?? 0);
+  const indexed = Number.isFinite(indexedRaw) ? Math.max(0, Math.floor(indexedRaw)) : 0;
+  const reason = String(faceIdentity.reason || details.face_identity_reason || "").trim();
+
+  return {
+    requested: Boolean(requested),
+    status: String(status || "off"),
+    indexed,
+    reason,
+  };
+}
+
+function formatFace01SelectionStatus(video) {
+  const facePeople = normalizedVideoAnalysis(video).face_people;
+  if (!facePeople.processed) {
+    return "FACE-01 not run";
+  }
+  return `FACE-01 done (faces ${facePeople.face_count}, people ${facePeople.people_count})`;
+}
+
+function formatFace02SelectionStatus(video) {
+  const faceIdentity = normalizedFaceIdentityAnalysis(video);
+  const status = String(faceIdentity.status || "").trim().toLowerCase();
+  if (status === "processed" || status === "completed") {
+    if (faceIdentity.indexed > 0) {
+      return `FACE-02 done (${faceIdentity.indexed} embeddings)`;
+    }
+    return "FACE-02 done";
+  }
+  if (status === "running") {
+    return "FACE-02 running";
+  }
+  if (status === "queued" || status === "pending" || status === "starting") {
+    return "FACE-02 queued";
+  }
+  if (status === "failed" || status === "error" || status === "unavailable") {
+    return "FACE-02 failed";
+  }
+  if (status === "interrupted" || status === "aborted") {
+    return "FACE-02 interrupted";
+  }
+  if (status === "cancelled" || status === "canceled") {
+    return "FACE-02 cancelled";
+  }
+  if (status === "skipped") {
+    return "FACE-02 skipped";
+  }
+  return "FACE-02 off";
+}
+
 function formatFirstHit(firstHitSeconds) {
   if (firstHitSeconds === null || firstHitSeconds === undefined) {
     return "n/a";
@@ -2363,16 +2519,13 @@ function queueJobKindLabel(jobKind, processItem = null) {
   }
   if (kind === "analysis") {
     const metadata = processItem && typeof processItem.metadata === "object" ? processItem.metadata : {};
-    const facePeople = Boolean(metadata.analysis_face_people);
-    const vehicles = Boolean(metadata.analysis_vehicles);
-    if (facePeople && vehicles) {
-      return "Analysis (Face & People + Vehicles)";
-    }
-    if (facePeople) {
-      return "Analysis (Face & People)";
-    }
-    if (vehicles) {
-      return "Analysis (Vehicles)";
+    const modesLabel = analysisModesLabelFromFlags(
+      Boolean(metadata.analysis_face_people),
+      Boolean(metadata.analysis_vehicles),
+      Boolean(metadata.analysis_face_identity),
+    );
+    if (modesLabel) {
+      return `Analysis (${modesLabel})`;
     }
     return "Analysis";
   }
@@ -2382,19 +2535,24 @@ function queueJobKindLabel(jobKind, processItem = null) {
   return kind;
 }
 
-function analysisModesLabelFromFlags(facePeople, vehicles) {
+function analysisModesLabelFromFlags(facePeople, vehicles, faceIdentity = false) {
   const hasFacePeople = Boolean(facePeople);
   const hasVehicles = Boolean(vehicles);
-  if (hasFacePeople && hasVehicles) {
-    return "Face & People + Vehicles";
-  }
+  const hasFaceIdentity = Boolean(faceIdentity);
+  const labels = [];
   if (hasFacePeople) {
-    return "Face & People";
+    labels.push("Face & People");
   }
   if (hasVehicles) {
-    return "Vehicles";
+    labels.push("Vehicles");
   }
-  return "";
+  if (hasFaceIdentity) {
+    labels.push("Face Identity");
+  }
+  if (!labels.length) {
+    return "";
+  }
+  return labels.join(" + ");
 }
 
 function queueTaskFilenames(item) {
@@ -2484,19 +2642,25 @@ function queueTaskAnalysisModesForFilename(item, filename) {
   const metadata = item?.metadata && typeof item.metadata === "object" ? item.metadata : {};
   const facePeopleSet = new Set(normalizeStringList(metadata.analysis_face_people_filenames));
   const vehiclesSet = new Set(normalizeStringList(metadata.analysis_vehicles_filenames));
-  const hasPerFileLists = facePeopleSet.size > 0 || vehiclesSet.size > 0;
+  const faceIdentitySet = new Set(normalizeStringList(metadata.analysis_face_identity_filenames));
+  const hasPerFileLists = facePeopleSet.size > 0 || vehiclesSet.size > 0 || faceIdentitySet.size > 0;
   const hasFacePeople = Boolean(metadata.analysis_face_people);
   const hasVehicles = Boolean(metadata.analysis_vehicles);
+  const hasFaceIdentity = Boolean(metadata.analysis_face_identity);
 
   if (hasPerFileLists) {
     const includeFacePeople = facePeopleSet.has(filename);
     const includeVehicles = vehiclesSet.has(filename);
+    const includeFaceIdentity = faceIdentitySet.has(filename);
     const modes = [];
     if (includeFacePeople) {
       modes.push({ label: "Face & People", key: "face_people" });
     }
     if (includeVehicles) {
       modes.push({ label: "Vehicles", key: "vehicles" });
+    }
+    if (includeFaceIdentity) {
+      modes.push({ label: "Face Identity", key: "face_identity" });
     }
     if (modes.length) {
       return modes;
@@ -2505,47 +2669,43 @@ function queueTaskAnalysisModesForFilename(item, filename) {
     return [{ label: "Analysis", key: "analysis" }];
   }
 
-  // No per-file mapping available; keep one row per file to avoid false duplication.
-  if (hasFacePeople && hasVehicles) {
-    return [{ label: "Face & People + Vehicles", key: "both" }];
-  }
+  // No per-file mapping available; show all enabled analysis modes as separate chips.
+  const sharedModes = [];
   if (hasFacePeople) {
-    return [{ label: "Face & People", key: "face_people" }];
+    sharedModes.push({ label: "Face & People", key: "face_people" });
   }
   if (hasVehicles) {
-    return [{ label: "Vehicles", key: "vehicles" }];
+    sharedModes.push({ label: "Vehicles", key: "vehicles" });
+  }
+  if (hasFaceIdentity) {
+    sharedModes.push({ label: "Face Identity", key: "face_identity" });
+  }
+  if (sharedModes.length) {
+    return sharedModes;
   }
 
-  return [{ label: "", key: "" }];
+  return [];
 }
 
 function expandQueueRowsByAnalysisModes(item, rows) {
   const safeRows = Array.isArray(rows) ? rows : [];
   const jobKind = String(item?.job_kind || "").trim().toLowerCase();
-  if (jobKind !== "analysis") {
-    return safeRows;
-  }
-
-  const expanded = [];
-  safeRows.forEach((row) => {
+  return safeRows.map((row) => {
     if (!row || typeof row !== "object") {
-      return;
+      return row;
+    }
+    if (jobKind !== "analysis") {
+      return {
+        ...row,
+        analysisModes: Array.isArray(row.analysisModes) ? row.analysisModes : [],
+      };
     }
     const filename = String(row.filename || "").trim();
-    if (!filename) {
-      expanded.push(row);
-      return;
-    }
-    const modes = queueTaskAnalysisModesForFilename(item, filename);
-    modes.forEach((mode) => {
-      expanded.push({
-        ...row,
-        analysisModeLabel: String(mode?.label || ""),
-        analysisModeKey: String(mode?.key || ""),
-      });
-    });
+    return {
+      ...row,
+      analysisModes: filename ? queueTaskAnalysisModesForFilename(item, filename) : [],
+    };
   });
-  return expanded;
 }
 
 function queueTaskStageStatusLabel(status) {
@@ -2554,6 +2714,48 @@ function queueTaskStageStatusLabel(status) {
     return "pending";
   }
   return normalized.replaceAll("_", " ");
+}
+
+function queueTaskPhaseLabel(phase, phaseLabel) {
+  const explicit = String(phaseLabel || "").trim();
+  if (explicit) {
+    return explicit;
+  }
+  const normalized = String(phase || "").trim().toLowerCase();
+  if (!normalized) {
+    return "";
+  }
+  const known = {
+    frame_scan: "Frame scan",
+    crop_embedding: "Crop embedding",
+    face_identity: "Face identity",
+    finalizing: "Finalizing",
+  };
+  if (known[normalized]) {
+    return known[normalized];
+  }
+  return normalized
+    .replaceAll("_", " ")
+    .replaceAll("-", " ")
+    .replace(/\b[a-z]/g, (char) => char.toUpperCase());
+}
+
+const QUEUE_ACTIONABLE_KINDS = new Set(["semantic_index", "analysis", "triage_timeline"]);
+
+function queueTaskNormalizedJobKind(item) {
+  return String(item?.job_kind || "")
+    .trim()
+    .toLowerCase();
+}
+
+function isQueueTaskActionableKind(item) {
+  return QUEUE_ACTIONABLE_KINDS.has(queueTaskNormalizedJobKind(item));
+}
+
+function isQueueTaskCurrentCase(item) {
+  const itemCaseId = String(item?.case_id || "").trim();
+  const activeCaseId = String(state.activeCaseId || "").trim();
+  return Boolean(itemCaseId) && Boolean(activeCaseId) && itemCaseId === activeCaseId;
 }
 
 function normalizeQueueTaskRecoveryCategory(value) {
@@ -2568,6 +2770,9 @@ function normalizeQueueTaskRecoveryCategory(value) {
 }
 
 function isQueueTaskRecoveryAvailable(item) {
+  if (!isQueueTaskCurrentCase(item)) {
+    return false;
+  }
   const status = String(item?.status || "").trim().toLowerCase();
   if (status !== "interrupted") {
     return false;
@@ -2585,8 +2790,11 @@ function isQueueTaskFileRemovalAvailable(item) {
   if (type !== "queue_job") {
     return false;
   }
+  if (!isQueueTaskActionableKind(item) || !isQueueTaskCurrentCase(item)) {
+    return false;
+  }
   const status = String(item?.status || "").trim().toLowerCase();
-  if (status !== "queued") {
+  if (!["queued", "running"].includes(status)) {
     return false;
   }
   const jobId = queueTaskPopupResolveJobId(item);
@@ -2611,12 +2819,15 @@ function formatQueueTimestamp(value) {
 function queueTaskPopupConfigureActionButtons(options = {}) {
   if (queueTaskPopupRestartBtn) {
     queueTaskPopupRestartBtn.hidden = !Boolean(options.restart);
+    queueTaskPopupRestartBtn.textContent = String(options.restartLabel || "Restart Selected");
   }
   if (queueTaskPopupCancelBtn) {
     queueTaskPopupCancelBtn.hidden = !Boolean(options.cancel);
+    queueTaskPopupCancelBtn.textContent = String(options.cancelLabel || "Cancel Selected");
   }
   if (queueTaskPopupRemoveFilesBtn) {
     queueTaskPopupRemoveFilesBtn.hidden = !Boolean(options.removeFiles);
+    queueTaskPopupRemoveFilesBtn.textContent = String(options.removeFilesLabel || "Remove Selected");
   }
 }
 
@@ -2639,6 +2850,12 @@ function queueTaskPopupResetRecovery() {
     cancel: false,
     removeFiles: false,
   });
+  if (queueTaskPopupRunBtn) {
+    queueTaskPopupRunBtn.setAttribute("hidden", "");
+  }
+  if (queueTaskPopupStopBtn) {
+    queueTaskPopupStopBtn.setAttribute("hidden", "");
+  }
   if (queueTaskPopupDeleteBtn) {
     queueTaskPopupDeleteBtn.setAttribute("hidden", "");
     queueTaskPopupDeleteBtn.textContent = "Delete Queue Item";
@@ -2668,23 +2885,52 @@ function queueTaskPopupResolveJobId(item) {
   return 0;
 }
 
-function queueTaskPopupConfigureDelete(item) {
-  if (!queueTaskPopupDeleteBtn) {
-    return;
+function queueTaskPopupHasCurrentCaseContext(item) {
+  if (!item || typeof item !== "object") {
+    return false;
   }
+  if (!isQueueTaskCurrentCase(item)) {
+    return false;
+  }
+  return isQueueTaskActionableKind(item);
+}
+
+function queueTaskPopupConfigurePrimaryActions(item) {
+  if (queueTaskPopupRunBtn) {
+    queueTaskPopupRunBtn.setAttribute("hidden", "");
+  }
+  if (queueTaskPopupStopBtn) {
+    queueTaskPopupStopBtn.setAttribute("hidden", "");
+  }
+  if (queueTaskPopupDeleteBtn) {
+    queueTaskPopupDeleteBtn.setAttribute("hidden", "");
+    queueTaskPopupDeleteBtn.textContent = "Delete Queue Item";
+  }
+
   const type = String(item?.type || "").trim().toLowerCase();
-  const jobId = queueTaskPopupResolveJobId(item);
-  if (!jobId) {
-    queueTaskPopupDeleteBtn.setAttribute("hidden", "");
-    return;
-  }
-  if (!["queue_job", "background_index", "analysis_interrupted"].includes(type)) {
-    queueTaskPopupDeleteBtn.setAttribute("hidden", "");
-    return;
-  }
   const status = String(item?.status || "").trim().toLowerCase();
-  queueTaskPopupDeleteBtn.textContent = status === "running" ? "Stop/Remove Queue Item" : "Delete Queue Item";
-  queueTaskPopupDeleteBtn.removeAttribute("hidden");
+  const jobId = queueTaskPopupResolveJobId(item);
+  if (type !== "queue_job" || !jobId || !queueTaskPopupHasCurrentCaseContext(item)) {
+    return;
+  }
+
+  if (queueTaskPopupRunBtn) {
+    if (status === "queued") {
+      queueTaskPopupRunBtn.removeAttribute("hidden");
+    } else {
+      queueTaskPopupRunBtn.setAttribute("hidden", "");
+    }
+  }
+  if (queueTaskPopupStopBtn) {
+    if (status === "queued" || status === "running") {
+      queueTaskPopupStopBtn.removeAttribute("hidden");
+    } else {
+      queueTaskPopupStopBtn.setAttribute("hidden", "");
+    }
+  }
+  if (queueTaskPopupDeleteBtn) {
+    queueTaskPopupDeleteBtn.removeAttribute("hidden");
+  }
 }
 
 async function deleteQueueItemFromPopup() {
@@ -2694,14 +2940,19 @@ async function deleteQueueItemFromPopup() {
     setStatus("No queue job selected to delete.", "error");
     return;
   }
-
+  if (!queueTaskPopupHasCurrentCaseContext(item)) {
+    setStatus("Queue actions are only available for the active case.", "error");
+    return;
+  }
+  const caseId = String(item?.case_id || "").trim();
   const status = String(item?.status || "").trim().toLowerCase();
-  const running = status === "running";
-  const confirmed = window.confirm(
-    running
-      ? `Job #${jobId} is running. Stop and remove it from queue tracking?`
-      : `Delete queue item #${jobId}?`,
-  );
+  if (status === "running") {
+    setStatus("Delete is queue-only. Stop the running job first.", "error");
+    queueTaskPopupSetRecoveryStatus("Delete is queue-only. Stop the running job first.", "error");
+    return;
+  }
+
+  const confirmed = window.confirm(`Delete queue item #${jobId} from queue only?`);
   if (!confirmed) {
     return;
   }
@@ -2711,16 +2962,18 @@ async function deleteQueueItemFromPopup() {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
+        case_id: caseId,
         job_ids: [jobId],
-        cancel_running: true,
+        cancel_running: false,
       }),
     });
 
     const removed = Math.max(0, Number(payload?.removed_count || 0));
-    const cancelledRunning = Math.max(0, Number(payload?.cancelled_running_count || 0));
-    const msg = running
-      ? `Queue item #${jobId} stop requested (${cancelledRunning} running cancelled, ${removed} removed).`
-      : `Queue item #${jobId} deleted (${removed} removed).`;
+    const skippedRunning = Math.max(0, Number(payload?.skipped_running_count || 0));
+    if (removed <= 0 && skippedRunning > 0) {
+      throw new Error("Queue item is running. Stop it first, then delete from queue.");
+    }
+    const msg = `Queue item #${jobId} deleted from queue (${removed} removed).`;
     setStatus(msg, "ok");
 
     const activeCaseId = String(state.activeCaseId || "").trim();
@@ -2739,6 +2992,126 @@ async function deleteQueueItemFromPopup() {
     const errorText = formatError(error);
     setStatus(`Delete queue item failed: ${errorText}`, "error");
     queueTaskPopupSetRecoveryStatus(`Delete queue item failed: ${errorText}`, "error");
+  }
+}
+
+async function stopQueueItemFromPopup() {
+  const item = queueTaskPopupCurrentItem;
+  const jobId = queueTaskPopupResolveJobId(item);
+  if (!jobId) {
+    setStatus("No queue job selected to stop.", "error");
+    return;
+  }
+  if (!queueTaskPopupHasCurrentCaseContext(item)) {
+    setStatus("Queue actions are only available for the active case.", "error");
+    return;
+  }
+  const caseId = String(item?.case_id || "").trim();
+  const confirmed = window.confirm(
+    `Stop queue item #${jobId} after the current in-flight step?`,
+  );
+  if (!confirmed) {
+    return;
+  }
+
+  try {
+    const payload = await fetchJson("/processes/queue/stop", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        case_id: caseId,
+        job_ids: [jobId],
+      }),
+    });
+    const cancelledCount = Math.max(0, Number(payload?.cancelled_count || 0));
+    const terminalCount = Math.max(0, Number(payload?.terminal_count || 0));
+    const msg =
+      cancelledCount > 0
+        ? `Stop requested for queue item #${jobId}.`
+        : terminalCount > 0
+          ? `Queue item #${jobId} is already in a terminal state.`
+          : `No stoppable queue item found for #${jobId}.`;
+    setStatus(msg, "ok");
+
+    const activeCaseId = String(state.activeCaseId || "").trim();
+    if (activeCaseId) {
+      await syncBackgroundIndexStatus(activeCaseId);
+      await Promise.all([
+        syncAnalysisQueueStatus(activeCaseId, "face_people"),
+        syncAnalysisQueueStatus(activeCaseId, "vehicles"),
+      ]);
+    }
+    if (state.workspaceView === "queue") {
+      await refreshReportQueue({ silent: true });
+    }
+    closeQueueTaskPopup();
+  } catch (error) {
+    const errorText = formatError(error);
+    setStatus(`Stop queue item failed: ${errorText}`, "error");
+    queueTaskPopupSetRecoveryStatus(`Stop queue item failed: ${errorText}`, "error");
+  }
+}
+
+async function runQueueItemFromPopup(filenames = []) {
+  const item = queueTaskPopupCurrentItem;
+  const jobId = queueTaskPopupResolveJobId(item);
+  if (!jobId) {
+    setStatus("No queue job selected to run.", "error");
+    return;
+  }
+  if (!queueTaskPopupHasCurrentCaseContext(item)) {
+    setStatus("Queue actions are only available for the active case.", "error");
+    return;
+  }
+  const caseId = String(item?.case_id || "").trim();
+  const selected = Array.isArray(filenames)
+    ? filenames
+        .map((name) => String(name || "").trim())
+        .filter((name) => name.length > 0)
+    : [];
+  const withSelection = selected.length > 0;
+  const confirmed = window.confirm(
+    withSelection
+      ? `Move ${selected.length} selected file(s) to the front of queue item #${jobId}?`
+      : `Move queue item #${jobId} to the front?`,
+  );
+  if (!confirmed) {
+    return;
+  }
+
+  try {
+    const payload = await fetchJson("/processes/queue/run", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        case_id: caseId,
+        job_id: jobId,
+        filenames: selected,
+      }),
+    });
+    const frontApplied = Math.max(0, Number(payload?.front_applied_count || 0));
+    const msg = withSelection
+      ? `Run-now applied to ${frontApplied} selected file(s) in queue item #${jobId}.`
+      : `Queue item #${jobId} moved to front.`;
+    setStatus(msg, "ok");
+
+    const activeCaseId = String(state.activeCaseId || "").trim();
+    if (activeCaseId) {
+      await syncBackgroundIndexStatus(activeCaseId);
+      await Promise.all([
+        syncAnalysisQueueStatus(activeCaseId, "face_people"),
+        syncAnalysisQueueStatus(activeCaseId, "vehicles"),
+      ]);
+    }
+    if (state.workspaceView === "queue") {
+      await refreshReportQueue({ silent: true });
+    }
+    closeQueueTaskPopup();
+  } catch (error) {
+    const errorText = formatError(error);
+    const prefix = withSelection ? "Run selected failed" : "Run now failed";
+    setStatus(`${prefix}: ${errorText}`, "error");
+    queueTaskPopupSetRecoveryStatus(`${prefix}: ${errorText}`, "error");
   }
 }
 
@@ -2841,11 +3214,16 @@ function queueTaskPopupConfigureFileRemoval(item, rows) {
     return;
   }
 
+  const popupStatus = String(item?.status || "").trim().toLowerCase();
   const uniqueFilenames = [];
   const seen = new Set();
   (Array.isArray(rows) ? rows : []).forEach((row) => {
     const safe = String(row?.filename || "").trim();
     if (!safe || seen.has(safe)) {
+      return;
+    }
+    const rowStatus = String(row?.status || "").trim().toLowerCase();
+    if (popupStatus === "running" && rowStatus === "running") {
       return;
     }
     seen.add(safe);
@@ -2856,22 +3234,29 @@ function queueTaskPopupConfigureFileRemoval(item, rows) {
   }
 
   queueTaskPopupRecoveryContext = {
-    mode: "remove_queue_files",
+    mode: "queue_manage_files",
     caseId: String(item?.case_id || "").trim(),
     category: "",
+    status: popupStatus,
     jobId: Math.max(0, Number(item?.queue_job_id || 0)),
     filenames: uniqueFilenames,
     selected: new Set(uniqueFilenames),
   };
+  const queuedMode = popupStatus === "queued";
   queueTaskPopupConfigureActionButtons({
-    restart: false,
-    cancel: false,
+    restart: queuedMode,
+    cancel: true,
     removeFiles: true,
+    restartLabel: "Run Selected",
+    cancelLabel: "Stop Selected",
+    removeFilesLabel: "Delete Selected",
   });
   queueTaskPopupRecovery.removeAttribute("hidden");
   queueTaskPopupUpdateRecoverySelectionMeta();
   queueTaskPopupSetRecoveryStatus(
-    "Select queued files to remove from this queue item.",
+    queuedMode
+      ? "Select queued files to run now, stop, or delete from queue."
+      : "Select pending files to stop or delete from this running queue item.",
     "working",
   );
 }
@@ -2882,6 +3267,7 @@ function queueTaskProgressRowsFromItem(item) {
     return [];
   }
 
+  const fallbackPhaseLabel = queueTaskPhaseLabel(item?.phase, item?.phase_label);
   const output = [];
   rawRows.forEach((rawRow) => {
     if (!rawRow || typeof rawRow !== "object") {
@@ -2909,6 +3295,13 @@ function queueTaskProgressRowsFromItem(item) {
       const totalLabel = estimatedTotalFrames > 0 ? String(estimatedTotalFrames) : "?";
       meta += ` | frames: ${processedFrames}/${totalLabel}`;
     }
+    const phaseLabel = queueTaskPhaseLabel(
+      rawRow.phase || rawRow.phase_name || rawRow.stage,
+      rawRow.phase_label || rawRow.phaseLabel || rawRow.stage_label,
+    ) || fallbackPhaseLabel;
+    if (phaseLabel) {
+      meta += ` | phase: ${phaseLabel}`;
+    }
     if (Boolean(rawRow.is_current)) {
       meta += " | active";
     }
@@ -2918,8 +3311,8 @@ function queueTaskProgressRowsFromItem(item) {
       status: queueTaskStageStatusLabel(status),
       progressPercent,
       meta,
-      analysisModeLabel: "",
-      analysisModeKey: "",
+      phaseLabel,
+      analysisModes: [],
     });
   });
 
@@ -2956,6 +3349,7 @@ function buildQueueTaskProgressRows(item, pipelinePayload) {
   const currentPercent = Number(item?.current_video_progress_percent || 0);
   const currentProcessedFrames = Math.max(0, Number(item?.current_video_processed_frames || 0));
   const currentTotalFrames = Math.max(0, Number(item?.current_video_total_frames || 0));
+  const fallbackPhaseLabel = queueTaskPhaseLabel(item?.phase, item?.phase_label);
 
   const rows = filenames.map((filename) => {
     const snapshot = byFilename.get(filename);
@@ -3003,6 +3397,13 @@ function buildQueueTaskProgressRows(item, pipelinePayload) {
       const totalLabel = estimatedTotalFrames > 0 ? String(estimatedTotalFrames) : "?";
       meta += ` | frames: ${processedFrames}/${totalLabel}`;
     }
+    const phaseLabel = queueTaskPhaseLabel(
+      details.phase || item?.phase,
+      details.phase_label || item?.phase_label,
+    ) || fallbackPhaseLabel;
+    if (phaseLabel) {
+      meta += ` | phase: ${phaseLabel}`;
+    }
     if (isCurrent) {
       meta += " | active";
     }
@@ -3011,8 +3412,8 @@ function buildQueueTaskProgressRows(item, pipelinePayload) {
       status: queueTaskStageStatusLabel(status),
       progressPercent,
       meta,
-      analysisModeLabel: "",
-      analysisModeKey: "",
+      phaseLabel,
+      analysisModes: [],
     };
   });
   return expandQueueRowsByAnalysisModes(item, rows);
@@ -3053,33 +3454,65 @@ function renderQueueTaskProgressRows(rows, options = {}) {
 
     const right = document.createElement("div");
     right.className = "queue-task-file-right";
-    if (rowData.analysisModeLabel) {
+    const modeChips = Array.isArray(rowData.analysisModes)
+      ? rowData.analysisModes
+      : (
+        rowData.analysisModeLabel
+          ? [{
+              label: String(rowData.analysisModeLabel || ""),
+              key: String(rowData.analysisModeKey || ""),
+            }]
+          : []
+      );
+    modeChips.forEach((modeData) => {
+      const modeLabel = String(modeData?.label || "").trim();
+      if (!modeLabel) {
+        return;
+      }
+      const safeModeKey = String(modeData?.key || "shared")
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9_-]/g, "_") || "shared";
       const mode = document.createElement("div");
       mode.className = "queue-task-file-mode";
-      mode.classList.add(`mode-${String(rowData.analysisModeKey || "shared")}`);
-      mode.textContent = String(rowData.analysisModeLabel);
+      mode.classList.add(`mode-${safeModeKey}`);
+      mode.textContent = modeLabel;
       right.appendChild(mode);
+    });
+    const phaseLabel = String(rowData.phaseLabel || rowData.phase_label || "").trim();
+    if (phaseLabel) {
+      const phase = document.createElement("div");
+      phase.className = "queue-task-file-phase";
+      phase.textContent = phaseLabel;
+      right.appendChild(phase);
     }
     right.appendChild(status);
 
     const selectable = Boolean(options.selectable);
+    const allowedSet = options.allowedFilenames instanceof Set ? options.allowedFilenames : null;
+    const rowFilename = String(rowData.filename || "");
+    const canSelectRow = !allowedSet || allowedSet.has(rowFilename);
     if (selectable) {
-      const left = document.createElement("div");
-      left.className = "queue-task-file-left";
-      const checkbox = document.createElement("input");
-      checkbox.type = "checkbox";
-      checkbox.className = "queue-task-file-select";
-      checkbox.dataset.filename = String(rowData.filename || "");
-      const selectedSet = options.selected instanceof Set ? options.selected : new Set();
-      checkbox.checked = selectedSet.has(String(rowData.filename || ""));
-      checkbox.addEventListener("change", () => {
-        if (typeof options.onToggle === "function") {
-          options.onToggle(String(rowData.filename || ""), Boolean(checkbox.checked));
-        }
-      });
-      left.appendChild(checkbox);
-      left.appendChild(name);
-      head.appendChild(left);
+      if (canSelectRow) {
+        const left = document.createElement("div");
+        left.className = "queue-task-file-left";
+        const checkbox = document.createElement("input");
+        checkbox.type = "checkbox";
+        checkbox.className = "queue-task-file-select";
+        checkbox.dataset.filename = rowFilename;
+        const selectedSet = options.selected instanceof Set ? options.selected : new Set();
+        checkbox.checked = selectedSet.has(rowFilename);
+        checkbox.addEventListener("change", () => {
+          if (typeof options.onToggle === "function") {
+            options.onToggle(rowFilename, Boolean(checkbox.checked));
+          }
+        });
+        left.appendChild(checkbox);
+        left.appendChild(name);
+        head.appendChild(left);
+      } else {
+        head.appendChild(name);
+      }
     } else {
       head.appendChild(name);
     }
@@ -3142,7 +3575,7 @@ function openQueueTaskPopup(item) {
   const fileRemovalEnabled = isQueueTaskFileRemovalAvailable(item);
   queueTaskPopupResetRecovery();
   queueTaskPopupCurrentItem = item && typeof item === "object" ? { ...item } : null;
-  queueTaskPopupConfigureDelete(queueTaskPopupCurrentItem);
+  queueTaskPopupConfigurePrimaryActions(queueTaskPopupCurrentItem);
 
   if (type === "background_index") {
     queueTaskPopupTitle.textContent = "Background Index Worker";
@@ -3194,6 +3627,9 @@ function openQueueTaskPopup(item) {
     {
       emptyMessage: "No file list reported yet.",
       selectable: recoveryEnabled || fileRemovalEnabled,
+      allowedFilenames: queueTaskPopupRecoveryContext?.filenames
+        ? new Set(queueTaskPopupRecoveryContext.filenames)
+        : null,
       selected: queueTaskPopupRecoveryContext?.selected || new Set(),
       onToggle: (filename, checked) => {
         const context = queueTaskPopupRecoveryContext;
@@ -3232,6 +3668,9 @@ function openQueueTaskPopup(item) {
       renderQueueTaskProgressRows(rows, {
         emptyMessage: "No file list reported yet.",
         selectable: recoveryEnabled || fileRemovalEnabled,
+        allowedFilenames: queueTaskPopupRecoveryContext?.filenames
+          ? new Set(queueTaskPopupRecoveryContext.filenames)
+          : null,
         selected: queueTaskPopupRecoveryContext?.selected || new Set(),
         onToggle: (filename, checked) => {
           const context = queueTaskPopupRecoveryContext;
@@ -3264,6 +3703,9 @@ function openQueueTaskPopup(item) {
       renderQueueTaskProgressRows([], {
         emptyMessage: `Unable to load per-file progress: ${formatError(error)}`,
         selectable: recoveryEnabled || fileRemovalEnabled,
+        allowedFilenames: queueTaskPopupRecoveryContext?.filenames
+          ? new Set(queueTaskPopupRecoveryContext.filenames)
+          : null,
         selected: queueTaskPopupRecoveryContext?.selected || new Set(),
         onToggle: (filename, checked) => {
           const context = queueTaskPopupRecoveryContext;
@@ -3311,6 +3753,7 @@ async function listInterruptedAnalysisQueueItems(caseId) {
     }
     const queue = payload.queue && typeof payload.queue === "object" ? payload.queue : {};
     const analysis = payload.analysis && typeof payload.analysis === "object" ? payload.analysis : {};
+    const analysisFaceIdentity = Boolean(analysis.face_identity);
     const facePeopleFilenames = Array.isArray(payload.analysis_face_people_filenames)
       ? payload.analysis_face_people_filenames
       : [];
@@ -3332,6 +3775,7 @@ async function listInterruptedAnalysisQueueItems(caseId) {
       metadata: {
         analysis_face_people: Boolean(analysis.face_people),
         analysis_vehicles: Boolean(analysis.vehicles),
+        analysis_face_identity: analysisFaceIdentity,
         analysis_face_people_filenames: facePeopleFilenames,
         analysis_vehicles_filenames: vehiclesFilenames,
       },
@@ -3343,18 +3787,20 @@ async function listInterruptedAnalysisQueueItems(caseId) {
   return output;
 }
 
-function renderReportQueueList(processesPayload) {
-  if (!reportQueueList) {
+function renderReportQueueList(processesPayload, options = {}) {
+  const targetList = options?.targetList || reportQueueList;
+  const emptyMessage = String(options?.emptyMessage || "No active background tasks.");
+  if (!targetList) {
     return;
   }
-  reportQueueList.innerHTML = "";
+  targetList.innerHTML = "";
 
   const processItems = Array.isArray(processesPayload?.processes) ? processesPayload.processes : [];
   if (!processItems.length) {
     const empty = document.createElement("div");
     empty.className = "empty";
-    empty.textContent = "No active background tasks.";
-    reportQueueList.appendChild(empty);
+    empty.textContent = emptyMessage;
+    targetList.appendChild(empty);
     return;
   }
 
@@ -3449,7 +3895,7 @@ function renderReportQueueList(processesPayload) {
       }
     });
 
-    reportQueueList.appendChild(row);
+    targetList.appendChild(row);
   });
 }
 
@@ -3497,24 +3943,47 @@ async function refreshReportQueue(options = {}) {
   if (!silent) {
     setReportQueueStatus("Loading queue status...", "working");
   }
+  setReportQueueBlocker("");
 
-  const payload = await fetchJson("/processes");
+  const activeCaseId = String(state.activeCaseId || "").trim();
+  const payload = await fetchJson(
+    activeCaseId ? withCaseQuery("/processes", activeCaseId) : "/processes",
+  );
   const processItemsRaw = Array.isArray(payload?.processes) ? payload.processes : [];
   const processItems = dedupeReportQueueItems(processItemsRaw);
   let interruptedItems = [];
-  const activeCaseId = String(state.activeCaseId || "").trim();
   if (activeCaseId) {
     interruptedItems = await listInterruptedAnalysisQueueItems(activeCaseId);
   }
   const mergedItems = [...processItems, ...interruptedItems];
+  const completedItemsRaw = Array.isArray(payload?.completed_processes)
+    ? payload.completed_processes
+    : [];
+  const completedItems = dedupeReportQueueItems(completedItemsRaw);
   const count = mergedItems.length;
   renderReportQueueList({
     ...payload,
     count,
     processes: mergedItems,
   });
+  if (reportQueueCompletedList) {
+    renderReportQueueList(
+      {
+        ...payload,
+        count: completedItems.length,
+        processes: completedItems,
+      },
+      {
+        targetList: reportQueueCompletedList,
+        emptyMessage: "No completed/recent jobs for this case.",
+      },
+    );
+  }
+  setReportQueueBlocker(String(payload?.blocking_message || ""));
   setReportQueueStatus(
-    count > 0 ? `${count} active/recovery background task(s).` : "No active background tasks.",
+    count > 0
+      ? `${count} active/recovery background task(s). Completed/recent: ${completedItems.length}.`
+      : `No active background tasks. Completed/recent: ${completedItems.length}.`,
     "ok",
   );
 }
@@ -3532,6 +4001,15 @@ function queueTaskPopupSelectedFilenames() {
 async function restartInterruptedAnalysisFromPopup() {
   const context = queueTaskPopupRecoveryContext;
   if (!context) {
+    return;
+  }
+  if (String(context.mode || "") === "queue_manage_files") {
+    const selected = queueTaskPopupSelectedFilenames();
+    if (!selected.length) {
+      queueTaskPopupSetRecoveryStatus("Select one or more files first.", "error");
+      return;
+    }
+    await runQueueItemFromPopup(selected);
     return;
   }
   const caseId = String(context.caseId || "").trim();
@@ -3566,6 +4044,7 @@ async function restartInterruptedAnalysisFromPopup() {
         force: false,
         analysis_face_people: category === "face_people",
         analysis_vehicles: category === "vehicles",
+        analysis_face_identity: category === "face_people" && isFaceIdentityEnabledSetting(),
       }),
     });
     const queueJobId = Math.max(0, Number(payload?.queue?.job_id || payload?.job_id || 0));
@@ -3583,6 +4062,10 @@ async function restartInterruptedAnalysisFromPopup() {
 async function cancelInterruptedAnalysisFromPopup() {
   const context = queueTaskPopupRecoveryContext;
   if (!context) {
+    return;
+  }
+  if (String(context.mode || "") === "queue_manage_files") {
+    await removeSelectedQueueFilesFromPopup({ asStop: true });
     return;
   }
   const caseId = String(context.caseId || "").trim();
@@ -3645,15 +4128,23 @@ async function cancelInterruptedAnalysisFromPopup() {
   }
 }
 
-async function removeSelectedQueueFilesFromPopup() {
+async function removeSelectedQueueFilesFromPopup(options = {}) {
+  const asStop = Boolean(options?.asStop);
   const context = queueTaskPopupRecoveryContext;
-  if (!context || String(context.mode || "") !== "remove_queue_files") {
+  if (!context || String(context.mode || "") !== "queue_manage_files") {
     return;
   }
   const jobId = Math.max(0, Number(context.jobId || 0));
+  const caseId = String(context.caseId || "").trim();
+  const queueStatus = String(context.status || "").trim().toLowerCase();
+  const allowRunning = queueStatus === "running";
   const filenames = queueTaskPopupSelectedFilenames();
   if (!jobId) {
     queueTaskPopupSetRecoveryStatus("Queue job is missing from popup context.", "error");
+    return;
+  }
+  if (!caseId) {
+    queueTaskPopupSetRecoveryStatus("Queue case context is missing.", "error");
     return;
   }
   if (!filenames.length) {
@@ -3661,19 +4152,28 @@ async function removeSelectedQueueFilesFromPopup() {
     return;
   }
 
-  const confirmed = window.confirm(`Remove ${filenames.length} selected file(s) from queue job #${jobId}?`);
+  const confirmed = window.confirm(
+    asStop
+      ? `Stop ${filenames.length} selected queued file(s) in queue job #${jobId}?`
+      : `Delete ${filenames.length} selected file(s) from queue job #${jobId}?`,
+  );
   if (!confirmed) {
     return;
   }
 
   try {
-    queueTaskPopupSetRecoveryStatus(`Removing ${filenames.length} file(s) from queue...`, "working");
+    queueTaskPopupSetRecoveryStatus(
+      `${asStop ? "Stopping" : "Deleting"} ${filenames.length} file(s) from queue...`,
+      "working",
+    );
     const payload = await fetchJson("/processes/queue/remove_files", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
+        case_id: caseId,
         job_id: jobId,
         filenames,
+        allow_running: allowRunning,
       }),
     });
 
@@ -3681,22 +4181,23 @@ async function removeSelectedQueueFilesFromPopup() {
     const remainingCount = Math.max(0, Number(payload?.remaining_count || 0));
     const deletedJob = Boolean(payload?.deleted_job);
     const notFoundCount = Math.max(0, Number((payload?.not_found_filenames || []).length));
-    const caseId = String(payload?.case_id || context.caseId || "").trim();
+    const responseCaseId = String(payload?.case_id || caseId || "").trim();
 
-    if (caseId) {
-      await syncBackgroundIndexStatus(caseId);
+    if (responseCaseId) {
+      await syncBackgroundIndexStatus(responseCaseId);
       await Promise.all([
-        syncAnalysisQueueStatus(caseId, "face_people"),
-        syncAnalysisQueueStatus(caseId, "vehicles"),
+        syncAnalysisQueueStatus(responseCaseId, "face_people"),
+        syncAnalysisQueueStatus(responseCaseId, "vehicles"),
       ]);
     }
     if (state.workspaceView === "queue") {
       await refreshReportQueue({ silent: true });
     }
 
+    const actionVerb = asStop ? "Stopped" : "Removed";
     const summary = deletedJob
-      ? `Removed ${removedCount} file(s). Queue job deleted.`
-      : `Removed ${removedCount} file(s). ${remainingCount} file(s) remain in queue item.`;
+      ? `${actionVerb} ${removedCount} file(s). Queue job deleted.`
+      : `${actionVerb} ${removedCount} file(s). ${remainingCount} file(s) remain in queue item.`;
     const extra = notFoundCount > 0 ? ` (${notFoundCount} selection(s) were no longer present.)` : "";
     queueTaskPopupSetRecoveryStatus(`${summary}${extra}`, "ok");
     setStatus(`${summary}${extra}`, "ok");
@@ -4370,6 +4871,107 @@ async function saveEmbeddingSettings() {
     setEmbeddingStatus(message, restartRequired ? "working" : "ok");
   } catch (error) {
     setEmbeddingStatus(`Save failed: ${formatError(error)}`, "error");
+  }
+}
+
+function isFaceIdentityEnabledSetting() {
+  return Boolean(state.analysisSettings?.saved?.face_identity_enabled);
+}
+
+function renderAnalysisSettings(payload) {
+  const settingsPayload = payload && typeof payload === "object" ? payload : {};
+  const savedRaw = settingsPayload.saved && typeof settingsPayload.saved === "object"
+    ? settingsPayload.saved
+    : {};
+  const recommendedRaw = settingsPayload.recommended && typeof settingsPayload.recommended === "object"
+    ? settingsPayload.recommended
+    : {};
+  const descriptions = settingsPayload.descriptions && typeof settingsPayload.descriptions === "object"
+    ? settingsPayload.descriptions
+    : {};
+
+  const savedEnabled = Boolean(savedRaw.face_identity_enabled);
+  const recommendedEnabled = Boolean(recommendedRaw.face_identity_enabled);
+
+  state.analysisSettings = {
+    saved: {
+      face_identity_enabled: savedEnabled,
+    },
+    recommended: {
+      face_identity_enabled: recommendedEnabled,
+    },
+    descriptions,
+  };
+
+  if (faceIdentityEnabledToggle) {
+    faceIdentityEnabledToggle.checked = savedEnabled;
+  }
+  setFaceIdentityToggleStateDisplay({
+    savedEnabled,
+    toggleEnabled: savedEnabled,
+  });
+
+  const description = String(descriptions.face_identity_enabled || "").trim();
+  const recommendation = recommendedEnabled
+    ? "Recommended default: on."
+    : "Recommended default: off.";
+  const message = [
+    `FACE-02 is ${savedEnabled ? "enabled" : "disabled"} for new Face & People analysis jobs.`,
+    description || recommendation,
+  ].filter(Boolean).join(" ");
+  setFaceIdentitySettingsStatus(message, "ok");
+}
+
+async function loadAnalysisSettings() {
+  if (!faceIdentityEnabledToggle && !faceIdentitySettingsMeta) {
+    return;
+  }
+  try {
+    const payload = await fetchJson("/settings/analysis");
+    renderAnalysisSettings(payload);
+  } catch (error) {
+    state.analysisSettings = {
+      saved: { face_identity_enabled: false },
+      recommended: { face_identity_enabled: false },
+      descriptions: {},
+    };
+    if (faceIdentityEnabledToggle) {
+      faceIdentityEnabledToggle.checked = false;
+    }
+    setFaceIdentityToggleStateDisplay({
+      savedEnabled: false,
+      toggleEnabled: false,
+    });
+    setFaceIdentitySettingsStatus(
+      `FACE-02 settings unavailable: ${formatError(error)}. Defaulting to off.`,
+      "error",
+    );
+  }
+}
+
+async function saveAnalysisSettings() {
+  if (!faceIdentityEnabledToggle) {
+    return;
+  }
+
+  const faceIdentityEnabled = Boolean(faceIdentityEnabledToggle.checked);
+  try {
+    setFaceIdentitySettingsStatus("Saving FACE-02 setting...", "working");
+    const payload = await fetchJson("/settings/analysis", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        face_identity_enabled: faceIdentityEnabled,
+      }),
+    });
+    renderAnalysisSettings(payload);
+    setFaceIdentitySettingsStatus(
+      `FACE-02 ${faceIdentityEnabled ? "enabled" : "disabled"} and saved.`,
+      "ok",
+    );
+    renderAnalysisSelectionLists();
+  } catch (error) {
+    setFaceIdentitySettingsStatus(`FACE-02 save failed: ${formatError(error)}`, "error");
   }
 }
 
@@ -6714,6 +7316,7 @@ function buildSelectionLabel(video, category) {
 }
 
 function renderAnalysisSelectionList(container, category) {
+  const safeCategory = normalizeAnalysisCategory(category);
   if (!container) {
     return;
   }
@@ -6723,6 +7326,7 @@ function renderAnalysisSelectionList(container, category) {
     container.appendChild(
       createInsightEmptyElement("Select a case first."),
     );
+    syncAnalysisSelectAllControl(safeCategory);
     return;
   }
 
@@ -6731,30 +7335,40 @@ function renderAnalysisSelectionList(container, category) {
     container.appendChild(
       createInsightEmptyElement("No videos in this case yet."),
     );
+    syncAnalysisSelectAllControl(safeCategory);
     return;
   }
 
   const sortedVideos = [...videos].sort((a, b) => String(a.filename).localeCompare(String(b.filename)));
   sortedVideos.forEach((video) => {
-    const analysis = normalizedVideoAnalysis(video)[category];
+    const analysis = normalizedVideoAnalysis(video)[safeCategory];
     const row = document.createElement("div");
     row.className = "analysis-video-item";
 
-    const label = buildSelectionLabel(video, category);
+    const label = buildSelectionLabel(video, safeCategory);
     const checkbox = label.querySelector("input.analysis-select-checkbox");
     if (checkbox) {
       checkbox.disabled = analysis.processed;
       checkbox.checked = false;
+      checkbox.addEventListener("change", () => {
+        syncAnalysisSelectAllControl(safeCategory);
+      });
     }
 
     const status = document.createElement("div");
     status.className = "analysis-video-status";
-    if (category === "face_people") {
-      if (analysis.processed) {
-        status.textContent = `Done | faces ${analysis.face_count} | people ${analysis.people_count} | first ${formatFirstHit(analysis.first_hit_seconds)}`;
-      } else {
-        status.textContent = "Not analyzed";
-      }
+    if (safeCategory === "face_people") {
+      status.classList.add("analysis-video-status-face");
+      const face01 = document.createElement("span");
+      face01.className = "analysis-status-chip chip-face01";
+      face01.textContent = formatFace01SelectionStatus(video);
+
+      const face02 = document.createElement("span");
+      face02.className = "analysis-status-chip chip-face02";
+      face02.textContent = formatFace02SelectionStatus(video);
+
+      status.appendChild(face01);
+      status.appendChild(face02);
     } else {
       if (analysis.processed) {
         status.textContent = `Done | vehicles ${analysis.vehicle_count} | first ${formatFirstHit(analysis.first_hit_seconds)}`;
@@ -6766,6 +7380,7 @@ function renderAnalysisSelectionList(container, category) {
     row.appendChild(status);
     container.appendChild(row);
   });
+  syncAnalysisSelectAllControl(safeCategory);
 }
 
 function renderAnalysisSelectionLists() {
@@ -7015,6 +7630,67 @@ function getSelectedInsightFilenames(category) {
   return Array.from(roots.querySelectorAll(selector))
     .map((input) => String(input.dataset.filename || "").trim())
     .filter((name) => Boolean(name));
+}
+
+function getAnalysisSelectAllControl(category) {
+  if (category === "vehicles") {
+    return vehicleAnalysisSelectAll;
+  }
+  return facePeopleAnalysisSelectAll;
+}
+
+function getAnalysisSelectionMetaElement(category) {
+  if (category === "vehicles") {
+    return vehicleAnalysisSelectionMeta;
+  }
+  return facePeopleAnalysisSelectionMeta;
+}
+
+function getAnalysisSelectionCheckboxes(category) {
+  const safeCategory = normalizeAnalysisCategory(category);
+  const root = safeCategory === "vehicles" ? vehicleVideoSelectList : facePeopleVideoSelectList;
+  if (!root) {
+    return [];
+  }
+  const selector = `input.analysis-select-checkbox[data-category="${safeCategory}"]`;
+  return Array.from(root.querySelectorAll(selector))
+    .filter((input) => !input.disabled);
+}
+
+function syncAnalysisSelectAllControl(category) {
+  const safeCategory = normalizeAnalysisCategory(category);
+  const selectAll = getAnalysisSelectAllControl(safeCategory);
+  const meta = getAnalysisSelectionMetaElement(safeCategory);
+  if (!selectAll || !meta) {
+    return;
+  }
+
+  const checkboxes = getAnalysisSelectionCheckboxes(safeCategory);
+  if (!checkboxes.length) {
+    selectAll.checked = false;
+    selectAll.indeterminate = false;
+    selectAll.disabled = true;
+    meta.textContent = "0 selected";
+    return;
+  }
+
+  const selectedCount = checkboxes.reduce(
+    (count, input) => count + (input.checked ? 1 : 0),
+    0,
+  );
+  selectAll.disabled = false;
+  selectAll.checked = selectedCount === checkboxes.length;
+  selectAll.indeterminate = selectedCount > 0 && selectedCount < checkboxes.length;
+  meta.textContent = `${selectedCount} selected`;
+}
+
+function setAllAnalysisSelection(category, checked) {
+  const safeCategory = normalizeAnalysisCategory(category);
+  const checkboxes = getAnalysisSelectionCheckboxes(safeCategory);
+  checkboxes.forEach((input) => {
+    input.checked = Boolean(checked);
+  });
+  syncAnalysisSelectAllControl(safeCategory);
 }
 
 async function refreshVideos(caseId = null, expectedSwitchVersion = null, options = {}) {
@@ -8018,6 +8694,7 @@ async function runSelectedAnalysisForCategory(category) {
         force: false,
         analysis_face_people: normalizedCategory === "face_people",
         analysis_vehicles: normalizedCategory === "vehicles",
+        analysis_face_identity: normalizedCategory === "face_people" && isFaceIdentityEnabledSetting(),
       }),
     });
     const queue = payload && typeof payload.queue === "object" ? payload.queue : {};
@@ -8082,6 +8759,7 @@ async function runSelectedAnalysisForCategory(category) {
               force: false,
               analysis_face_people: normalizedCategory === "face_people",
               analysis_vehicles: normalizedCategory === "vehicles",
+              analysis_face_identity: normalizedCategory === "face_people" && isFaceIdentityEnabledSetting(),
               analysis_only: true,
             }),
           });
@@ -8384,6 +9062,21 @@ function setupListeners() {
   saveEmbeddingSettingsBtn?.addEventListener("click", () => {
     saveEmbeddingSettings();
   });
+  saveFaceIdentitySettingsBtn?.addEventListener("click", () => {
+    saveAnalysisSettings();
+  });
+  faceIdentityEnabledToggle?.addEventListener("change", () => {
+    const enabled = Boolean(faceIdentityEnabledToggle.checked);
+    setFaceIdentityToggleStateDisplay({
+      savedEnabled: isFaceIdentityEnabledSetting(),
+      toggleEnabled: enabled,
+    });
+    setFaceIdentitySettingsStatus(
+      `FACE-02 will be ${enabled ? "enabled" : "disabled"} after save.`,
+      "working",
+    );
+    renderAnalysisSelectionLists();
+  });
   saveSearchSettingsBtn?.addEventListener("click", () => {
     saveSearchSettings();
   });
@@ -8400,6 +9093,12 @@ function setupListeners() {
   });
   runVehiclesSelectedBtn?.addEventListener("click", () => {
     runSelectedAnalysisForCategory("vehicles");
+  });
+  facePeopleAnalysisSelectAll?.addEventListener("change", () => {
+    setAllAnalysisSelection("face_people", Boolean(facePeopleAnalysisSelectAll.checked));
+  });
+  vehicleAnalysisSelectAll?.addEventListener("change", () => {
+    setAllAnalysisSelection("vehicles", Boolean(vehicleAnalysisSelectAll.checked));
   });
   mainTabTriageBtn?.addEventListener("click", async () => {
     setActiveMainTab("triage");
@@ -8526,6 +9225,12 @@ function setupListeners() {
   queueTaskPopupRemoveFilesBtn?.addEventListener("click", () => {
     void removeSelectedQueueFilesFromPopup();
   });
+  queueTaskPopupRunBtn?.addEventListener("click", () => {
+    void runQueueItemFromPopup();
+  });
+  queueTaskPopupStopBtn?.addEventListener("click", () => {
+    void stopQueueItemFromPopup();
+  });
   queueTaskPopupDeleteBtn?.addEventListener("click", () => {
     void deleteQueueItemFromPopup();
   });
@@ -8565,6 +9270,7 @@ async function init() {
   setupListeners();
   setActiveMainTab("triage");
   await loadEmbeddingSettings();
+  await loadAnalysisSettings();
   await loadSearchSettings();
 
   clearResults();

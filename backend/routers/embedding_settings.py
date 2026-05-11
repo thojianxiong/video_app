@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import Callable
 
 from fastapi import APIRouter, HTTPException
+from backend.schemas.analysis_settings import AnalysisSettingsUpdateRequest
 from backend.schemas.embedding_settings import EmbeddingSettingsUpdateRequest
 from backend.schemas.search_settings import SearchSettingsUpdateRequest
 
@@ -16,6 +17,9 @@ def build_embedding_settings_router(
     read_saved_search_settings_sync: Callable[[], dict],
     write_saved_search_settings_sync: Callable[..., dict],
     build_search_settings_response_sync: Callable[[], dict],
+    read_saved_analysis_settings_sync: Callable[[], dict],
+    write_saved_analysis_settings_sync: Callable[..., dict],
+    build_analysis_settings_response_sync: Callable[[], dict],
 ) -> APIRouter:
     router = APIRouter(tags=["settings"])
 
@@ -94,6 +98,34 @@ def build_embedding_settings_router(
                 result_limit=result_limit,
             )
             return await asyncio.to_thread(build_search_settings_response_sync)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc))
+
+    @router.get("/settings/analysis")
+    async def get_analysis_settings() -> dict:
+        try:
+            return await asyncio.to_thread(build_analysis_settings_response_sync)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc))
+
+    @router.post("/settings/analysis")
+    async def update_analysis_settings(request: AnalysisSettingsUpdateRequest) -> dict:
+        try:
+            saved = await asyncio.to_thread(read_saved_analysis_settings_sync)
+            face_identity_enabled = (
+                bool(request.face_identity_enabled)
+                if request.face_identity_enabled is not None
+                else bool(saved.get("face_identity_enabled", False))
+            )
+            await asyncio.to_thread(
+                write_saved_analysis_settings_sync,
+                face_identity_enabled=face_identity_enabled,
+            )
+            return await asyncio.to_thread(build_analysis_settings_response_sync)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
         except Exception as exc:

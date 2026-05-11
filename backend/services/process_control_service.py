@@ -8,6 +8,12 @@ from typing import Any
 
 
 class ProcessControlService:
+    ALLOWED_QUEUE_JOB_KINDS = {
+        "semantic_index",
+        "analysis",
+        "triage_timeline",
+    }
+
     def __init__(
         self,
         *,
@@ -18,6 +24,68 @@ class ProcessControlService:
         self.app = app
         self.utc_now_iso = utc_now_iso
         self.index_job_snapshot = index_job_snapshot
+
+    @staticmethod
+    def _normalize_case_id(value: Any) -> str:
+        normalized = str(value or "").strip()
+        if not normalized:
+            raise ValueError("case_id is required")
+        return normalized
+
+    @staticmethod
+    def _normalize_job_ids(job_ids: list[int] | tuple[int, ...] | set[int]) -> list[int]:
+        unique: list[int] = []
+        seen: set[int] = set()
+        for raw in job_ids:
+            try:
+                parsed = int(raw)
+            except (TypeError, ValueError):
+                continue
+            if parsed <= 0 or parsed in seen:
+                continue
+            seen.add(parsed)
+            unique.append(parsed)
+        if not unique:
+            raise ValueError("job_ids is required")
+        return unique
+
+    @staticmethod
+    def _normalize_single_job_id(job_id: Any) -> int:
+        try:
+            parsed = int(job_id)
+        except (TypeError, ValueError):
+            parsed = 0
+        if parsed <= 0:
+            raise ValueError("job_id must be greater than 0")
+        return parsed
+
+    def _get_queue_store(self) -> Any:
+        queue_store = getattr(self.app.state, "index_queue_store", None)
+        if queue_store is None:
+            raise ValueError("Queue store is unavailable.")
+        return queue_store
+
+    def _get_case_scoped_queue_job(
+        self,
+        *,
+        case_id: str,
+        job_id: int,
+    ) -> dict[str, Any]:
+        queue_store = self._get_queue_store()
+        if not hasattr(queue_store, "get_job"):
+            raise ValueError("Queue store does not support job lookup.")
+        job = queue_store.get_job(int(job_id))
+        if not isinstance(job, dict):
+            raise ValueError("Queue job not found.")
+
+        job_case_id = str(job.get("case_id") or "").strip()
+        if job_case_id != case_id:
+            raise ValueError("Queue job does not belong to the selected case.")
+
+        job_kind = str(job.get("job_kind") or "").strip().lower()
+        if job_kind not in self.ALLOWED_QUEUE_JOB_KINDS:
+            raise ValueError(f"Queue job kind '{job_kind}' is not supported for this action.")
+        return job
 
     @staticmethod
     def _is_active_job(job: dict) -> bool:
@@ -189,6 +257,9 @@ class ProcessControlService:
                     percent = min(100.0, max(0.0, (float(processed) / float(total)) * 100.0))
                 elif is_current and safe_current_percent > 0:
                     percent = min(100.0, max(0.0, safe_current_percent))
+                # Keep running rows below 100% so users can distinguish "still working" from done.
+                if percent >= 100.0:
+                    percent = 99.0
 
             rows.append(
                 {
@@ -200,12 +271,18 @@ class ProcessControlService:
                     "is_current": bool(is_current),
                 }
             )
+            if isinstance(details.get("phase"), str) and str(details.get("phase")).strip():
+                rows[-1]["phase"] = str(details.get("phase")).strip()
+            if isinstance(details.get("phase_label"), str) and str(details.get("phase_label")).strip():
+                rows[-1]["phase_label"] = str(details.get("phase_label")).strip()
         return rows
 
-    def list_active_processes_sync(self) -> dict:
+    def list_active_processes_sync(self, case_id: str | None = None) -> dict:
+        selected_case_id = str(case_id or "").strip()
         jobs: dict[str, dict] = self.app.state.index_jobs
         lock: Lock = self.app.state.index_jobs_lock
-        processes: list[dict] = []
+        processes_all: list[dict] = []
+        completed_processes_all: list[dict] = []
         pipeline_snapshot_cache: dict[str, dict[str, dict]] = {}
 
         with lock:
@@ -248,7 +325,7 @@ class ProcessControlService:
                     current_total_frames=current_video_total_frames,
                     current_progress_percent=current_video_progress_percent,
                 )
-                processes.append(
+                processes_all.append(
                     {
                         "type": "background_index",
                         "case_id": case_id,
@@ -270,6 +347,68 @@ class ProcessControlService:
                 )
 
         queue_store = getattr(self.app.state, "index_queue_store", None)
+        def _serialize_queue_job(item: dict[str, Any], *, process_type: str) -> dict[str, Any]:
+            payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+            filenames = [
+                str(name).strip()
+                for name in (payload.get("filenames") or [])
+                if str(name).strip()
+            ]
+            metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+            face_people_filenames = [
+                str(name).strip()
+                for name in (metadata.get("analysis_face_people_filenames") or [])
+                if str(name).strip()
+            ]
+            vehicles_filenames = [
+                str(name).strip()
+                for name in (metadata.get("analysis_vehicles_filenames") or [])
+                if str(name).strip()
+            ]
+            face_identity_filenames = [
+                str(name).strip()
+                for name in (metadata.get("analysis_face_identity_filenames") or [])
+                if str(name).strip()
+            ]
+            queue_case_id = str(item.get("case_id") or "")
+            status = str(item.get("status") or "")
+            job_kind = str(item.get("job_kind") or "")
+            file_progress = self._build_file_progress_rows(
+                case_id=queue_case_id,
+                filenames=filenames,
+                stage_name=self._stage_name_for_job_kind(job_kind),
+                fallback_status=status,
+                snapshot_cache=pipeline_snapshot_cache,
+            )
+            return {
+                "type": process_type,
+                "queue_job_id": int(item.get("job_id", 0)),
+                "job_kind": job_kind,
+                "priority": int(item.get("priority", 0)),
+                "case_id": queue_case_id,
+                "status": status,
+                "queue_position": max(0, int(item.get("queue_position", 0))),
+                "attempt_count": int(item.get("attempt_count", 0)),
+                "filenames_count": len(filenames),
+                "filenames_preview": filenames[:5],
+                "filenames": filenames,
+                "file_progress": file_progress,
+                "metadata": {
+                    "analysis_face_people": bool(metadata.get("analysis_face_people", False)),
+                    "analysis_vehicles": bool(metadata.get("analysis_vehicles", False)),
+                    "analysis_face_identity": bool(metadata.get("analysis_face_identity", False)),
+                    "analysis_only": bool(metadata.get("analysis_only", False)),
+                    "analysis_mode": str(metadata.get("analysis_mode") or ""),
+                    "analysis_face_people_filenames": face_people_filenames,
+                    "analysis_vehicles_filenames": vehicles_filenames,
+                    "analysis_face_identity_filenames": face_identity_filenames,
+                },
+                "enqueued_at": str(item.get("enqueued_at") or ""),
+                "started_at": str(item.get("started_at") or ""),
+                "finished_at": str(item.get("finished_at") or ""),
+                "updated_at": str(item.get("updated_at") or ""),
+            }
+
         if queue_store is not None and hasattr(queue_store, "list_active_jobs"):
             try:
                 active_queue_jobs = queue_store.list_active_jobs(limit=500)
@@ -278,65 +417,81 @@ class ProcessControlService:
             for item in active_queue_jobs:
                 if not isinstance(item, dict):
                     continue
-                payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
-                filenames = [
-                    str(name).strip()
-                    for name in (payload.get("filenames") or [])
-                    if str(name).strip()
-                ]
-                metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
-                face_people_filenames = [
-                    str(name).strip()
-                    for name in (metadata.get("analysis_face_people_filenames") or [])
-                    if str(name).strip()
-                ]
-                vehicles_filenames = [
-                    str(name).strip()
-                    for name in (metadata.get("analysis_vehicles_filenames") or [])
-                    if str(name).strip()
-                ]
-                case_id = str(item.get("case_id") or "")
-                status = str(item.get("status") or "")
-                job_kind = str(item.get("job_kind") or "")
-                file_progress = self._build_file_progress_rows(
-                    case_id=case_id,
-                    filenames=filenames,
-                    stage_name=self._stage_name_for_job_kind(job_kind),
-                    fallback_status=status,
-                    snapshot_cache=pipeline_snapshot_cache,
-                )
-                processes.append(
-                    {
-                        "type": "queue_job",
-                        "queue_job_id": int(item.get("job_id", 0)),
-                        "job_kind": job_kind,
-                        "priority": int(item.get("priority", 0)),
-                        "case_id": case_id,
-                        "status": status,
-                        "queue_position": max(0, int(item.get("queue_position", 0))),
-                        "attempt_count": int(item.get("attempt_count", 0)),
-                        "filenames_count": len(filenames),
-                        "filenames_preview": filenames[:5],
-                        "filenames": filenames,
-                        "file_progress": file_progress,
-                        "metadata": {
-                            "analysis_face_people": bool(metadata.get("analysis_face_people", False)),
-                            "analysis_vehicles": bool(metadata.get("analysis_vehicles", False)),
-                            "analysis_only": bool(metadata.get("analysis_only", False)),
-                            "analysis_face_people_filenames": face_people_filenames,
-                            "analysis_vehicles_filenames": vehicles_filenames,
-                        },
-                        "enqueued_at": str(item.get("enqueued_at") or ""),
-                        "started_at": str(item.get("started_at") or ""),
-                        "updated_at": str(item.get("updated_at") or ""),
-                    }
+                processes_all.append(_serialize_queue_job(item, process_type="queue_job"))
+
+            if hasattr(queue_store, "list_recent_jobs"):
+                try:
+                    recent_queue_jobs = queue_store.list_recent_jobs(limit=500)
+                except Exception:
+                    recent_queue_jobs = []
+                for item in recent_queue_jobs:
+                    if not isinstance(item, dict):
+                        continue
+                    completed_processes_all.append(
+                        _serialize_queue_job(item, process_type="queue_job_completed")
+                    )
+
+        if selected_case_id:
+            processes = [
+                item
+                for item in processes_all
+                if str(item.get("case_id") or "").strip() == selected_case_id
+            ]
+            completed_processes = [
+                item
+                for item in completed_processes_all
+                if str(item.get("case_id") or "").strip() == selected_case_id
+            ]
+        else:
+            processes = list(processes_all)
+            completed_processes = list(completed_processes_all)
+
+        blocked_by_other_case = False
+        blocking_case_id = ""
+        blocking_message = ""
+        if selected_case_id:
+            current_case_has_waiting = any(
+                str(item.get("case_id") or "").strip() == selected_case_id
+                and str(item.get("status") or "").strip().lower() == "queued"
+                for item in processes_all
+            )
+            running_other_case_item = next(
+                (
+                    item
+                    for item in processes_all
+                    if str(item.get("case_id") or "").strip() != selected_case_id
+                    and str(item.get("status") or "").strip().lower() == "running"
+                    and str(item.get("type") or "").strip().lower() in {"queue_job", "background_index"}
+                ),
+                None,
+            )
+            if current_case_has_waiting and isinstance(running_other_case_item, dict):
+                blocked_by_other_case = True
+                blocking_case_id = str(running_other_case_item.get("case_id") or "").strip()
+                blocking_kind = str(running_other_case_item.get("job_kind") or "").strip().lower()
+                if str(running_other_case_item.get("type") or "").strip().lower() == "background_index":
+                    blocking_kind = "semantic_index"
+                blocking_label = {
+                    "semantic_index": "Semantic Index",
+                    "analysis": "Analysis",
+                    "triage_timeline": "Triage Timeline",
+                }.get(blocking_kind, "background task")
+                blocking_message = (
+                    f"Another case ({blocking_case_id}) is currently running {blocking_label}. "
+                    "Current case queued jobs will start after that running task finishes."
                 )
 
         return {
             "shutdown_requested": bool(getattr(self.app.state, "shutdown_requested", False)),
             "shutdown_requested_at": str(getattr(self.app.state, "shutdown_requested_at", "") or ""),
+            "queue_scope_case_id": selected_case_id,
+            "blocked_by_other_case": bool(blocked_by_other_case),
+            "blocking_case_id": blocking_case_id,
+            "blocking_message": blocking_message,
             "count": len(processes),
             "processes": processes,
+            "completed_count": len(completed_processes),
+            "completed_processes": completed_processes,
         }
 
     def cancel_running_index_jobs_sync(self) -> dict:
@@ -428,6 +583,7 @@ class ProcessControlService:
                     queue_store.cancel_case_active(
                         normalized_case_id,
                         reason=str(reason or "").strip() or "Cancelled by user request.",
+                        job_kind="semantic_index",
                     )
                 )
                 if queue_cancelled > 0:
@@ -465,8 +621,8 @@ class ProcessControlService:
 
         loop.call_later(max(0.2, float(delay_seconds)), _trigger_exit)
 
-    async def list_processes(self) -> dict:
-        return await asyncio.to_thread(self.list_active_processes_sync)
+    async def list_processes(self, *, case_id: str | None = None) -> dict:
+        return await asyncio.to_thread(self.list_active_processes_sync, case_id)
 
     async def cancel_case_index_jobs(
         self,
@@ -485,76 +641,277 @@ class ProcessControlService:
     def delete_queue_jobs_sync(
         self,
         *,
+        case_id: str,
         job_ids: list[int],
-        cancel_running: bool = True,
+        cancel_running: bool = False,
     ) -> dict:
-        queue_store = getattr(self.app.state, "index_queue_store", None)
-        if queue_store is None or not hasattr(queue_store, "delete_jobs"):
+        normalized_case_id = self._normalize_case_id(case_id)
+        normalized_job_ids = self._normalize_job_ids(job_ids)
+        queue_store = self._get_queue_store()
+        if not hasattr(queue_store, "delete_jobs"):
             raise ValueError("Queue store is unavailable.")
 
-        result = queue_store.delete_jobs(
-            job_ids=job_ids,
-            cancel_running=bool(cancel_running),
-            reason="Removed from queue by user request.",
-        )
-        if not isinstance(result, dict):
-            result = {}
+        not_found_ids: list[int] = []
+        wrong_case_ids: list[int] = []
+        unsupported_kind_ids: list[int] = []
+        eligible_ids: list[int] = []
 
-        affected_case_ids = [
-            str(item).strip()
-            for item in (result.get("affected_case_ids") or [])
-            if str(item).strip()
+        for job_id in normalized_job_ids:
+            job = queue_store.get_job(int(job_id)) if hasattr(queue_store, "get_job") else None
+            if not isinstance(job, dict):
+                not_found_ids.append(int(job_id))
+                continue
+            job_case_id = str(job.get("case_id") or "").strip()
+            if job_case_id != normalized_case_id:
+                wrong_case_ids.append(int(job_id))
+                continue
+            job_kind = str(job.get("job_kind") or "").strip().lower()
+            if job_kind not in self.ALLOWED_QUEUE_JOB_KINDS:
+                unsupported_kind_ids.append(int(job_id))
+                continue
+            eligible_ids.append(int(job_id))
+
+        result: dict[str, Any] = {}
+        if eligible_ids:
+            result = queue_store.delete_jobs(
+                job_ids=eligible_ids,
+                cancel_running=bool(cancel_running),
+                reason="Removed from queue by user request.",
+            )
+            if not isinstance(result, dict):
+                result = {}
+
+        removed_count = int(result.get("removed_count", 0))
+        cancelled_running_count = int(result.get("cancelled_running_count", 0))
+        skipped_running_count = int(result.get("skipped_running_count", 0))
+        effective_not_found = [
+            *[int(item) for item in (result.get("not_found_ids") or [])],
+            *not_found_ids,
         ]
-        if affected_case_ids:
+
+        return {
+            "case_id": normalized_case_id,
+            "requested_count": len(normalized_job_ids),
+            "eligible_count": len(eligible_ids),
+            "found_count": int(result.get("found_count", 0)),
+            "removed_count": removed_count,
+            "cancelled_running_count": cancelled_running_count,
+            "skipped_running_count": skipped_running_count,
+            "removed_job_ids": result.get("removed_job_ids") or [],
+            "cancelled_running_job_ids": result.get("cancelled_running_job_ids") or [],
+            "skipped_running_job_ids": result.get("skipped_running_job_ids") or [],
+            "not_found_ids": sorted(set(effective_not_found)),
+            "wrong_case_job_ids": sorted(set(wrong_case_ids)),
+            "unsupported_kind_job_ids": sorted(set(unsupported_kind_ids)),
+            "affected_case_ids": [
+                str(item).strip()
+                for item in (result.get("affected_case_ids") or [])
+                if str(item).strip()
+            ],
+            "message": "Queue items removed from queue tracking.",
+        }
+
+    def stop_queue_jobs_sync(
+        self,
+        *,
+        case_id: str,
+        job_ids: list[int],
+    ) -> dict:
+        normalized_case_id = self._normalize_case_id(case_id)
+        normalized_job_ids = self._normalize_job_ids(job_ids)
+        queue_store = self._get_queue_store()
+        if not hasattr(queue_store, "cancel_jobs"):
+            raise ValueError("Queue store does not support stopping jobs.")
+
+        not_found_ids: list[int] = []
+        wrong_case_ids: list[int] = []
+        unsupported_kind_ids: list[int] = []
+        terminal_ids: list[int] = []
+        eligible_ids: list[int] = []
+        semantic_running_cases: set[str] = set()
+
+        for job_id in normalized_job_ids:
+            job = queue_store.get_job(int(job_id)) if hasattr(queue_store, "get_job") else None
+            if not isinstance(job, dict):
+                not_found_ids.append(int(job_id))
+                continue
+            job_case_id = str(job.get("case_id") or "").strip()
+            if job_case_id != normalized_case_id:
+                wrong_case_ids.append(int(job_id))
+                continue
+            job_kind = str(job.get("job_kind") or "").strip().lower()
+            if job_kind not in self.ALLOWED_QUEUE_JOB_KINDS:
+                unsupported_kind_ids.append(int(job_id))
+                continue
+            status = str(job.get("status") or "").strip().lower()
+            if status not in {"queued", "running"}:
+                terminal_ids.append(int(job_id))
+                continue
+            if status == "running" and job_kind == "semantic_index":
+                semantic_running_cases.add(job_case_id)
+            eligible_ids.append(int(job_id))
+
+        result: dict[str, Any] = {}
+        if eligible_ids:
+            result = queue_store.cancel_jobs(
+                job_ids=eligible_ids,
+                include_running=True,
+                reason="Stop requested by user. Will stop after current step.",
+            )
+            if not isinstance(result, dict):
+                result = {}
+
+        semantic_cancel_count = 0
+        if semantic_running_cases:
             jobs: dict[str, dict] = self.app.state.index_jobs
             lock: Lock = self.app.state.index_jobs_lock
             now = self.utc_now_iso()
             with lock:
-                for case_id in affected_case_ids:
-                    job = jobs.get(case_id)
-                    if not isinstance(job, dict):
+                for semantic_case_id in sorted(semantic_running_cases):
+                    snapshot = jobs.get(semantic_case_id)
+                    if not isinstance(snapshot, dict):
                         continue
-                    status = str(job.get("status") or "").strip().lower()
-                    running = bool(job.get("running"))
-                    if running:
-                        continue
-                    if status in {"queued", "cancelling"}:
-                        job["status"] = "idle"
-                        job["running"] = False
-                        job["cancel_requested"] = False
-                        job["queue_job_id"] = 0
-                        job["queue_job_kind"] = ""
-                        job["queue_priority"] = 0
-                        job["updated_at"] = now
+                    snapshot["cancel_requested"] = True
+                    snapshot["status"] = "cancelling"
+                    snapshot["running"] = False
+                    snapshot["updated_at"] = now
+                    semantic_cancel_count += 1
 
         return {
-            "requested_count": int(result.get("requested_count", 0)),
-            "found_count": int(result.get("found_count", 0)),
-            "removed_count": int(result.get("removed_count", 0)),
-            "cancelled_running_count": int(result.get("cancelled_running_count", 0)),
+            "case_id": normalized_case_id,
+            "requested_count": len(normalized_job_ids),
+            "eligible_count": len(eligible_ids),
+            "cancelled_count": int(result.get("cancelled_count", 0)),
+            "cancelled_job_ids": result.get("cancelled_job_ids") or [],
             "skipped_running_count": int(result.get("skipped_running_count", 0)),
-            "removed_job_ids": result.get("removed_job_ids") or [],
-            "cancelled_running_job_ids": result.get("cancelled_running_job_ids") or [],
             "skipped_running_job_ids": result.get("skipped_running_job_ids") or [],
-            "not_found_ids": result.get("not_found_ids") or [],
-            "affected_case_ids": affected_case_ids,
-            "message": "Queue items updated.",
+            "terminal_count": int(result.get("terminal_count", 0)) + len(terminal_ids),
+            "terminal_job_ids": sorted(
+                {
+                    *[int(item) for item in (result.get("terminal_job_ids") or [])],
+                    *terminal_ids,
+                }
+            ),
+            "not_found_ids": sorted(
+                {
+                    *[int(item) for item in (result.get("not_found_ids") or [])],
+                    *not_found_ids,
+                }
+            ),
+            "wrong_case_job_ids": sorted(set(wrong_case_ids)),
+            "unsupported_kind_job_ids": sorted(set(unsupported_kind_ids)),
+            "semantic_cancelled_count": int(semantic_cancel_count),
+            "affected_case_ids": sorted(
+                {
+                    *[
+                        str(item).strip()
+                        for item in (result.get("affected_case_ids") or [])
+                        if str(item).strip()
+                    ],
+                    *semantic_running_cases,
+                }
+            ),
+            "message": "Stop requested. Running tasks will stop after the current in-flight step.",
+        }
+
+    def run_queue_job_sync(
+        self,
+        *,
+        case_id: str,
+        job_id: int,
+        filenames: list[str],
+    ) -> dict:
+        normalized_case_id = self._normalize_case_id(case_id)
+        normalized_job_id = self._normalize_single_job_id(job_id)
+        selected_filenames = self._normalize_filenames(filenames)
+        queue_store = self._get_queue_store()
+        if not hasattr(queue_store, "prioritize_job"):
+            raise ValueError("Queue store does not support run-now priority.")
+
+        current_job = self._get_case_scoped_queue_job(
+            case_id=normalized_case_id,
+            job_id=normalized_job_id,
+        )
+        current_status = str(current_job.get("status") or "").strip().lower()
+        if current_status == "running":
+            return {
+                "case_id": normalized_case_id,
+                "job_id": normalized_job_id,
+                "status": "running",
+                "updated": False,
+                "queue": current_job,
+                "message": "Job is already running.",
+            }
+        if current_status != "queued":
+            raise ValueError("Only queued jobs can be run immediately.")
+
+        result = queue_store.prioritize_job(
+            job_id=normalized_job_id,
+            priority=1,
+            filenames_front=selected_filenames,
+        )
+        if not isinstance(result, dict):
+            raise ValueError("Queue store returned an invalid response.")
+        if not bool(result.get("found", False)):
+            raise ValueError("Queue job not found.")
+        if str(result.get("blocked_status") or "").strip().lower() == "running":
+            return {
+                "case_id": normalized_case_id,
+                "job_id": normalized_job_id,
+                "status": "running",
+                "updated": False,
+                "queue": result.get("job") if isinstance(result.get("job"), dict) else {},
+                "message": "Job is already running.",
+            }
+
+        updated_job = result.get("job") if isinstance(result.get("job"), dict) else {}
+        queue_payload = {}
+        if isinstance(updated_job, dict):
+            queue_payload = {
+                "job_id": int(updated_job.get("job_id", normalized_job_id)),
+                "job_kind": str(updated_job.get("job_kind") or ""),
+                "priority": int(updated_job.get("priority", 0)),
+                "status": str(updated_job.get("status") or ""),
+                "position_ahead": int(updated_job.get("queue_position", 0)),
+                "attempt_count": int(updated_job.get("attempt_count", 0)),
+                "enqueued_at": str(updated_job.get("enqueued_at") or ""),
+                "started_at": str(updated_job.get("started_at") or ""),
+                "updated_at": str(updated_job.get("updated_at") or ""),
+            }
+
+        return {
+            "case_id": normalized_case_id,
+            "job_id": normalized_job_id,
+            "updated": bool(result.get("updated", False)),
+            "front_applied_count": int(result.get("front_applied_count", 0)),
+            "front_applied_filenames": result.get("front_applied_filenames") or [],
+            "front_missing_filenames": result.get("front_missing_filenames") or [],
+            "queue": queue_payload,
+            "message": str(result.get("message") or "Queue item moved to front."),
         }
 
     def remove_queue_job_files_sync(
         self,
         *,
+        case_id: str,
         job_id: int,
         filenames: list[str],
+        allow_running: bool = False,
     ) -> dict:
-        queue_store = getattr(self.app.state, "index_queue_store", None)
-        if queue_store is None or not hasattr(queue_store, "remove_files_from_job"):
+        normalized_case_id = self._normalize_case_id(case_id)
+        normalized_job_id = self._normalize_single_job_id(job_id)
+        self._get_case_scoped_queue_job(
+            case_id=normalized_case_id,
+            job_id=normalized_job_id,
+        )
+        queue_store = self._get_queue_store()
+        if not hasattr(queue_store, "remove_files_from_job"):
             raise ValueError("Queue store is unavailable.")
 
         result = queue_store.remove_files_from_job(
-            job_id=int(job_id),
+            job_id=int(normalized_job_id),
             filenames=filenames,
-            allow_running=False,
+            allow_running=bool(allow_running),
             reason="Selected files removed from queue by user request.",
         )
         if not isinstance(result, dict):
@@ -625,7 +982,7 @@ class ProcessControlService:
             }
 
         return {
-            "job_id": int(result.get("job_id", job_id)),
+            "job_id": int(result.get("job_id", normalized_job_id)),
             "case_id": case_id,
             "job_kind": job_kind,
             "deleted_job": deleted_job,
@@ -642,25 +999,57 @@ class ProcessControlService:
     async def delete_queue_jobs(
         self,
         *,
+        case_id: str,
         job_ids: list[int],
-        cancel_running: bool = True,
+        cancel_running: bool = False,
     ) -> dict:
         return await asyncio.to_thread(
             self.delete_queue_jobs_sync,
+            case_id=case_id,
             job_ids=job_ids,
             cancel_running=cancel_running,
+        )
+
+    async def stop_queue_jobs(
+        self,
+        *,
+        case_id: str,
+        job_ids: list[int],
+    ) -> dict:
+        return await asyncio.to_thread(
+            self.stop_queue_jobs_sync,
+            case_id=case_id,
+            job_ids=job_ids,
+        )
+
+    async def run_queue_job(
+        self,
+        *,
+        case_id: str,
+        job_id: int,
+        filenames: list[str],
+    ) -> dict:
+        return await asyncio.to_thread(
+            self.run_queue_job_sync,
+            case_id=case_id,
+            job_id=job_id,
+            filenames=filenames,
         )
 
     async def remove_queue_job_files(
         self,
         *,
+        case_id: str,
         job_id: int,
         filenames: list[str],
+        allow_running: bool = False,
     ) -> dict:
         return await asyncio.to_thread(
             self.remove_queue_job_files_sync,
+            case_id=case_id,
             job_id=job_id,
             filenames=filenames,
+            allow_running=allow_running,
         )
 
     async def graceful_shutdown(self, *, confirm: bool) -> dict:

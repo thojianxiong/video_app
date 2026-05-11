@@ -102,6 +102,7 @@ DEFAULT_SEARCH_DEDUPE_AGGRESSIVENESS = 55.0
 DEFAULT_SEARCH_RESULT_LIMIT = 120
 SEARCH_MIN_RESULT_LIMIT = 10
 SEARCH_MAX_RESULT_LIMIT = 500
+DEFAULT_FACE_IDENTITY_ENABLED = False
 
 INTENT_PROMPTS = {
     SEMANTIC_OBJECT: [
@@ -469,6 +470,50 @@ def _build_search_settings_response_sync() -> dict[str, Any]:
             float(saved.get("dedupe_aggressiveness", DEFAULT_SEARCH_DEDUPE_AGGRESSIVENESS))
         ),
     }
+
+
+def _read_saved_analysis_settings_sync() -> dict[str, Any]:
+    payload = _read_app_settings_payload_sync()
+    raw_analysis = payload.get("analysis") if isinstance(payload.get("analysis"), dict) else {}
+    return {
+        "face_identity_enabled": bool(
+            raw_analysis.get("face_identity_enabled", DEFAULT_FACE_IDENTITY_ENABLED)
+        ),
+    }
+
+
+def _write_saved_analysis_settings_sync(
+    *,
+    face_identity_enabled: bool,
+) -> dict[str, Any]:
+    saved = {
+        "face_identity_enabled": bool(face_identity_enabled),
+    }
+    payload = _read_app_settings_payload_sync()
+    payload["analysis"] = saved
+    _write_app_settings_payload_sync(payload)
+    return dict(saved)
+
+
+def _build_analysis_settings_response_sync() -> dict[str, Any]:
+    saved = _read_saved_analysis_settings_sync()
+    return {
+        "saved": dict(saved),
+        "recommended": {
+            "face_identity_enabled": bool(DEFAULT_FACE_IDENTITY_ENABLED),
+        },
+        "descriptions": {
+            "face_identity_enabled": (
+                "FACE-02: ArcFace/InsightFace identity embeddings over detected face crops. "
+                "Enable only when you need suspect-photo search precision."
+            ),
+        },
+    }
+
+
+def _is_face_identity_enabled_sync() -> bool:
+    settings = _read_saved_analysis_settings_sync()
+    return bool(settings.get("face_identity_enabled", DEFAULT_FACE_IDENTITY_ENABLED))
 
 
 def _normalize_embedding_vector(vector: np.ndarray) -> np.ndarray:
@@ -1088,6 +1133,32 @@ def _normalize_unique_filenames(raw_items: list[Any]) -> list[str]:
     return output
 
 
+def _base_index_phase_label(phase: str) -> str:
+    normalized = str(phase or "").strip().lower()
+    if normalized == "frame_scan":
+        return "Frame scan"
+    if normalized == "embedding":
+        return "Embedding"
+    if normalized == "temporal_windows":
+        return "Temporal windows"
+    if normalized == "finalizing":
+        return "Finalizing"
+    return "Processing"
+
+
+def _analysis_phase_label(phase: str) -> str:
+    normalized = str(phase or "").strip().lower()
+    if normalized == "frame_scan":
+        return "Frame scan"
+    if normalized == "crop_embedding":
+        return "Crop embedding"
+    if normalized == "face_identity":
+        return "Face identity"
+    if normalized == "finalizing":
+        return "Finalizing"
+    return "Processing"
+
+
 def _slice_analysis_metadata_for_filenames(
     metadata: dict[str, Any],
     target_filenames: list[str],
@@ -1097,10 +1168,12 @@ def _slice_analysis_metadata_for_filenames(
 
     face_key = "analysis_face_people_filenames"
     vehicle_key = "analysis_vehicles_filenames"
+    face_identity_key = "analysis_face_identity_filenames"
     has_face_list = isinstance(metadata.get(face_key), list)
     has_vehicle_list = isinstance(metadata.get(vehicle_key), list)
+    has_face_identity_list = isinstance(metadata.get(face_identity_key), list)
 
-    for key in (face_key, vehicle_key):
+    for key in (face_key, vehicle_key, face_identity_key):
         if not isinstance(metadata.get(key), list):
             continue
         filtered = _normalize_unique_filenames(
@@ -1113,15 +1186,20 @@ def _slice_analysis_metadata_for_filenames(
 
     face_enabled = bool(metadata.get("analysis_face_people", False))
     vehicle_enabled = bool(metadata.get("analysis_vehicles", False))
+    face_identity_enabled = bool(metadata.get("analysis_face_identity", False))
     if has_face_list:
         face_enabled = bool(sliced.get(face_key))
     if has_vehicle_list:
         vehicle_enabled = bool(sliced.get(vehicle_key))
+    if has_face_identity_list:
+        face_identity_enabled = bool(sliced.get(face_identity_key))
 
     if "analysis_face_people" in metadata or has_face_list:
         sliced["analysis_face_people"] = bool(face_enabled)
     if "analysis_vehicles" in metadata or has_vehicle_list:
         sliced["analysis_vehicles"] = bool(vehicle_enabled)
+    if "analysis_face_identity" in metadata or has_face_identity_list:
+        sliced["analysis_face_identity"] = bool(face_identity_enabled)
     return sliced
 
 
@@ -1241,7 +1319,8 @@ async def _run_analysis_queue_job_async(
     metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
     analysis_face_people = bool(metadata.get("analysis_face_people", False))
     analysis_vehicles = bool(metadata.get("analysis_vehicles", False))
-    if not analysis_face_people and not analysis_vehicles:
+    analysis_face_identity = bool(metadata.get("analysis_face_identity", False))
+    if not analysis_face_people and not analysis_vehicles and not analysis_face_identity:
         return "failed", "Analysis queue payload missing analysis type."
 
     try:
@@ -1292,24 +1371,35 @@ async def _run_analysis_queue_job_async(
                 "source": "queue",
                 "analysis_face_people": bool(analysis_face_people),
                 "analysis_vehicles": bool(analysis_vehicles),
+                "analysis_face_identity": bool(analysis_face_identity),
                 "frame_interval_seconds": float(frame_interval_seconds),
                 "batch_size": int(batch_size),
                 "force": bool(force),
+                "phase": "frame_scan",
+                "phase_label": _analysis_phase_label("frame_scan"),
             },
         )
         progress_state: dict[str, float | int] = {
             "latest_processed": 0,
             "latest_estimated": 0,
             "latest_percent": 0.0,
+            "latest_phase": "frame_scan",
             "last_emit_processed": -1,
             "last_emit_ts": 0.0,
+            "last_emit_phase": "",
         }
 
-        def _on_analysis_progress(processed_frames: int, estimated_total_frames: int | None) -> None:
+        def _on_analysis_progress(
+            processed_frames: int,
+            estimated_total_frames: int | None,
+            phase: str | None = None,
+        ) -> None:
             processed = max(0, int(processed_frames))
             estimated = max(0, int(estimated_total_frames or 0))
             if estimated > 0 and estimated < processed:
                 estimated = processed
+            phase_value = str(phase or "").strip().lower() or "frame_scan"
+            phase_label = _analysis_phase_label(phase_value)
 
             if estimated > 0:
                 progress_percent = min(
@@ -1322,21 +1412,25 @@ async def _run_analysis_queue_job_async(
             progress_state["latest_processed"] = processed
             progress_state["latest_estimated"] = estimated
             progress_state["latest_percent"] = progress_percent
+            progress_state["latest_phase"] = phase_value
 
             last_emit_processed = int(progress_state.get("last_emit_processed", -1))
             last_emit_ts = float(progress_state.get("last_emit_ts", 0.0))
+            last_emit_phase = str(progress_state.get("last_emit_phase", "") or "")
             now_ts = float(time.time())
             should_emit = (
                 processed <= 1
                 or (estimated > 0 and processed >= estimated)
                 or (processed - max(0, last_emit_processed) >= 5)
                 or (now_ts - last_emit_ts >= 0.75)
+                or (phase_value != last_emit_phase)
             )
             if not should_emit:
                 return
 
             progress_state["last_emit_processed"] = processed
             progress_state["last_emit_ts"] = now_ts
+            progress_state["last_emit_phase"] = phase_value
             try:
                 _pipeline_update_stage_sync(
                     case_id=case_id,
@@ -1348,9 +1442,12 @@ async def _run_analysis_queue_job_async(
                         "source": "queue",
                         "analysis_face_people": bool(analysis_face_people),
                         "analysis_vehicles": bool(analysis_vehicles),
+                        "analysis_face_identity": bool(analysis_face_identity),
                         "processed_frames": processed,
                         "estimated_total_frames": estimated,
                         "progress_percent": float(progress_percent),
+                        "phase": phase_value,
+                        "phase_label": phase_label,
                     },
                 )
             except Exception as exc:
@@ -1369,6 +1466,7 @@ async def _run_analysis_queue_job_async(
                 force=force,
                 analysis_face_people=analysis_face_people,
                 analysis_vehicles=analysis_vehicles,
+                analysis_face_identity=analysis_face_identity,
                 analysis_only=True,
                 progress_callback=_on_analysis_progress,
                 cancel_check=_cancel_check,
@@ -1417,6 +1515,8 @@ async def _run_analysis_queue_job_async(
                         "processed_frames": processed_frames,
                         "estimated_total_frames": estimated_total_frames,
                         "progress_percent": float(progress_percent),
+                        "phase": "finalizing",
+                        "phase_label": _analysis_phase_label("finalizing"),
                     },
                 )
             elif analysis_status in {"skipped", "not_requested"}:
@@ -1433,6 +1533,8 @@ async def _run_analysis_queue_job_async(
                         "processed_frames": processed_frames,
                         "estimated_total_frames": estimated_total_frames,
                         "progress_percent": float(progress_percent),
+                        "phase": "finalizing",
+                        "phase_label": _analysis_phase_label("finalizing"),
                     },
                 )
             else:
@@ -1451,6 +1553,8 @@ async def _run_analysis_queue_job_async(
                         "processed_frames": processed_frames,
                         "estimated_total_frames": estimated_total_frames,
                         "progress_percent": float(progress_percent),
+                        "phase": str(progress_state.get("latest_phase") or ""),
+                        "phase_label": _analysis_phase_label(str(progress_state.get("latest_phase") or "")),
                     },
                 )
         except _IndexCancellationRequested:
@@ -1466,6 +1570,8 @@ async def _run_analysis_queue_job_async(
                     "processed_frames": max(0, int(progress_state.get("latest_processed", 0))),
                     "estimated_total_frames": max(0, int(progress_state.get("latest_estimated", 0))),
                     "progress_percent": float(progress_state.get("latest_percent", 0.0)),
+                    "phase": str(progress_state.get("latest_phase") or ""),
+                    "phase_label": _analysis_phase_label(str(progress_state.get("latest_phase") or "")),
                 },
             )
             return "cancelled", "Cancelled by user request."
@@ -1484,6 +1590,8 @@ async def _run_analysis_queue_job_async(
                     "processed_frames": max(0, int(progress_state.get("latest_processed", 0))),
                     "estimated_total_frames": max(0, int(progress_state.get("latest_estimated", 0))),
                     "progress_percent": float(progress_state.get("latest_percent", 0.0)),
+                    "phase": str(progress_state.get("latest_phase") or ""),
+                    "phase_label": _analysis_phase_label(str(progress_state.get("latest_phase") or "")),
                 },
             )
 
@@ -1635,7 +1743,34 @@ async def _index_queue_worker_loop(
                     continue
 
                 async def _enqueue_remaining_files_if_needed() -> tuple[int, int]:
-                    if not remaining_filenames:
+                    effective_filenames = list(remaining_filenames)
+                    effective_payload = dict(remaining_payload)
+                    try:
+                        latest_queue_job = await asyncio.to_thread(queue_store.get_job, int(job_id))
+                    except Exception:
+                        latest_queue_job = None
+                    if isinstance(latest_queue_job, dict):
+                        latest_payload = (
+                            latest_queue_job.get("payload")
+                            if isinstance(latest_queue_job.get("payload"), dict)
+                            else {}
+                        )
+                        latest_filenames = _normalize_unique_filenames(
+                            latest_payload.get("filenames") or []
+                        )
+                        if latest_filenames:
+                            latest_remaining = [
+                                safe_name
+                                for safe_name in latest_filenames
+                                if str(safe_name).strip() and str(safe_name).strip() != current_filename
+                            ]
+                            effective_filenames = latest_remaining
+                            effective_payload = _build_payload_subset_for_filenames(
+                                latest_payload,
+                                latest_remaining,
+                            )
+
+                    if not effective_filenames:
                         return 0, 0
                     if _is_case_delete_in_progress(case_id):
                         return 0, 0
@@ -1643,20 +1778,20 @@ async def _index_queue_worker_loop(
                         requeued = await asyncio.to_thread(
                             queue_store.enqueue_or_get_active,
                             case_id=case_id,
-                            filenames=remaining_filenames,
-                            frame_interval_seconds=float(remaining_payload.get("frame_interval_seconds", 1.0)),
-                            batch_size=int(remaining_payload.get("batch_size", 32)),
-                            force=bool(remaining_payload.get("force", False)),
+                            filenames=effective_filenames,
+                            frame_interval_seconds=float(effective_payload.get("frame_interval_seconds", 1.0)),
+                            batch_size=int(effective_payload.get("batch_size", 32)),
+                            force=bool(effective_payload.get("force", False)),
                             job_kind=job_kind,
                             priority=queue_priority,
                             metadata=(
-                                remaining_payload.get("metadata")
-                                if isinstance(remaining_payload.get("metadata"), dict)
+                                effective_payload.get("metadata")
+                                if isinstance(effective_payload.get("metadata"), dict)
                                 else {}
                             ),
                         )
                         if not isinstance(requeued, dict):
-                            return 0, len(remaining_filenames)
+                            return 0, len(effective_filenames)
                         queued_payload = (
                             requeued.get("payload")
                             if isinstance(requeued.get("payload"), dict)
@@ -1667,13 +1802,13 @@ async def _index_queue_worker_loop(
                         )
                         appended_count = max(0, int(requeued.get("appended_count", 0)))
                         if bool(requeued.get("created", False)):
-                            queued_count = len(queued_filenames or remaining_filenames)
+                            queued_count = len(queued_filenames or effective_filenames)
                         else:
                             queued_count = appended_count
                         queue_position = max(0, int(requeued.get("queue_position", 0)))
                         print(
                             f"[index-queue-worker:{worker_name}] requeue case={case_id} kind={job_kind} "
-                            f"current={current_filename} remaining={len(remaining_filenames)} "
+                            f"current={current_filename} remaining={len(effective_filenames)} "
                             f"created={bool(requeued.get('created', False))} "
                             f"queue_position={queue_position}"
                         )
@@ -1681,10 +1816,10 @@ async def _index_queue_worker_loop(
                     except Exception as exc:
                         print(
                             f"[index-queue-worker:{worker_name}] requeue_failed case={case_id} kind={job_kind} "
-                            f"current={current_filename} remaining={len(remaining_filenames)} "
+                            f"current={current_filename} remaining={len(effective_filenames)} "
                             f"error={exc}"
                         )
-                        return 0, len(remaining_filenames)
+                        return 0, len(effective_filenames)
 
                 queue_status = "failed"
                 queue_error = ""
@@ -1878,6 +2013,8 @@ async def _run_index_job_async(case_id: str) -> None:
                     "frame_interval_seconds": frame_interval_seconds,
                     "batch_size": batch_size,
                     "force": force,
+                    "phase": "frame_scan",
+                    "phase_label": _base_index_phase_label("frame_scan"),
                 },
             )
             await _persist_index_job_snapshot(normalized_case_id)
@@ -1886,6 +2023,7 @@ async def _run_index_job_async(case_id: str) -> None:
                 progress_emit_state: dict[str, float | int] = {
                     "last_emit_processed": -1,
                     "last_emit_ts": 0.0,
+                    "last_emit_phase": "",
                 }
 
                 def _is_cancel_requested() -> bool:
@@ -1899,7 +2037,11 @@ async def _run_index_job_async(case_id: str) -> None:
                             return True
                         return bool(running_job.get("cancel_requested", False))
 
-                def _on_video_progress(processed_frames: int, estimated_total_frames: int | None) -> None:
+                def _on_video_progress(
+                    processed_frames: int,
+                    estimated_total_frames: int | None,
+                    phase: str | None = None,
+                ) -> None:
                     with lock:
                         running_job = jobs.get(normalized_case_id)
                         if not isinstance(running_job, dict):
@@ -1908,6 +2050,7 @@ async def _run_index_job_async(case_id: str) -> None:
                             return
                         processed = max(0, int(processed_frames))
                         estimated = max(0, int(estimated_total_frames or 0))
+                        phase_value = str(phase or "").strip().lower() or "frame_scan"
                         if estimated < processed:
                             estimated = processed
 
@@ -1935,18 +2078,21 @@ async def _run_index_job_async(case_id: str) -> None:
 
                     last_emit_processed = int(progress_emit_state.get("last_emit_processed", -1))
                     last_emit_ts = float(progress_emit_state.get("last_emit_ts", 0.0))
+                    last_emit_phase = str(progress_emit_state.get("last_emit_phase", "") or "")
                     now_ts = float(time.time())
                     should_emit = (
                         processed <= 1
                         or (estimated > 0 and processed >= estimated)
                         or (processed - max(0, last_emit_processed) >= 5)
                         or (now_ts - last_emit_ts >= 0.75)
+                        or (phase_value != last_emit_phase)
                     )
                     if not should_emit:
                         return
 
                     progress_emit_state["last_emit_processed"] = processed
                     progress_emit_state["last_emit_ts"] = now_ts
+                    progress_emit_state["last_emit_phase"] = phase_value
                     progress_percent = (
                         min(100.0, max(0.0, (float(processed) / float(estimated)) * 100.0))
                         if estimated > 0
@@ -1964,6 +2110,8 @@ async def _run_index_job_async(case_id: str) -> None:
                                 "processed_frames": processed,
                                 "estimated_total_frames": estimated,
                                 "progress_percent": float(progress_percent),
+                                "phase": phase_value,
+                                "phase_label": _base_index_phase_label(phase_value),
                             },
                         )
                     except Exception as exc:
@@ -1981,6 +2129,7 @@ async def _run_index_job_async(case_id: str) -> None:
                     force=force,
                     analysis_face_people=False,
                     analysis_vehicles=False,
+                    analysis_face_identity=False,
                     analysis_only=False,
                     progress_callback=_on_video_progress,
                     cancel_check=_is_cancel_requested,
@@ -2041,6 +2190,8 @@ async def _run_index_job_async(case_id: str) -> None:
                         "indexed_windows": indexed_windows,
                         "processed_frames": processed_frames,
                         "estimated_total_frames": estimated_total_frames,
+                        "phase": "finalizing",
+                        "phase_label": _base_index_phase_label("finalizing"),
                     },
                 )
                 await _persist_index_job_snapshot(normalized_case_id)
@@ -2926,6 +3077,7 @@ def _run_optional_analysis_sync(
     frame_interval_seconds: float,
     batch_size: int,
     selection: AnalysisSelection,
+    analysis_face_identity: bool,
     force: bool,
     progress_callback=None,
     cancel_check=None,
@@ -3055,13 +3207,19 @@ def _run_optional_analysis_sync(
         )
         images.append(Image.fromarray(crop_rgb))
 
+    def _emit_analysis_progress(phase: str) -> None:
+        if progress_callback is None:
+            return
+        try:
+            progress_callback(processed_frames, estimated_total_frames, str(phase or "").strip().lower())
+        except TypeError:
+            progress_callback(processed_frames, estimated_total_frames)
+        except Exception:
+            pass
+
     try:
         estimated_total_frames = _estimate_sampled_frame_count(video_path, frame_interval_seconds)
-        if progress_callback is not None:
-            try:
-                progress_callback(0, estimated_total_frames)
-            except Exception:
-                pass
+        _emit_analysis_progress("frame_scan")
 
         for frame in iter_video_frames(video_path, interval_seconds=frame_interval_seconds):
             if cancel_check is not None and bool(cancel_check()):
@@ -3069,11 +3227,7 @@ def _run_optional_analysis_sync(
                     f"Background analysis cancelled while processing frames: {resolved_filename}"
                 )
             processed_frames += 1
-            if progress_callback is not None:
-                try:
-                    progress_callback(processed_frames, estimated_total_frames)
-                except Exception:
-                    pass
+            _emit_analysis_progress("frame_scan")
             detections = analyzer.detect_frame(frame.frame_rgb, pending_selection)
 
             if pending["face_people"]:
@@ -3130,11 +3284,7 @@ def _run_optional_analysis_sync(
 
         if estimated_total_frames < processed_frames:
             estimated_total_frames = processed_frames
-        if progress_callback is not None:
-            try:
-                progress_callback(processed_frames, estimated_total_frames)
-            except Exception:
-                pass
+        _emit_analysis_progress("frame_scan")
     except _IndexCancellationRequested:
         raise
     except Exception as exc:
@@ -3152,11 +3302,13 @@ def _run_optional_analysis_sync(
     face_identity_status = "not_requested"
     face_identity_reason = ""
     face_identity_indexed = 0
+    run_face_identity = bool(analysis_face_identity) and bool(pending["face_people"])
     if cancel_check is not None and bool(cancel_check()):
         raise _IndexCancellationRequested(
             f"Background analysis cancelled before embedding crops: {resolved_filename}"
         )
     if pending["face_people"]:
+        _emit_analysis_progress("crop_embedding")
         if face_people_images:
             face_people_embeddings = embedder.encode_images(
                 face_people_images,
@@ -3182,46 +3334,49 @@ def _run_optional_analysis_sync(
             face_only_records.append(record)
             face_only_images.append(image)
 
-        # Refresh face identity records on each face/people rerun so suspect search stays in sync.
-        face_identity_store.delete_video(resolved_filename)
-        if cancel_check is not None and bool(cancel_check()):
-            raise _IndexCancellationRequested(
-                f"Background analysis cancelled before FACE-02 embedding: {resolved_filename}"
-            )
-        if face_only_images:
-            if face_embedder is not None and bool(getattr(face_embedder, "available", False)):
-                try:
-                    face_vectors, matched_indices = face_embedder.encode_face_crops(face_only_images)
-                    matched_records = [
-                        face_only_records[index]
-                        for index in matched_indices
-                        if 0 <= int(index) < len(face_only_records)
-                    ]
-                    upsert_result = face_identity_store.upsert_faces(
-                        video_filename=resolved_filename,
-                        records=matched_records,
-                        embeddings=face_vectors,
-                        force=True,
-                    )
-                    face_identity_status = str(upsert_result.get("status") or "processed")
-                    face_identity_indexed = int(upsert_result.get("indexed", 0))
-                except Exception as exc:
-                    face_identity_status = "failed"
-                    face_identity_reason = _truncate_error(str(exc))
-                    print(
-                        f"[face-identity][{case_paths.case_id}] "
-                        f"file={resolved_filename} status=failed error={face_identity_reason}"
+        if run_face_identity:
+            # Refresh face identity records on each face/people rerun so suspect search stays in sync.
+            face_identity_store.delete_video(resolved_filename)
+            if cancel_check is not None and bool(cancel_check()):
+                raise _IndexCancellationRequested(
+                    f"Background analysis cancelled before FACE-02 embedding: {resolved_filename}"
+                )
+            if face_only_images:
+                if face_embedder is not None and bool(getattr(face_embedder, "available", False)):
+                    try:
+                        _emit_analysis_progress("face_identity")
+                        face_vectors, matched_indices = face_embedder.encode_face_crops(face_only_images)
+                        matched_records = [
+                            face_only_records[index]
+                            for index in matched_indices
+                            if 0 <= int(index) < len(face_only_records)
+                        ]
+                        upsert_result = face_identity_store.upsert_faces(
+                            video_filename=resolved_filename,
+                            records=matched_records,
+                            embeddings=face_vectors,
+                            force=True,
+                        )
+                        face_identity_status = str(upsert_result.get("status") or "processed")
+                        face_identity_indexed = int(upsert_result.get("indexed", 0))
+                    except Exception as exc:
+                        face_identity_status = "failed"
+                        face_identity_reason = _truncate_error(str(exc))
+                        print(
+                            f"[face-identity][{case_paths.case_id}] "
+                            f"file={resolved_filename} status=failed error={face_identity_reason}"
+                        )
+                else:
+                    face_identity_status = "unavailable"
+                    face_identity_reason = _truncate_error(
+                        str(getattr(face_embedder, "error_message", "InsightFace unavailable"))
                     )
             else:
-                face_identity_status = "unavailable"
-                face_identity_reason = _truncate_error(
-                    str(getattr(face_embedder, "error_message", "InsightFace unavailable"))
-                )
-        else:
-            face_identity_status = "processed"
-            face_identity_indexed = 0
+                face_identity_status = "processed"
+                face_identity_indexed = 0
 
     if pending["vehicles"]:
+        _emit_analysis_progress("crop_embedding")
         if vehicle_images:
             vehicle_embeddings = embedder.encode_images(
                 vehicle_images,
@@ -3237,6 +3392,7 @@ def _run_optional_analysis_sync(
             force=force or not existing_status["vehicles"],
         )
 
+    _emit_analysis_progress("finalizing")
     stored = vector_store.upsert_video_analysis(
         signature=signature,
         analysis_interval_seconds=frame_interval_seconds,
@@ -3311,6 +3467,7 @@ def _process_video_sync(
     force: bool,
     analysis_face_people: bool,
     analysis_vehicles: bool,
+    analysis_face_identity: bool,
     analysis_only: bool,
     progress_callback=None,
     cancel_check=None,
@@ -3357,6 +3514,20 @@ def _process_video_sync(
     temporal_status = "not_requested" if analysis_only else "skipped"
     temporal_reason = "analysis_only mode" if analysis_only else "already indexed for this interval"
 
+    def _emit_progress(
+        processed: int,
+        estimated_total: int | None,
+        phase: str,
+    ) -> None:
+        if progress_callback is None:
+            return
+        safe_processed = max(0, int(processed))
+        safe_estimated = max(0, int(estimated_total or 0))
+        try:
+            progress_callback(safe_processed, safe_estimated, str(phase or "").strip().lower())
+        except TypeError:
+            progress_callback(safe_processed, safe_estimated)
+
     if not analysis_only:
         frame_indexed = vector_store.is_video_indexed(signature, frame_interval_seconds)
         temporal_indexed = temporal_store.is_video_indexed(
@@ -3372,11 +3543,8 @@ def _process_video_sync(
             temporal_status = "skipped"
             temporal_reason = "video already indexed for temporal windows"
             estimated_total_frames = max(0, int(indexed_frames))
-            if progress_callback is not None and estimated_total_frames > 0:
-                try:
-                    progress_callback(estimated_total_frames, estimated_total_frames)
-                except Exception:
-                    pass
+            if estimated_total_frames > 0:
+                _emit_progress(estimated_total_frames, estimated_total_frames, "finalizing")
         else:
             if cancel_check is not None and bool(cancel_check()):
                 raise _IndexCancellationRequested(
@@ -3392,11 +3560,7 @@ def _process_video_sync(
             pending_images: list[Image.Image] = []
             total_frames = 0
             estimated_total_frames = _estimate_sampled_frame_count(video_path, frame_interval_seconds)
-            if progress_callback is not None:
-                try:
-                    progress_callback(0, estimated_total_frames)
-                except Exception:
-                    pass
+            _emit_progress(0, estimated_total_frames, "frame_scan")
 
             for frame in iter_video_frames(video_path, interval_seconds=frame_interval_seconds):
                 if cancel_check is not None and bool(cancel_check()):
@@ -3418,17 +3582,14 @@ def _process_video_sync(
                 )
                 pending_images.append(Image.fromarray(frame.frame_rgb))
                 total_frames += 1
-                if progress_callback is not None:
-                    try:
-                        progress_callback(total_frames, estimated_total_frames)
-                    except Exception:
-                        pass
+                _emit_progress(total_frames, estimated_total_frames, "frame_scan")
 
                 if len(pending_images) >= batch_size:
                     if cancel_check is not None and bool(cancel_check()):
                         raise _IndexCancellationRequested(
                             f"Background indexing cancelled before embedding batch: {resolved_filename}"
                         )
+                    _emit_progress(total_frames, estimated_total_frames, "embedding")
                     embeddings_batches.append(
                         app.state.embedder.encode_images(pending_images, batch_size=batch_size)
                     )
@@ -3439,6 +3600,7 @@ def _process_video_sync(
                     raise _IndexCancellationRequested(
                         f"Background indexing cancelled before final embedding batch: {resolved_filename}"
                     )
+                _emit_progress(total_frames, estimated_total_frames, "embedding")
                 embeddings_batches.append(
                     app.state.embedder.encode_images(pending_images, batch_size=batch_size)
                 )
@@ -3450,11 +3612,7 @@ def _process_video_sync(
 
             if estimated_total_frames < total_frames:
                 estimated_total_frames = total_frames
-            if progress_callback is not None:
-                try:
-                    progress_callback(total_frames, estimated_total_frames)
-                except Exception:
-                    pass
+            _emit_progress(total_frames, estimated_total_frames, "temporal_windows")
 
             frame_upsert_result = vector_store.upsert_video_embeddings(
                 signature=signature,
@@ -3489,6 +3647,7 @@ def _process_video_sync(
             if base_status != "skipped":
                 base_reason = ""
             temporal_reason = ""
+            _emit_progress(total_frames, estimated_total_frames, "finalizing")
 
     analysis_payload = _run_optional_analysis_sync(
         case_paths=case_paths,
@@ -3502,6 +3661,7 @@ def _process_video_sync(
             face_people=analysis_face_people,
             vehicles=analysis_vehicles,
         ),
+        analysis_face_identity=analysis_face_identity,
         force=force,
         progress_callback=progress_callback,
         cancel_check=cancel_check,
@@ -3612,6 +3772,9 @@ app.include_router(
         read_saved_search_settings_sync=_read_saved_search_settings_sync,
         write_saved_search_settings_sync=_write_saved_search_settings_sync,
         build_search_settings_response_sync=_build_search_settings_response_sync,
+        read_saved_analysis_settings_sync=_read_saved_analysis_settings_sync,
+        write_saved_analysis_settings_sync=_write_saved_analysis_settings_sync,
+        build_analysis_settings_response_sync=_build_analysis_settings_response_sync,
     )
 )
 _media_service = MediaService(
@@ -3629,6 +3792,8 @@ _media_service = MediaService(
     media_url_for_case_path=_media_url_for_case_path,
     get_vector_store_for_case=_get_vector_store_for_case,
     get_temporal_store_for_case=_get_temporal_store_for_case,
+    get_face_identity_store_for_case=_get_face_identity_store_for_case,
+    is_face_identity_enabled_sync=_is_face_identity_enabled_sync,
     delete_video_sync=_delete_video_sync,
     process_video_sync=_process_video_sync,
     resolve_index_filenames=_resolve_index_filenames,

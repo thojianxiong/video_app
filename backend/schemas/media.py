@@ -11,6 +11,7 @@ class ProcessVideoRequest(BaseModel):
     force: bool = False
     analysis_face_people: bool = False
     analysis_vehicles: bool = False
+    analysis_face_identity: bool | None = None
     analysis_only: bool = False
 
 
@@ -30,6 +31,7 @@ class AnalysisStartRequest(BaseModel):
     force: bool = False
     analysis_face_people: bool = False
     analysis_vehicles: bool = False
+    analysis_face_identity: bool | None = None
 
 
 class AnalysisInterruptedCancelRequest(BaseModel):

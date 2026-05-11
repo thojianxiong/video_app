@@ -44,6 +44,8 @@ class MediaServiceAnalysisStatusTests(unittest.IsolatedAsyncioTestCase):
             media_url_for_case_path=lambda _path: "",
             get_vector_store_for_case=lambda *_args, **_kwargs: (None, None),
             get_temporal_store_for_case=lambda *_args, **_kwargs: (None, None),
+            get_face_identity_store_for_case=lambda *_args, **_kwargs: (None, None),
+            is_face_identity_enabled_sync=lambda *_args, **_kwargs: False,
             delete_video_sync=lambda *_args, **_kwargs: {},
             process_video_sync=lambda *_args, **_kwargs: {},
             resolve_index_filenames=lambda *_args, **_kwargs: [],
@@ -312,6 +314,51 @@ class MediaServiceAnalysisStatusTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(int(payload["queue"]["job_id"]), 0)
         self.assertEqual(int(payload["progress"]["total"]), 0)
         self.assertEqual(payload["filenames"], [])
+
+    async def test_get_background_analysis_status_prefers_active_matching_category_over_latest_terminal(self) -> None:
+        face_job = self._enqueue_analysis_job(
+            filenames=["fp_running.mp4"],
+            metadata={
+                "analysis_face_people": True,
+                "analysis_vehicles": False,
+                "analysis_face_people_filenames": ["fp_running.mp4"],
+            },
+        )
+        claimed_face = self.queue_store.claim_next_queued()
+        self.assertIsNotNone(claimed_face)
+        self.assertEqual(int(claimed_face["job_id"]), int(face_job["job_id"]))
+
+        vehicle_job = self._enqueue_analysis_job(
+            filenames=["veh_done.mp4"],
+            metadata={
+                "analysis_face_people": False,
+                "analysis_vehicles": True,
+                "analysis_vehicles_filenames": ["veh_done.mp4"],
+            },
+        )
+        claimed_vehicle = self.queue_store.claim_next_queued()
+        self.assertIsNotNone(claimed_vehicle)
+        self.assertEqual(int(claimed_vehicle["job_id"]), int(vehicle_job["job_id"]))
+        self.queue_store.complete_job(
+            job_id=int(vehicle_job["job_id"]),
+            status="completed",
+            error="",
+        )
+
+        self.pipeline_store.update_stage(
+            case_id="case_a",
+            filename="fp_running.mp4",
+            stage="analysis",
+            status="running",
+            event="analysis_running",
+        )
+
+        payload = await self.service.get_background_analysis_status("case_a", "face_people")
+        self.assertEqual(payload["status"], "running")
+        self.assertEqual(int(payload["queue"]["job_id"]), int(face_job["job_id"]))
+        self.assertEqual(payload["filenames"], ["fp_running.mp4"])
+        self.assertTrue(bool(payload["analysis"]["face_people"]))
+        self.assertFalse(bool(payload["analysis"]["vehicles"]))
 
 
 if __name__ == "__main__":

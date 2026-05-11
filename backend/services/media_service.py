@@ -49,6 +49,8 @@ class MediaService:
         media_url_for_case_path: Any,
         get_vector_store_for_case: Any,
         get_temporal_store_for_case: Any,
+        get_face_identity_store_for_case: Any,
+        is_face_identity_enabled_sync: Any,
         delete_video_sync: Any,
         process_video_sync: Any,
         resolve_index_filenames: Any,
@@ -71,6 +73,8 @@ class MediaService:
         self.media_url_for_case_path = media_url_for_case_path
         self.get_vector_store_for_case = get_vector_store_for_case
         self.get_temporal_store_for_case = get_temporal_store_for_case
+        self.get_face_identity_store_for_case = get_face_identity_store_for_case
+        self.is_face_identity_enabled_sync = is_face_identity_enabled_sync
         self.delete_video_sync = delete_video_sync
         self.process_video_sync = process_video_sync
         self.resolve_index_filenames = resolve_index_filenames
@@ -78,6 +82,24 @@ class MediaService:
         self.new_index_job_record = new_index_job_record
         self.run_index_job_async = run_index_job_async
         self.index_job_snapshot = index_job_snapshot
+
+    def _resolve_face_identity_enabled(
+        self,
+        *,
+        analysis_face_people: bool,
+        analysis_face_identity: bool | None,
+    ) -> bool:
+        if not bool(analysis_face_people):
+            return False
+        if analysis_face_identity is not None:
+            return bool(analysis_face_identity)
+        resolver = self.is_face_identity_enabled_sync
+        if callable(resolver):
+            try:
+                return bool(resolver())
+            except Exception:
+                return False
+        return False
 
     @classmethod
     def _normalize_upload_chunk_size(cls, chunk_size_bytes: int) -> int:
@@ -221,6 +243,11 @@ class MediaService:
                 "hit_frames": 0,
                 "first_hit_seconds": None,
             },
+            "face_identity": {
+                "status": "not_requested",
+                "indexed": 0,
+                "reason": "",
+            },
         }
 
     @classmethod
@@ -237,6 +264,72 @@ class MediaService:
             status_code=400,
             detail=f"Invalid analysis category: {category}",
         )
+
+    @classmethod
+    def _queue_job_matches_analysis_category(
+        cls,
+        *,
+        job: dict[str, Any],
+        category: str,
+    ) -> bool:
+        selected_category = cls._normalize_analysis_status_category(category)
+        if not selected_category:
+            return True
+
+        queue_payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
+        metadata = queue_payload.get("metadata") if isinstance(queue_payload.get("metadata"), dict) else {}
+        all_filenames = cls._unique_filenames(queue_payload.get("filenames") or [])
+        face_people_filenames = cls._unique_filenames(metadata.get("analysis_face_people_filenames") or [])
+        vehicle_filenames = cls._unique_filenames(metadata.get("analysis_vehicles_filenames") or [])
+        face_identity_filenames = cls._unique_filenames(metadata.get("analysis_face_identity_filenames") or [])
+        analysis_face_people = bool(metadata.get("analysis_face_people", False))
+        analysis_vehicles = bool(metadata.get("analysis_vehicles", False))
+        analysis_face_identity = bool(metadata.get("analysis_face_identity", False))
+
+        has_explicit_mode_flags = (
+            "analysis_face_people" in metadata
+            or "analysis_vehicles" in metadata
+            or "analysis_face_identity" in metadata
+            or bool(face_people_filenames)
+            or bool(vehicle_filenames)
+            or bool(analysis_face_identity)
+        )
+
+        if selected_category == cls.ANALYSIS_STATUS_CATEGORY_FACE_PEOPLE:
+            if face_people_filenames:
+                return True
+            if face_identity_filenames:
+                return True
+            if (
+                analysis_face_people
+                and (
+                    not analysis_vehicles
+                    or (not face_people_filenames and not vehicle_filenames)
+                )
+            ):
+                return True
+            if analysis_face_identity and not analysis_vehicles:
+                return True
+            if not has_explicit_mode_flags and bool(all_filenames):
+                return True
+            return False
+
+        if selected_category == cls.ANALYSIS_STATUS_CATEGORY_VEHICLES:
+            if vehicle_filenames:
+                return True
+            if (
+                analysis_vehicles
+                and (
+                    not analysis_face_people
+                    or (not face_people_filenames and not vehicle_filenames)
+                )
+            ):
+                return True
+            if not has_explicit_mode_flags and bool(all_filenames):
+                return True
+            return False
+
+        return True
 
     @staticmethod
     def _default_pipeline(case_id: str, filename: str) -> dict:
@@ -1040,11 +1133,12 @@ class MediaService:
         details = stage_payload.get("details") if isinstance(stage_payload.get("details"), dict) else {}
         face_people_flag = bool(details.get("analysis_face_people", False))
         vehicles_flag = bool(details.get("analysis_vehicles", False))
-        if not face_people_flag and not vehicles_flag:
+        face_identity_flag = bool(details.get("analysis_face_identity", False))
+        if not face_people_flag and not vehicles_flag and not face_identity_flag:
             # Backward compatibility for older snapshots without explicit mode flags.
             return True
         if normalized_category == cls.ANALYSIS_STATUS_CATEGORY_FACE_PEOPLE:
-            return face_people_flag
+            return face_people_flag or face_identity_flag
         if normalized_category == cls.ANALYSIS_STATUS_CATEGORY_VEHICLES:
             return vehicles_flag
         return False
@@ -1173,6 +1267,9 @@ class MediaService:
                     progress_percent = min(100.0, max(0.0, (float(processed) / float(total)) * 100.0))
                 elif is_current and safe_current_percent > 0:
                     progress_percent = safe_current_percent
+                # Keep running rows below 100% so users can distinguish "still working" from done.
+                if progress_percent >= 100.0:
+                    progress_percent = 99.0
 
             rows.append(
                 {
@@ -1184,6 +1281,10 @@ class MediaService:
                     "is_current": bool(is_current),
                 }
             )
+            if isinstance(details.get("phase"), str) and str(details.get("phase")).strip():
+                rows[-1]["phase"] = str(details.get("phase")).strip()
+            if isinstance(details.get("phase_label"), str) and str(details.get("phase_label")).strip():
+                rows[-1]["phase_label"] = str(details.get("phase_label")).strip()
         return rows
 
     @staticmethod
@@ -1251,9 +1352,11 @@ class MediaService:
             "file_progress": [],
             "analysis_face_people_filenames": [],
             "analysis_vehicles_filenames": [],
+            "analysis_face_identity_filenames": [],
             "analysis": {
                 "face_people": False,
                 "vehicles": False,
+                "face_identity": False,
             },
             "message": "No analysis job found for this case.",
         }
@@ -2573,6 +2676,7 @@ class MediaService:
         }
 
     async def list_videos(self, case_id: str | None) -> dict:
+        face_identity_store = None
         try:
             resolved_case_id = await asyncio.to_thread(self.resolve_case_id_or_default, case_id)
             case_paths, vector_store = await asyncio.to_thread(
@@ -2583,15 +2687,37 @@ class MediaService:
                 self.get_temporal_store_for_case,
                 resolved_case_id,
             )
+            _, face_identity_store = await asyncio.to_thread(
+                self.get_face_identity_store_for_case,
+                resolved_case_id,
+            )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
         except KeyError:
             raise HTTPException(status_code=404, detail=f"Case not found: {case_id}")
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc))
 
         indexed_counts = vector_store.indexed_counts_by_filename()
         indexed_window_counts = temporal_store.indexed_counts_by_filename()
         preview_thumbnails = vector_store.preview_thumbnails_by_filename()
         analysis_summary = vector_store.analysis_summary_by_filename()
+        face_identity_counts_by_filename: dict[str, int] = {}
+        if face_identity_store is not None:
+            if hasattr(face_identity_store, "counts_by_video_filename"):
+                try:
+                    loaded_counts = await asyncio.to_thread(face_identity_store.counts_by_video_filename)
+                    if isinstance(loaded_counts, dict):
+                        for raw_name, raw_count in loaded_counts.items():
+                            safe_name = str(raw_name or "").strip()
+                            if not safe_name:
+                                continue
+                            try:
+                                face_identity_counts_by_filename[safe_name] = max(0, int(raw_count))
+                            except (TypeError, ValueError):
+                                face_identity_counts_by_filename[safe_name] = 0
+                except Exception:
+                    face_identity_counts_by_filename = {}
         pipeline_snapshots = await self._pipeline_list_case_snapshots(case_id=case_paths.case_id)
         pipeline_by_filename = {}
         for item in pipeline_snapshots:
@@ -2627,7 +2753,7 @@ class MediaService:
 
             indexed_frames = int(indexed_counts.get(file_path.name, 0))
             indexed_windows = int(indexed_window_counts.get(file_path.name, 0))
-            analysis = analysis_summary.get(
+            analysis_raw = analysis_summary.get(
                 file_path.name,
                 self._default_analysis_summary(),
             )
@@ -2635,6 +2761,79 @@ class MediaService:
                 file_path.name,
                 self._default_pipeline(case_paths.case_id, file_path.name),
             )
+            analysis_face_people = (
+                analysis_raw.get("face_people")
+                if isinstance(analysis_raw.get("face_people"), dict)
+                else {}
+            )
+            analysis_vehicles = (
+                analysis_raw.get("vehicles")
+                if isinstance(analysis_raw.get("vehicles"), dict)
+                else {}
+            )
+            analysis = {
+                "processed_frames": int(analysis_raw.get("processed_frames", 0)),
+                "detector": str(analysis_raw.get("detector", "")),
+                "face_people": {
+                    "processed": bool(analysis_face_people.get("processed", False)),
+                    "face_count": int(analysis_face_people.get("face_count", 0)),
+                    "people_count": int(analysis_face_people.get("people_count", 0)),
+                    "hit_frames": int(analysis_face_people.get("hit_frames", 0)),
+                    "first_hit_seconds": analysis_face_people.get("first_hit_seconds"),
+                },
+                "vehicles": {
+                    "processed": bool(analysis_vehicles.get("processed", False)),
+                    "vehicle_count": int(analysis_vehicles.get("vehicle_count", 0)),
+                    "hit_frames": int(analysis_vehicles.get("hit_frames", 0)),
+                    "first_hit_seconds": analysis_vehicles.get("first_hit_seconds"),
+                },
+            }
+
+            stage_payload = self._stage_payload(pipeline, "analysis")
+            stage_details = (
+                stage_payload.get("details")
+                if isinstance(stage_payload.get("details"), dict)
+                else {}
+            )
+            stage_status = self._stage_status(pipeline, "analysis")
+            face_identity_details = (
+                stage_details.get("face_identity")
+                if isinstance(stage_details.get("face_identity"), dict)
+                else {}
+            )
+
+            face_identity_status = str(face_identity_details.get("status") or "").strip().lower()
+            face_identity_reason = str(face_identity_details.get("reason") or "").strip()
+            face_identity_indexed = max(0, int(face_identity_counts_by_filename.get(file_path.name, 0)))
+
+            if "indexed" in face_identity_details:
+                try:
+                    face_identity_indexed = max(
+                        face_identity_indexed,
+                        max(0, int(face_identity_details.get("indexed", 0))),
+                    )
+                except (TypeError, ValueError):
+                    pass
+
+            requested_face_identity = bool(stage_details.get("analysis_face_identity", False))
+            if not face_identity_status:
+                if face_identity_indexed > 0:
+                    face_identity_status = "processed"
+                elif requested_face_identity:
+                    if stage_status in {"queued", "running", "pending", "cancelling"}:
+                        face_identity_status = "pending"
+                    elif stage_status in {"failed", "interrupted", "cancelled"}:
+                        face_identity_status = stage_status
+                    else:
+                        face_identity_status = "processed"
+                else:
+                    face_identity_status = "not_requested"
+
+            analysis["face_identity"] = {
+                "status": face_identity_status or "not_requested",
+                "indexed": int(face_identity_indexed),
+                "reason": face_identity_reason,
+            }
             video_url = self.media_url_for_case_path(file_path)
 
             videos.append(
@@ -2825,12 +3024,17 @@ class MediaService:
         force: bool,
         analysis_face_people: bool,
         analysis_vehicles: bool,
+        analysis_face_identity: bool | None,
         analysis_only: bool,
     ) -> dict:
         resolved_case_id = ""
         base_stage_started = False
         analysis_stage_started = False
         pipeline_filename = Path(str(filename or "")).name.strip() or str(filename or "").strip()
+        effective_face_identity = self._resolve_face_identity_enabled(
+            analysis_face_people=bool(analysis_face_people),
+            analysis_face_identity=analysis_face_identity,
+        )
         try:
             resolved_case_id = await asyncio.to_thread(
                 self.resolve_case_id_or_default,
@@ -2852,6 +3056,9 @@ class MediaService:
                     "batch_size": int(batch_size),
                     "force": bool(force),
                     "analysis_only": bool(analysis_only),
+                    "analysis_face_people": bool(analysis_face_people),
+                    "analysis_vehicles": bool(analysis_vehicles),
+                    "analysis_face_identity": bool(effective_face_identity),
                 },
             )
 
@@ -2887,6 +3094,7 @@ class MediaService:
                     details={
                         "face_people": bool(analysis_face_people),
                         "vehicles": bool(analysis_vehicles),
+                        "analysis_face_identity": bool(effective_face_identity),
                     },
                 )
                 analysis_stage_started = True
@@ -2909,6 +3117,7 @@ class MediaService:
                 force=force,
                 analysis_face_people=analysis_face_people,
                 analysis_vehicles=analysis_vehicles,
+                analysis_face_identity=effective_face_identity,
                 analysis_only=analysis_only,
             )
             resolved_output_filename = (
@@ -2948,6 +3157,11 @@ class MediaService:
                 analysis_status = self._pipeline_status_from_analysis(
                     str(analysis_payload.get("status") or "not_requested")
                 )
+                face_identity_payload = (
+                    analysis_payload.get("face_identity")
+                    if isinstance(analysis_payload.get("face_identity"), dict)
+                    else {}
+                )
                 await self._pipeline_update_stage(
                     case_id=resolved_case_id,
                     filename=pipeline_filename,
@@ -2959,6 +3173,8 @@ class MediaService:
                         "ran": bool(analysis_payload.get("ran", False)),
                         "pending": dict(analysis_payload.get("pending") or {}),
                         "requested": dict(analysis_payload.get("requested") or {}),
+                        "analysis_face_identity": bool(effective_face_identity),
+                        "face_identity": dict(face_identity_payload),
                     },
                 )
 
@@ -3248,8 +3464,15 @@ class MediaService:
         force: bool,
         analysis_face_people: bool,
         analysis_vehicles: bool,
+        analysis_face_identity: bool | None,
     ) -> dict:
         locked_filenames: list[str] = []
+        effective_face_identity = self._resolve_face_identity_enabled(
+            analysis_face_people=bool(analysis_face_people),
+            analysis_face_identity=analysis_face_identity,
+        )
+        if bool(effective_face_identity):
+            analysis_face_people = True
         if not analysis_face_people and not analysis_vehicles:
             raise HTTPException(
                 status_code=400,
@@ -3318,6 +3541,7 @@ class MediaService:
                     "force": bool(force),
                     "analysis_face_people": bool(analysis_face_people),
                     "analysis_vehicles": bool(analysis_vehicles),
+                    "analysis_face_identity": bool(effective_face_identity),
                 },
             )
 
@@ -3325,95 +3549,132 @@ class MediaService:
         if queue_store is None:
             raise HTTPException(status_code=500, detail="Background analysis queue is unavailable.")
 
-        analysis_metadata: dict[str, Any] = {
-            "analysis_face_people": bool(analysis_face_people),
-            "analysis_vehicles": bool(analysis_vehicles),
-            "analysis_only": True,
-        }
-        if analysis_face_people:
-            analysis_metadata["analysis_face_people_filenames"] = list(resolved_filenames)
-        if analysis_vehicles:
-            analysis_metadata["analysis_vehicles_filenames"] = list(resolved_filenames)
+        queue_jobs: list[dict[str, Any]] = []
 
-        queued_job = await asyncio.to_thread(
-            queue_store.enqueue_or_get_active,
-            case_id=resolved_case_id,
-            filenames=resolved_filenames,
-            frame_interval_seconds=frame_interval_seconds,
-            batch_size=batch_size,
-            force=force,
-            job_kind=self.QUEUE_KIND_ANALYSIS,
-            priority=self.QUEUE_PRIORITY_ANALYSIS,
-            metadata=analysis_metadata,
-        )
-        if not isinstance(queued_job, dict):
-            raise HTTPException(status_code=500, detail="Failed to enqueue background analysis job.")
+        async def _enqueue_analysis_job(
+            *,
+            mode_key: str,
+            face_people: bool,
+            vehicles: bool,
+            face_identity: bool,
+        ) -> dict[str, Any]:
+            metadata: dict[str, Any] = {
+                "analysis_face_people": bool(face_people),
+                "analysis_vehicles": bool(vehicles),
+                "analysis_face_identity": bool(face_identity),
+                "analysis_only": True,
+                "analysis_mode": str(mode_key),
+            }
+            if face_people:
+                metadata["analysis_face_people_filenames"] = list(resolved_filenames)
+            if vehicles:
+                metadata["analysis_vehicles_filenames"] = list(resolved_filenames)
+            if face_identity:
+                metadata["analysis_face_identity_filenames"] = list(resolved_filenames)
+            queued = await asyncio.to_thread(
+                queue_store.enqueue_or_get_active,
+                case_id=resolved_case_id,
+                filenames=resolved_filenames,
+                frame_interval_seconds=frame_interval_seconds,
+                batch_size=batch_size,
+                force=force,
+                job_kind=self.QUEUE_KIND_ANALYSIS,
+                priority=self.QUEUE_PRIORITY_ANALYSIS,
+                metadata=metadata,
+                append_to_case_queued=False,
+            )
+            if not isinstance(queued, dict):
+                raise HTTPException(status_code=500, detail="Failed to enqueue background analysis job.")
+            queued["analysis_mode"] = str(mode_key)
+            return queued
 
-        queue_position = max(0, int(queued_job.get("queue_position", 0)))
-        queue_job_id = int(queued_job.get("job_id", 0))
-        queue_job_kind = str(queued_job.get("job_kind") or self.QUEUE_KIND_ANALYSIS)
-        queue_priority = max(1, int(queued_job.get("priority", self.QUEUE_PRIORITY_ANALYSIS)))
-        created = bool(queued_job.get("created", False))
-        reason = str(queued_job.get("reason") or "")
-        appended_count = max(0, int(queued_job.get("appended_count", 0)))
-        appended_filenames = [
-            str(item).strip()
-            for item in (queued_job.get("appended_filenames") or [])
-            if str(item).strip()
-        ]
-        queued_payload = queued_job.get("payload") if isinstance(queued_job.get("payload"), dict) else {}
-        queued_metadata = (
-            queued_payload.get("metadata")
-            if isinstance(queued_payload.get("metadata"), dict)
-            else {}
-        )
-        effective_face_people = bool(queued_metadata.get("analysis_face_people", analysis_face_people))
-        effective_vehicles = bool(queued_metadata.get("analysis_vehicles", analysis_vehicles))
+        if bool(analysis_face_people):
+            queue_jobs.append(
+                await _enqueue_analysis_job(
+                    mode_key="face_people",
+                    face_people=True,
+                    vehicles=False,
+                    face_identity=False,
+                )
+            )
+        if bool(analysis_vehicles):
+            queue_jobs.append(
+                await _enqueue_analysis_job(
+                    mode_key="vehicles",
+                    face_people=False,
+                    vehicles=True,
+                    face_identity=False,
+                )
+            )
+        if bool(effective_face_identity):
+            queue_jobs.append(
+                await _enqueue_analysis_job(
+                    mode_key="face_identity",
+                    face_people=False,
+                    vehicles=False,
+                    face_identity=True,
+                )
+            )
 
+        if not queue_jobs:
+            raise HTTPException(
+                status_code=400,
+                detail="Select at least one analysis mode to queue.",
+            )
+
+        started_any = any(bool(item.get("created", False)) for item in queue_jobs)
+        queue_entries: list[dict[str, Any]] = []
+        for job in queue_jobs:
+            queue_entries.append(
+                {
+                    "job_id": int(job.get("job_id", 0)),
+                    "job_kind": str(job.get("job_kind") or self.QUEUE_KIND_ANALYSIS),
+                    "priority": max(1, int(job.get("priority", self.QUEUE_PRIORITY_ANALYSIS))),
+                    "status": str(job.get("status") or "queued"),
+                    "position_ahead": max(0, int(job.get("queue_position", 0))),
+                    "created": bool(job.get("created", False)),
+                    "reason": str(job.get("reason") or ""),
+                    "analysis_mode": str(job.get("analysis_mode") or ""),
+                    "enqueued_at": str(job.get("enqueued_at") or ""),
+                }
+            )
+
+        primary_queue = queue_entries[0] if queue_entries else {}
+        queue_job_id = int(primary_queue.get("job_id", 0))
         print(
-            f"[analysis-enqueue][{resolved_case_id}] job_id={queue_job_id} "
-            f"created={created} reason={reason or 'queued'} "
-            f"files={len(resolved_filenames)} queue_position={queue_position} "
-            f"face_people={bool(analysis_face_people)} vehicles={bool(analysis_vehicles)} "
-            f"frame_interval={frame_interval_seconds} batch_size={batch_size} force={force}"
+            f"[analysis-enqueue][{resolved_case_id}] jobs={len(queue_entries)} "
+            f"primary_job_id={queue_job_id} started_any={started_any} "
+            f"modes={','.join([str(item.get('analysis_mode') or '') for item in queue_entries if item.get('analysis_mode')])} "
+            f"files={len(resolved_filenames)} frame_interval={frame_interval_seconds} "
+            f"batch_size={batch_size} force={force}"
         )
 
         return {
-            "started": created,
+            "started": bool(started_any),
             "case_id": resolved_case_id,
             "filenames": resolved_filenames,
-            "queue": {
-                "job_id": queue_job_id,
-                "job_kind": queue_job_kind,
-                "priority": queue_priority,
-                "status": str(queued_job.get("status") or "queued"),
-                "position_ahead": queue_position,
-                "created": created,
-                "reason": reason,
-            },
+            "queue": primary_queue,
+            "queue_jobs": queue_entries,
             "analysis": {
                 "face_people": bool(analysis_face_people),
                 "vehicles": bool(analysis_vehicles),
+                "face_identity": bool(effective_face_identity),
             },
             "effective_analysis": {
-                "face_people": effective_face_people,
-                "vehicles": effective_vehicles,
+                "face_people": bool(analysis_face_people),
+                "vehicles": bool(analysis_vehicles),
+                "face_identity": bool(effective_face_identity),
             },
             "message": (
                 "Background analysis queued."
-                if created
+                if started_any
                 else (
-                    f"Background analysis queue updated with {appended_count} additional video(s)."
-                    if reason == "appended_case_active_job" and appended_count > 0
-                    else (
-                        f"Background analysis already queued/running for this case (job #{queue_job_id})."
-                        if queue_job_id > 0
-                        else "Background analysis already queued/running for this case."
-                    )
+                    f"Background analysis already queued/running for this case (job #{queue_job_id})."
+                    if queue_job_id > 0
+                    else "Background analysis already queued/running for this case."
                 )
             ),
-            "appended_count": appended_count,
-            "appended_filenames": appended_filenames,
+            "queued_jobs_count": len(queue_entries),
             "locked_count": len(locked_filenames),
             "locked_filenames": locked_filenames,
         }
@@ -3528,6 +3789,7 @@ class MediaService:
         self,
         case_id: str | None,
         category: str | None = None,
+        job_id: int | None = None,
     ) -> dict:
         selected_category = self._normalize_analysis_status_category(category)
         selected_case_id = ""
@@ -3546,45 +3808,96 @@ class MediaService:
         payload = self._default_analysis_status_payload(case_id=selected_case_id)
 
         queue_store = getattr(self.app.state, "index_queue_store", None)
-        latest_job = None
+        selected_job = None
         if queue_store is not None:
+            candidate_jobs: list[dict] = []
+            seen_job_ids: set[int] = set()
+
+            def _push_candidate(raw_job: Any) -> None:
+                if not isinstance(raw_job, dict):
+                    return
+                try:
+                    candidate_job_id = int(raw_job.get("job_id", 0))
+                except (TypeError, ValueError):
+                    candidate_job_id = 0
+                if candidate_job_id > 0 and candidate_job_id in seen_job_ids:
+                    return
+                if candidate_job_id > 0:
+                    seen_job_ids.add(candidate_job_id)
+                candidate_jobs.append(raw_job)
+
+            target_job_id = max(0, int(job_id or 0))
+            if target_job_id > 0 and hasattr(queue_store, "get_job"):
+                try:
+                    explicit_job = await asyncio.to_thread(queue_store.get_job, target_job_id)
+                except Exception:
+                    explicit_job = None
+                if (
+                    isinstance(explicit_job, dict)
+                    and str(explicit_job.get("case_id") or "").strip() == selected_case_id
+                    and str(explicit_job.get("job_kind") or "").strip().lower() == self.QUEUE_KIND_ANALYSIS
+                ):
+                    _push_candidate(explicit_job)
+
             try:
-                if hasattr(queue_store, "get_case_latest"):
-                    latest_job = await asyncio.to_thread(
-                        queue_store.get_case_latest,
-                        selected_case_id,
-                        job_kind=self.QUEUE_KIND_ANALYSIS,
-                    )
-                else:
-                    latest_job = await asyncio.to_thread(
+                _push_candidate(
+                    await asyncio.to_thread(
                         queue_store.get_case_active,
                         selected_case_id,
                         job_kind=self.QUEUE_KIND_ANALYSIS,
                     )
+                )
+            except Exception as exc:
+                print(f"[analysis-queue][{selected_case_id}] active_lookup_failed error={exc}")
+            try:
+                if hasattr(queue_store, "get_case_latest"):
+                    _push_candidate(
+                        await asyncio.to_thread(
+                            queue_store.get_case_latest,
+                            selected_case_id,
+                            job_kind=self.QUEUE_KIND_ANALYSIS,
+                        )
+                    )
             except Exception as exc:
                 print(f"[analysis-queue][{selected_case_id}] status_lookup_failed error={exc}")
-                latest_job = None
+            if candidate_jobs:
+                if selected_category:
+                    for candidate in candidate_jobs:
+                        if self._queue_job_matches_analysis_category(
+                            job=candidate,
+                            category=selected_category,
+                        ):
+                            selected_job = candidate
+                            break
+                if not isinstance(selected_job, dict):
+                    selected_job = candidate_jobs[0]
 
-        if not isinstance(latest_job, dict):
+        if not isinstance(selected_job, dict):
             return payload
 
-        queue_status = str(latest_job.get("status") or "").strip().lower()
-        queue_payload = latest_job.get("payload") if isinstance(latest_job.get("payload"), dict) else {}
+        queue_status = str(selected_job.get("status") or "").strip().lower()
+        queue_payload = selected_job.get("payload") if isinstance(selected_job.get("payload"), dict) else {}
         all_filenames = self._unique_filenames(queue_payload.get("filenames") or [])
         metadata = queue_payload.get("metadata") if isinstance(queue_payload.get("metadata"), dict) else {}
         analysis_face_people = bool(metadata.get("analysis_face_people", False))
         analysis_vehicles = bool(metadata.get("analysis_vehicles", False))
+        analysis_face_identity = bool(metadata.get("analysis_face_identity", False))
         face_people_filenames = self._unique_filenames(
             metadata.get("analysis_face_people_filenames") or [],
         )
         vehicle_filenames = self._unique_filenames(
             metadata.get("analysis_vehicles_filenames") or [],
         )
+        face_identity_filenames = self._unique_filenames(
+            metadata.get("analysis_face_identity_filenames") or [],
+        )
 
         filenames = list(all_filenames)
         if selected_category == self.ANALYSIS_STATUS_CATEGORY_FACE_PEOPLE:
             if face_people_filenames:
                 filenames = face_people_filenames
+            elif face_identity_filenames and analysis_face_identity:
+                filenames = face_identity_filenames
             elif (
                 analysis_face_people
                 and (
@@ -3593,6 +3906,9 @@ class MediaService:
                 )
             ):
                 # Backward compatibility: old jobs may not have per-category filename metadata.
+                filenames = list(all_filenames)
+            elif analysis_face_identity and not analysis_vehicles:
+                # Face-identity-only job still belongs to Face & People lane.
                 filenames = list(all_filenames)
             else:
                 filenames = []
@@ -3617,9 +3933,11 @@ class MediaService:
             payload["analysis"] = {
                 "face_people": bool(analysis_face_people),
                 "vehicles": bool(analysis_vehicles),
+                "face_identity": bool(analysis_face_identity),
             }
             payload["analysis_face_people_filenames"] = self._unique_filenames(face_people_filenames)
             payload["analysis_vehicles_filenames"] = self._unique_filenames(vehicle_filenames)
+            payload["analysis_face_identity_filenames"] = self._unique_filenames(face_identity_filenames)
             payload["message"] = (
                 "No Face & People analysis job found for this case."
                 if selected_category == self.ANALYSIS_STATUS_CATEGORY_FACE_PEOPLE
@@ -3627,7 +3945,7 @@ class MediaService:
             )
             return payload
 
-        queue_error = str(latest_job.get("error") or "").strip()
+        queue_error = str(selected_job.get("error") or "").strip()
 
         snapshots = await self._pipeline_list_case_snapshots(case_id=selected_case_id)
         snapshots_by_filename: dict[str, dict] = {}
@@ -3660,26 +3978,26 @@ class MediaService:
         )
 
         try:
-            queue_priority = max(1, int(latest_job.get("priority", self.QUEUE_PRIORITY_ANALYSIS)))
+            queue_priority = max(1, int(selected_job.get("priority", self.QUEUE_PRIORITY_ANALYSIS)))
         except (TypeError, ValueError):
             queue_priority = int(self.QUEUE_PRIORITY_ANALYSIS)
 
-        queue_position = max(0, int(latest_job.get("queue_position", 0))) if queue_status == "queued" else 0
+        queue_position = max(0, int(selected_job.get("queue_position", 0))) if queue_status == "queued" else 0
         progress_completed = max(0, int(progress.get("completed", 0)))
         progress_total = max(0, int(progress.get("total", 0)))
         progress_percent = float(progress.get("percent", 0.0))
 
         payload["status"] = final_status
         payload["queue"] = {
-            "job_id": int(latest_job.get("job_id", 0)),
-            "job_kind": str(latest_job.get("job_kind") or self.QUEUE_KIND_ANALYSIS),
+            "job_id": int(selected_job.get("job_id", 0)),
+            "job_kind": str(selected_job.get("job_kind") or self.QUEUE_KIND_ANALYSIS),
             "priority": queue_priority,
             "status": queue_status or "idle",
             "position_ahead": queue_position,
-            "attempt_count": int(latest_job.get("attempt_count", 0)),
-            "enqueued_at": str(latest_job.get("enqueued_at") or ""),
-            "started_at": str(latest_job.get("started_at") or ""),
-            "finished_at": str(latest_job.get("finished_at") or ""),
+            "attempt_count": int(selected_job.get("attempt_count", 0)),
+            "enqueued_at": str(selected_job.get("enqueued_at") or ""),
+            "started_at": str(selected_job.get("started_at") or ""),
+            "finished_at": str(selected_job.get("finished_at") or ""),
         }
         payload["progress"] = {
             "completed": progress_completed,
@@ -3695,9 +4013,11 @@ class MediaService:
         )
         payload["analysis_face_people_filenames"] = self._unique_filenames(face_people_filenames)
         payload["analysis_vehicles_filenames"] = self._unique_filenames(vehicle_filenames)
+        payload["analysis_face_identity_filenames"] = self._unique_filenames(face_identity_filenames)
         payload["analysis"] = {
             "face_people": analysis_face_people,
             "vehicles": analysis_vehicles,
+            "face_identity": analysis_face_identity,
         }
         payload["message"] = self._analysis_status_message(
             status=final_status,

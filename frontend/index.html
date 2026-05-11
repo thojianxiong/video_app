@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Local Video Semantic Search</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260508n" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260510b" />
   </head>
   <body>
     <main class="app-shell repository-mode">
@@ -116,8 +116,11 @@
             <p class="analysis-note">Live view of all queued/running background tasks across the app.</p>
             <button id="reportQueueRefreshBtn" type="button" class="ghost">Refresh</button>
           </div>
+          <p id="reportQueueBlocker" class="analysis-note" hidden></p>
           <p id="reportQueueStatus" class="status">Loading queue status...</p>
           <div id="reportQueueList" class="report-queue-list"></div>
+          <h3 class="queue-section-title">Completed / Recent</h3>
+          <div id="reportQueueCompletedList" class="report-queue-list report-queue-list-completed"></div>
         </section>
 
         <section id="tabTriage" class="tab-pane active">
@@ -243,12 +246,35 @@
         </section>
 
         <section id="tabFacePeople" class="tab-pane">
+          <section class="panel face-identity-panel">
+            <h2>FACE-02 Identity (ArcFace)</h2>
+            <p class="analysis-note">
+              FACE-02 builds identity embeddings on detected faces to improve suspect-photo matching precision.
+            </p>
+            <p id="faceIdentityToggleState" class="face-identity-toggle-state">Current state: off</p>
+            <div class="face-identity-controls">
+              <label class="analysis-toggle" for="faceIdentityEnabledToggle">
+                <input id="faceIdentityEnabledToggle" type="checkbox" />
+                Enable FACE-02 during Face &amp; People analysis
+              </label>
+              <button id="saveFaceIdentitySettingsBtn" type="button" class="ghost">
+                Save FACE-02 Setting
+              </button>
+            </div>
+            <p id="faceIdentitySettingsMeta" class="status"></p>
+          </section>
+
           <section class="panel analysis-select-panel">
             <h2>Run Face &amp; People Analysis</h2>
             <p class="analysis-note">Select ingested videos, then run analysis.</p>
             <div id="facePeopleVideoSelectList" class="analysis-video-list"></div>
             <div class="analysis-select-actions">
+              <label class="analysis-select-all">
+                <input id="facePeopleAnalysisSelectAll" type="checkbox" />
+                Select All
+              </label>
               <button id="runFacePeopleSelectedBtn" type="button" class="ghost">Run Face &amp; People For Selected</button>
+              <span id="facePeopleAnalysisSelectionMeta" class="analysis-select-meta">0 selected</span>
             </div>
             <p id="analysisStatus" class="status"></p>
             <div class="queue-summary-row">
@@ -315,7 +341,12 @@
             <p class="analysis-note">Select ingested videos, then run analysis.</p>
             <div id="vehicleVideoSelectList" class="analysis-video-list"></div>
             <div class="analysis-select-actions">
+              <label class="analysis-select-all">
+                <input id="vehicleAnalysisSelectAll" type="checkbox" />
+                Select All
+              </label>
               <button id="runVehiclesSelectedBtn" type="button" class="ghost">Run Vehicle Analysis For Selected</button>
+              <span id="vehicleAnalysisSelectionMeta" class="analysis-select-meta">0 selected</span>
             </div>
             <p id="vehicleStatus" class="status"></p>
             <div class="queue-summary-row">
@@ -370,6 +401,8 @@
         </div>
         <p id="queueTaskPopupMeta" class="player-meta">Task details.</p>
         <div class="queue-task-actions">
+          <button id="queueTaskPopupRunBtn" type="button" class="ghost" hidden>Run Now</button>
+          <button id="queueTaskPopupStopBtn" type="button" class="danger" hidden>Stop Job</button>
           <button id="queueTaskPopupDeleteBtn" type="button" class="danger ghost" hidden>Delete Queue Item</button>
         </div>
         <section id="queueTaskPopupRecovery" class="queue-task-recovery" hidden>
@@ -393,6 +426,6 @@
         </section>
       </div>
     </div>
-    <script src="/static/script.js?v=20260509a"></script>
+    <script src="/static/script.js?v=20260510b"></script>
   </body>
 </html>

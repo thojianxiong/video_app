@@ -276,6 +276,7 @@ class IndexQueueStore:
         job_kind: str = DEFAULT_JOB_KIND,
         priority: int = DEFAULT_PRIORITY,
         metadata: dict[str, Any] | None = None,
+        append_to_case_queued: bool = True,
     ) -> dict[str, Any]:
         payload = self._build_payload(
             case_id=case_id,
@@ -310,134 +311,143 @@ class IndexQueueStore:
                 job["queue_position"] = self.queue_position(job["job_id"], _conn=conn)
                 return job
 
-            # Prefer appending into an already queued job for the same case/kind.
-            # We intentionally do not append into a running job because the worker
-            # may be processing one file at a time (interleaving mode).
-            case_active = conn.execute(
-                """
-                SELECT *
-                FROM index_job_queue
-                WHERE case_id = ?
-                  AND job_kind = ?
-                  AND status = 'queued'
-                ORDER BY priority ASC, id ASC
-                LIMIT 1
-                """,
-                (payload["case_id"], payload["job_kind"]),
-            ).fetchone()
-            if case_active is not None:
-                active_job = self._row_to_job(case_active)
-                active_payload = active_job.get("payload") if isinstance(active_job.get("payload"), dict) else {}
-                try:
-                    existing_files = self._normalize_filenames(active_payload.get("filenames") or [])
-                except ValueError:
-                    existing_files = []
-                incoming_files = self._normalize_filenames(payload.get("filenames") or [])
-                merged_files, appended_files = self._merge_unique_filenames(existing_files, incoming_files)
-
-                if not appended_files:
-                    active_job["created"] = False
-                    active_job["reason"] = "case_already_has_active_job"
-                    active_job["appended_count"] = 0
-                    active_job["appended_filenames"] = []
-                    active_job["queue_position"] = self.queue_position(active_job["job_id"], _conn=conn)
-                    return active_job
-
-                merged_payload = {
-                    "case_id": payload["case_id"],
-                    "job_kind": payload["job_kind"],
-                    "filenames": merged_files,
-                    "frame_interval_seconds": float(
-                        active_payload.get("frame_interval_seconds", payload["frame_interval_seconds"])
-                    ),
-                    "batch_size": int(active_payload.get("batch_size", payload["batch_size"])),
-                    "force": bool(active_payload.get("force", payload["force"])),
-                    "metadata": {},
-                }
-                active_metadata = (
-                    active_payload.get("metadata")
-                    if isinstance(active_payload.get("metadata"), dict)
-                    else {}
-                )
-                incoming_metadata = (
-                    payload.get("metadata")
-                    if isinstance(payload.get("metadata"), dict)
-                    else {}
-                )
-                merged_metadata = {**active_metadata, **incoming_metadata}
-                if (
-                    "analysis_face_people" in active_metadata
-                    or "analysis_face_people" in incoming_metadata
-                ):
-                    merged_metadata["analysis_face_people"] = bool(
-                        active_metadata.get("analysis_face_people", False)
-                    ) or bool(incoming_metadata.get("analysis_face_people", False))
-                if (
-                    "analysis_vehicles" in active_metadata
-                    or "analysis_vehicles" in incoming_metadata
-                ):
-                    merged_metadata["analysis_vehicles"] = bool(
-                        active_metadata.get("analysis_vehicles", False)
-                    ) or bool(incoming_metadata.get("analysis_vehicles", False))
-                for key in (
-                    "analysis_face_people_filenames",
-                    "analysis_vehicles_filenames",
-                ):
-                    if key not in active_metadata and key not in incoming_metadata:
-                        continue
-                    active_files_raw = active_metadata.get(key) or []
-                    incoming_files_raw = incoming_metadata.get(key) or []
-                    try:
-                        active_files = self._normalize_filenames(active_files_raw)
-                    except ValueError:
-                        active_files = []
-                    try:
-                        incoming_files = self._normalize_filenames(incoming_files_raw)
-                    except ValueError:
-                        incoming_files = []
-                    merged_files_for_key, _ = self._merge_unique_filenames(
-                        active_files,
-                        incoming_files,
-                    )
-                    if merged_files_for_key:
-                        merged_metadata[key] = merged_files_for_key
-                    else:
-                        merged_metadata.pop(key, None)
-                merged_payload["metadata"] = merged_metadata
-                merged_dedupe_key = self._dedupe_key(merged_payload)
-                conn.execute(
-                    """
-                    UPDATE index_job_queue
-                    SET payload_json = ?,
-                        dedupe_key = ?,
-                        priority = ?,
-                        updated_at = ?
-                    WHERE id = ?
-                    """,
-                    (
-                        json.dumps(merged_payload, ensure_ascii=True),
-                        merged_dedupe_key,
-                        normalized_priority,
-                        now,
-                        int(active_job["job_id"]),
-                    ),
-                )
-                row = conn.execute(
+            if append_to_case_queued:
+                # Prefer appending into an already queued job for the same case/kind.
+                # We intentionally do not append into a running job because the worker
+                # may be processing one file at a time (interleaving mode).
+                case_active = conn.execute(
                     """
                     SELECT *
                     FROM index_job_queue
-                    WHERE id = ?
+                    WHERE case_id = ?
+                      AND job_kind = ?
+                      AND status = 'queued'
+                    ORDER BY priority ASC, id ASC
+                    LIMIT 1
                     """,
-                    (int(active_job["job_id"]),),
+                    (payload["case_id"], payload["job_kind"]),
                 ).fetchone()
-                conn.commit()
-                job = self._row_to_job(row) if row is not None else active_job
-                job["created"] = False
-                job["reason"] = "appended_case_active_job"
-                job["appended_count"] = len(appended_files)
-                job["appended_filenames"] = appended_files
-                job["queue_position"] = self.queue_position(job["job_id"], _conn=conn)
-                return job
+                if case_active is not None:
+                    active_job = self._row_to_job(case_active)
+                    active_payload = active_job.get("payload") if isinstance(active_job.get("payload"), dict) else {}
+                    try:
+                        existing_files = self._normalize_filenames(active_payload.get("filenames") or [])
+                    except ValueError:
+                        existing_files = []
+                    incoming_files = self._normalize_filenames(payload.get("filenames") or [])
+                    merged_files, appended_files = self._merge_unique_filenames(existing_files, incoming_files)
+
+                    if not appended_files:
+                        active_job["created"] = False
+                        active_job["reason"] = "case_already_has_active_job"
+                        active_job["appended_count"] = 0
+                        active_job["appended_filenames"] = []
+                        active_job["queue_position"] = self.queue_position(active_job["job_id"], _conn=conn)
+                        return active_job
+
+                    merged_payload = {
+                        "case_id": payload["case_id"],
+                        "job_kind": payload["job_kind"],
+                        "filenames": merged_files,
+                        "frame_interval_seconds": float(
+                            active_payload.get("frame_interval_seconds", payload["frame_interval_seconds"])
+                        ),
+                        "batch_size": int(active_payload.get("batch_size", payload["batch_size"])),
+                        "force": bool(active_payload.get("force", payload["force"])),
+                        "metadata": {},
+                    }
+                    active_metadata = (
+                        active_payload.get("metadata")
+                        if isinstance(active_payload.get("metadata"), dict)
+                        else {}
+                    )
+                    incoming_metadata = (
+                        payload.get("metadata")
+                        if isinstance(payload.get("metadata"), dict)
+                        else {}
+                    )
+                    merged_metadata = {**active_metadata, **incoming_metadata}
+                    if (
+                        "analysis_face_people" in active_metadata
+                        or "analysis_face_people" in incoming_metadata
+                    ):
+                        merged_metadata["analysis_face_people"] = bool(
+                            active_metadata.get("analysis_face_people", False)
+                        ) or bool(incoming_metadata.get("analysis_face_people", False))
+                    if (
+                        "analysis_vehicles" in active_metadata
+                        or "analysis_vehicles" in incoming_metadata
+                    ):
+                        merged_metadata["analysis_vehicles"] = bool(
+                            active_metadata.get("analysis_vehicles", False)
+                        ) or bool(incoming_metadata.get("analysis_vehicles", False))
+                    if (
+                        "analysis_face_identity" in active_metadata
+                        or "analysis_face_identity" in incoming_metadata
+                    ):
+                        merged_metadata["analysis_face_identity"] = bool(
+                            active_metadata.get("analysis_face_identity", False)
+                        ) or bool(incoming_metadata.get("analysis_face_identity", False))
+                    for key in (
+                        "analysis_face_people_filenames",
+                        "analysis_vehicles_filenames",
+                        "analysis_face_identity_filenames",
+                    ):
+                        if key not in active_metadata and key not in incoming_metadata:
+                            continue
+                        active_files_raw = active_metadata.get(key) or []
+                        incoming_files_raw = incoming_metadata.get(key) or []
+                        try:
+                            active_files = self._normalize_filenames(active_files_raw)
+                        except ValueError:
+                            active_files = []
+                        try:
+                            incoming_files = self._normalize_filenames(incoming_files_raw)
+                        except ValueError:
+                            incoming_files = []
+                        merged_files_for_key, _ = self._merge_unique_filenames(
+                            active_files,
+                            incoming_files,
+                        )
+                        if merged_files_for_key:
+                            merged_metadata[key] = merged_files_for_key
+                        else:
+                            merged_metadata.pop(key, None)
+                    merged_payload["metadata"] = merged_metadata
+                    merged_dedupe_key = self._dedupe_key(merged_payload)
+                    conn.execute(
+                        """
+                        UPDATE index_job_queue
+                        SET payload_json = ?,
+                            dedupe_key = ?,
+                            priority = ?,
+                            updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            json.dumps(merged_payload, ensure_ascii=True),
+                            merged_dedupe_key,
+                            normalized_priority,
+                            now,
+                            int(active_job["job_id"]),
+                        ),
+                    )
+                    row = conn.execute(
+                        """
+                        SELECT *
+                        FROM index_job_queue
+                        WHERE id = ?
+                        """,
+                        (int(active_job["job_id"]),),
+                    ).fetchone()
+                    conn.commit()
+                    job = self._row_to_job(row) if row is not None else active_job
+                    job["created"] = False
+                    job["reason"] = "appended_case_active_job"
+                    job["appended_count"] = len(appended_files)
+                    job["appended_filenames"] = appended_files
+                    job["queue_position"] = self.queue_position(job["job_id"], _conn=conn)
+                    return job
 
             conn.execute(
                 """
@@ -847,6 +857,311 @@ class IndexQueueStore:
                 job["queue_position"] = self.queue_position(int(job.get("job_id", 0)), _conn=conn)
             return jobs
 
+    def list_recent_jobs(
+        self,
+        *,
+        statuses: list[str] | tuple[str, ...] | set[str] | None = None,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        safe_limit = max(1, min(5000, int(limit or 0)))
+        normalized_statuses = [
+            str(item or "").strip().lower()
+            for item in (statuses or [])
+            if str(item or "").strip()
+        ]
+        if not normalized_statuses:
+            normalized_statuses = ["completed", "failed", "cancelled", "interrupted"]
+        placeholders = ",".join(["?"] * len(normalized_statuses))
+        with self._lock, self._managed_connection() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT *
+                FROM index_job_queue
+                WHERE status IN ({placeholders})
+                ORDER BY
+                  CASE WHEN finished_at = '' THEN 1 ELSE 0 END ASC,
+                  finished_at DESC,
+                  id DESC
+                LIMIT ?
+                """,
+                (*tuple(normalized_statuses), safe_limit),
+            ).fetchall()
+            jobs = [self._row_to_job(row) for row in rows]
+            for job in jobs:
+                job["queue_position"] = 0
+            return jobs
+
+    @staticmethod
+    def _reorder_with_front(
+        existing: list[str],
+        front: list[str],
+    ) -> tuple[list[str], list[str], list[str]]:
+        normalized_existing = [
+            str(item or "").strip()
+            for item in existing
+            if str(item or "").strip()
+        ]
+        normalized_front = [
+            str(item or "").strip()
+            for item in front
+            if str(item or "").strip()
+        ]
+        if not normalized_existing:
+            return [], [], normalized_front
+        if not normalized_front:
+            return list(normalized_existing), [], []
+
+        existing_set = set(normalized_existing)
+        front_present: list[str] = []
+        front_missing: list[str] = []
+        seen_present: set[str] = set()
+        for filename in normalized_front:
+            if filename not in existing_set:
+                if filename not in front_missing:
+                    front_missing.append(filename)
+                continue
+            if filename in seen_present:
+                continue
+            seen_present.add(filename)
+            front_present.append(filename)
+
+        if not front_present:
+            return list(normalized_existing), [], front_missing
+
+        front_set = set(front_present)
+        remainder = [name for name in normalized_existing if name not in front_set]
+        return [*front_present, *remainder], front_present, front_missing
+
+    def prioritize_job(
+        self,
+        *,
+        job_id: int,
+        priority: int = 1,
+        filenames_front: list[str] | tuple[str, ...] | set[str] | None = None,
+    ) -> dict[str, Any]:
+        target_job_id = int(job_id or 0)
+        if target_job_id <= 0:
+            raise ValueError("job_id must be greater than 0")
+        normalized_priority = self._normalize_priority(priority)
+        normalized_front = self._normalize_optional_filenames(filenames_front)
+        now = self._utc_now_iso()
+
+        with self._lock, self._managed_connection() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM index_job_queue
+                WHERE id = ?
+                LIMIT 1
+                """,
+                (target_job_id,),
+            ).fetchone()
+            if row is None:
+                return {
+                    "job_id": target_job_id,
+                    "found": False,
+                    "updated": False,
+                    "status": "",
+                    "front_applied_count": 0,
+                    "front_missing_filenames": list(normalized_front),
+                    "message": "Queue job not found.",
+                }
+
+            job = self._row_to_job(row)
+            status = str(job.get("status") or "").strip().lower()
+            if status != "queued":
+                queue_position = self.queue_position(target_job_id, _conn=conn) if status == "queued" else 0
+                job["queue_position"] = queue_position
+                return {
+                    "job_id": target_job_id,
+                    "found": True,
+                    "updated": False,
+                    "status": status,
+                    "blocked_status": status,
+                    "front_applied_count": 0,
+                    "front_missing_filenames": list(normalized_front),
+                    "job": job,
+                    "message": "Only queued jobs can be moved to front.",
+                }
+
+            payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
+            payload = dict(payload)
+            existing_filenames = self._normalize_optional_filenames(payload.get("filenames"))
+            reordered_filenames, front_applied, front_missing = self._reorder_with_front(
+                existing_filenames,
+                normalized_front,
+            )
+            payload["filenames"] = reordered_filenames
+
+            metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+            if metadata:
+                metadata = dict(metadata)
+                for key in (
+                    "analysis_face_people_filenames",
+                    "analysis_vehicles_filenames",
+                    "analysis_face_identity_filenames",
+                ):
+                    if key not in metadata:
+                        continue
+                    key_existing = self._normalize_optional_filenames(metadata.get(key))
+                    key_reordered, _, _ = self._reorder_with_front(key_existing, front_applied)
+                    if key_reordered:
+                        metadata[key] = key_reordered
+                    else:
+                        metadata.pop(key, None)
+                payload["metadata"] = metadata
+
+            updated_dedupe_key = self._dedupe_key(payload)
+            conn.execute(
+                """
+                UPDATE index_job_queue
+                SET priority = ?,
+                    payload_json = ?,
+                    dedupe_key = ?,
+                    updated_at = ?
+                WHERE id = ?
+                  AND status = 'queued'
+                """,
+                (
+                    normalized_priority,
+                    json.dumps(payload, ensure_ascii=True),
+                    updated_dedupe_key,
+                    now,
+                    target_job_id,
+                ),
+            )
+            updated_count = int(conn.total_changes)
+            refreshed_row = conn.execute(
+                """
+                SELECT *
+                FROM index_job_queue
+                WHERE id = ?
+                """,
+                (target_job_id,),
+            ).fetchone()
+            conn.commit()
+            refreshed_job = self._row_to_job(refreshed_row) if refreshed_row is not None else None
+            queue_position = self.queue_position(target_job_id, _conn=conn) if refreshed_job is not None else 0
+            if isinstance(refreshed_job, dict):
+                refreshed_job["queue_position"] = queue_position
+
+            return {
+                "job_id": target_job_id,
+                "found": True,
+                "updated": updated_count > 0,
+                "status": str(refreshed_job.get("status") or status) if isinstance(refreshed_job, dict) else status,
+                "queue_position": int(queue_position),
+                "front_applied_count": len(front_applied),
+                "front_applied_filenames": front_applied,
+                "front_missing_filenames": front_missing,
+                "job": refreshed_job,
+                "message": "Queue job moved to front." if updated_count > 0 else "Queue job was not updated.",
+            }
+
+    def cancel_jobs(
+        self,
+        job_ids: list[int] | tuple[int, ...] | set[int],
+        *,
+        include_running: bool = True,
+        reason: str = "Cancelled by user request.",
+    ) -> dict[str, Any]:
+        unique_job_ids: list[int] = []
+        seen: set[int] = set()
+        for raw in job_ids:
+            try:
+                parsed = int(raw)
+            except Exception:
+                continue
+            if parsed <= 0 or parsed in seen:
+                continue
+            seen.add(parsed)
+            unique_job_ids.append(parsed)
+
+        if not unique_job_ids:
+            return {
+                "requested_count": 0,
+                "found_count": 0,
+                "cancelled_count": 0,
+                "cancelled_job_ids": [],
+                "skipped_running_count": 0,
+                "skipped_running_job_ids": [],
+                "terminal_count": 0,
+                "terminal_job_ids": [],
+                "not_found_ids": [],
+                "affected_case_ids": [],
+            }
+
+        safe_reason = str(reason or "").strip() or "Cancelled by user request."
+        now = self._utc_now_iso()
+        placeholders = ",".join(["?"] * len(unique_job_ids))
+
+        with self._lock, self._managed_connection() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT id, case_id, status
+                FROM index_job_queue
+                WHERE id IN ({placeholders})
+                """,
+                tuple(unique_job_ids),
+            ).fetchall()
+            by_id = {int(row["id"]): row for row in rows}
+            not_found_ids = [job_id for job_id in unique_job_ids if job_id not in by_id]
+
+            cancelled_job_ids: list[int] = []
+            skipped_running_job_ids: list[int] = []
+            terminal_job_ids: list[int] = []
+            affected_case_ids: set[str] = set()
+
+            for job_id in unique_job_ids:
+                row = by_id.get(job_id)
+                if row is None:
+                    continue
+                status = str(row["status"] or "").strip().lower()
+                case_id = str(row["case_id"] or "").strip()
+                if case_id:
+                    affected_case_ids.add(case_id)
+
+                if status == "queued" or (status == "running" and bool(include_running)):
+                    conn.execute(
+                        """
+                        UPDATE index_job_queue
+                        SET status = 'cancelled',
+                            error = CASE
+                                WHEN error = '' THEN ?
+                                ELSE error
+                            END,
+                            finished_at = CASE
+                                WHEN finished_at = '' THEN ?
+                                ELSE finished_at
+                            END,
+                            updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (safe_reason, now, now, int(job_id)),
+                    )
+                    cancelled_job_ids.append(job_id)
+                    continue
+
+                if status == "running":
+                    skipped_running_job_ids.append(job_id)
+                else:
+                    terminal_job_ids.append(job_id)
+
+            conn.commit()
+
+        return {
+            "requested_count": len(unique_job_ids),
+            "found_count": len(rows),
+            "cancelled_count": len(cancelled_job_ids),
+            "cancelled_job_ids": cancelled_job_ids,
+            "skipped_running_count": len(skipped_running_job_ids),
+            "skipped_running_job_ids": skipped_running_job_ids,
+            "terminal_count": len(terminal_job_ids),
+            "terminal_job_ids": terminal_job_ids,
+            "not_found_ids": not_found_ids,
+            "affected_case_ids": sorted(affected_case_ids),
+        }
+
     def remove_files_from_job(
         self,
         *,
@@ -951,6 +1266,7 @@ class IndexQueueStore:
                 for key in (
                     "analysis_face_people_filenames",
                     "analysis_vehicles_filenames",
+                    "analysis_face_identity_filenames",
                 ):
                     if key not in metadata:
                         continue
@@ -964,16 +1280,21 @@ class IndexQueueStore:
                 if job_kind == "analysis":
                     face_people_enabled = bool(metadata.get("analysis_face_people", False))
                     vehicles_enabled = bool(metadata.get("analysis_vehicles", False))
+                    face_identity_enabled = bool(metadata.get("analysis_face_identity", False))
                     face_people_key_present = "analysis_face_people_filenames" in metadata
                     vehicles_key_present = "analysis_vehicles_filenames" in metadata
+                    face_identity_key_present = "analysis_face_identity_filenames" in metadata
 
                     if face_people_key_present and not metadata.get("analysis_face_people_filenames"):
                         face_people_enabled = False
                     if vehicles_key_present and not metadata.get("analysis_vehicles_filenames"):
                         vehicles_enabled = False
+                    if face_identity_key_present and not metadata.get("analysis_face_identity_filenames"):
+                        face_identity_enabled = False
 
                     metadata["analysis_face_people"] = bool(face_people_enabled)
                     metadata["analysis_vehicles"] = bool(vehicles_enabled)
+                    metadata["analysis_face_identity"] = bool(face_identity_enabled)
 
                     effective_targets: list[str] = []
                     if face_people_enabled:
@@ -990,6 +1311,15 @@ class IndexQueueStore:
                             )
                         else:
                             effective_targets.extend(remaining_filenames)
+                    if face_identity_enabled:
+                        if face_identity_key_present:
+                            effective_targets.extend(
+                                self._normalize_optional_filenames(
+                                    metadata.get("analysis_face_identity_filenames")
+                                )
+                            )
+                        else:
+                            effective_targets.extend(remaining_filenames)
 
                     normalized_targets = self._normalize_optional_filenames(effective_targets)
                     if normalized_targets:
@@ -1000,6 +1330,7 @@ class IndexQueueStore:
                         for key in (
                             "analysis_face_people_filenames",
                             "analysis_vehicles_filenames",
+                            "analysis_face_identity_filenames",
                         ):
                             if key not in metadata:
                                 continue
