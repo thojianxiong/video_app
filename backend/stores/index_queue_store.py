@@ -290,6 +290,8 @@ class IndexQueueStore:
         normalized_priority = self._normalize_priority(priority)
         dedupe_key = self._dedupe_key(payload)
         now = self._utc_now_iso()
+        payload_metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+        incoming_submission_id = str(payload_metadata.get("submission_id") or "").strip()
 
         with self._lock, self._managed_connection() as conn:
             # Dedupe exact same queued/running job
@@ -315,7 +317,7 @@ class IndexQueueStore:
                 # Prefer appending into an already queued job for the same case/kind.
                 # We intentionally do not append into a running job because the worker
                 # may be processing one file at a time (interleaving mode).
-                case_active = conn.execute(
+                queued_candidates = conn.execute(
                     """
                     SELECT *
                     FROM index_job_queue
@@ -323,10 +325,35 @@ class IndexQueueStore:
                       AND job_kind = ?
                       AND status = 'queued'
                     ORDER BY priority ASC, id ASC
-                    LIMIT 1
+                    LIMIT 200
                     """,
                     (payload["case_id"], payload["job_kind"]),
-                ).fetchone()
+                ).fetchall()
+                case_active = None
+                for candidate in queued_candidates:
+                    candidate_job = self._row_to_job(candidate)
+                    candidate_payload = (
+                        candidate_job.get("payload")
+                        if isinstance(candidate_job.get("payload"), dict)
+                        else {}
+                    )
+                    candidate_metadata = (
+                        candidate_payload.get("metadata")
+                        if isinstance(candidate_payload.get("metadata"), dict)
+                        else {}
+                    )
+                    candidate_submission_id = str(
+                        candidate_metadata.get("submission_id") or ""
+                    ).strip()
+
+                    # Keep queued submissions isolated so one user action remains one queue item.
+                    if incoming_submission_id:
+                        if candidate_submission_id != incoming_submission_id:
+                            continue
+                    elif candidate_submission_id:
+                        continue
+                    case_active = candidate
+                    break
                 if case_active is not None:
                     active_job = self._row_to_job(case_active)
                     active_payload = active_job.get("payload") if isinstance(active_job.get("payload"), dict) else {}
@@ -839,6 +866,43 @@ class IndexQueueStore:
             conn.commit()
             return changed
 
+    def cancel_active_by_job_kind(
+        self,
+        *,
+        job_kind: str,
+        reason: str = "Cancelled by startup policy.",
+    ) -> int:
+        normalized_job_kind = self._normalize_job_kind(job_kind)
+        now = self._utc_now_iso()
+        clean_reason = str(reason or "").strip() or "Cancelled by startup policy."
+        with self._lock, self._managed_connection() as conn:
+            conn.execute(
+                """
+                UPDATE index_job_queue
+                SET status = 'cancelled',
+                    error = CASE
+                        WHEN error = '' THEN ?
+                        ELSE error
+                    END,
+                    finished_at = CASE
+                        WHEN finished_at = '' THEN ?
+                        ELSE finished_at
+                    END,
+                    updated_at = ?
+                WHERE job_kind = ?
+                  AND status IN ('queued', 'running')
+                """,
+                (
+                    clean_reason,
+                    now,
+                    now,
+                    normalized_job_kind,
+                ),
+            )
+            changed = int(conn.total_changes)
+            conn.commit()
+            return changed
+
     def list_active_jobs(self, *, limit: int = 200) -> list[dict[str, Any]]:
         safe_limit = max(1, min(5000, int(limit or 0)))
         with self._lock, self._managed_connection() as conn:
@@ -1277,10 +1341,26 @@ class IndexQueueStore:
                     else:
                         metadata.pop(key, None)
 
-                if job_kind == "analysis":
+                if job_kind in {
+                    "analysis",
+                    "analysis_face_people",
+                    "analysis_face_identity",
+                    "analysis_vehicles",
+                }:
                     face_people_enabled = bool(metadata.get("analysis_face_people", False))
                     vehicles_enabled = bool(metadata.get("analysis_vehicles", False))
                     face_identity_enabled = bool(metadata.get("analysis_face_identity", False))
+                    if job_kind == "analysis_face_people":
+                        face_people_enabled = True
+                        vehicles_enabled = False
+                    elif job_kind == "analysis_face_identity":
+                        face_people_enabled = False
+                        vehicles_enabled = False
+                        face_identity_enabled = True
+                    elif job_kind == "analysis_vehicles":
+                        face_people_enabled = False
+                        vehicles_enabled = True
+                        face_identity_enabled = False
                     face_people_key_present = "analysis_face_people_filenames" in metadata
                     vehicles_key_present = "analysis_vehicles_filenames" in metadata
                     face_identity_key_present = "analysis_face_identity_filenames" in metadata

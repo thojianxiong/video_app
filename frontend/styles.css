@@ -594,6 +594,17 @@ h1 {
   font-size: 0.9rem;
 }
 
+.analysis-split-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  align-items: start;
+}
+
+.analysis-split-panel {
+  min-width: 0;
+}
+
 .face-identity-panel h2 {
   margin: 0 0 10px;
   font-size: 1rem;
@@ -1921,6 +1932,10 @@ label {
   }
 
   .analysis-controls {
+    grid-template-columns: 1fr;
+  }
+
+  .analysis-split-grid {
     grid-template-columns: 1fr;
   }
 

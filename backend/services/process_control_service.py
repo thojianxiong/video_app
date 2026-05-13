@@ -11,6 +11,9 @@ class ProcessControlService:
     ALLOWED_QUEUE_JOB_KINDS = {
         "semantic_index",
         "analysis",
+        "analysis_face_people",
+        "analysis_face_identity",
+        "analysis_vehicles",
         "triage_timeline",
     }
 
@@ -132,6 +135,12 @@ class ProcessControlService:
         normalized = str(job_kind or "").strip().lower()
         if normalized == "semantic_index":
             return "base_index"
+        if normalized == "analysis_face_people":
+            return "analysis_face_people"
+        if normalized == "analysis_face_identity":
+            return "analysis_face_identity"
+        if normalized == "analysis_vehicles":
+            return "analysis_vehicles"
         if normalized == "analysis":
             return "analysis"
         if normalized == "triage_timeline":
@@ -370,6 +379,9 @@ class ProcessControlService:
                 for name in (metadata.get("analysis_face_identity_filenames") or [])
                 if str(name).strip()
             ]
+            submission_id = str(metadata.get("submission_id") or "").strip()
+            submission_created_at = str(metadata.get("submission_created_at") or "").strip()
+            submission_kind = str(metadata.get("submission_kind") or "").strip().lower()
             queue_case_id = str(item.get("case_id") or "")
             status = str(item.get("status") or "")
             job_kind = str(item.get("job_kind") or "")
@@ -393,6 +405,9 @@ class ProcessControlService:
                 "filenames_preview": filenames[:5],
                 "filenames": filenames,
                 "file_progress": file_progress,
+                "submission_id": submission_id,
+                "submission_created_at": submission_created_at,
+                "submission_kind": submission_kind,
                 "metadata": {
                     "analysis_face_people": bool(metadata.get("analysis_face_people", False)),
                     "analysis_vehicles": bool(metadata.get("analysis_vehicles", False)),
@@ -402,12 +417,266 @@ class ProcessControlService:
                     "analysis_face_people_filenames": face_people_filenames,
                     "analysis_vehicles_filenames": vehicles_filenames,
                     "analysis_face_identity_filenames": face_identity_filenames,
+                    "submission_id": submission_id,
+                    "submission_created_at": submission_created_at,
+                    "submission_kind": submission_kind,
                 },
                 "enqueued_at": str(item.get("enqueued_at") or ""),
                 "started_at": str(item.get("started_at") or ""),
                 "finished_at": str(item.get("finished_at") or ""),
                 "updated_at": str(item.get("updated_at") or ""),
             }
+
+        def _collapse_completed_by_submission(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            def _merge_unique(left: list[str], right: list[str]) -> list[str]:
+                merged: list[str] = []
+                seen: set[str] = set()
+                for value in [*left, *right]:
+                    safe = str(value or "").strip()
+                    if not safe or safe in seen:
+                        continue
+                    seen.add(safe)
+                    merged.append(safe)
+                return merged
+
+            def _pick_earliest(left: str, right: str) -> str:
+                safe_left = str(left or "").strip()
+                safe_right = str(right or "").strip()
+                if not safe_left:
+                    return safe_right
+                if not safe_right:
+                    return safe_left
+                return safe_left if safe_left <= safe_right else safe_right
+
+            def _pick_latest(left: str, right: str) -> str:
+                safe_left = str(left or "").strip()
+                safe_right = str(right or "").strip()
+                if not safe_left:
+                    return safe_right
+                if not safe_right:
+                    return safe_left
+                return safe_left if safe_left >= safe_right else safe_right
+
+            def _merge_status(current: str, incoming: str) -> str:
+                current_norm = str(current or "").strip().lower()
+                incoming_norm = str(incoming or "").strip().lower()
+                error_statuses = {
+                    "completed_with_errors",
+                    "failed",
+                    "error",
+                    "cancelled",
+                    "canceled",
+                    "interrupted",
+                    "aborted",
+                }
+                success_statuses = {"completed", "processed", "success", "succeeded", "skipped"}
+                if current_norm in error_statuses or incoming_norm in error_statuses:
+                    return "completed_with_errors"
+                if current_norm in success_statuses and incoming_norm in success_statuses:
+                    return "completed"
+                return incoming_norm or current_norm
+
+            def _merge_file_progress(
+                existing_rows: list[dict[str, Any]],
+                incoming_rows: list[dict[str, Any]],
+                *,
+                filenames_order: list[str],
+            ) -> list[dict[str, Any]]:
+                rows_by_filename: dict[str, dict[str, Any]] = {}
+                for row in [*existing_rows, *incoming_rows]:
+                    if not isinstance(row, dict):
+                        continue
+                    filename = str(row.get("filename") or "").strip()
+                    if not filename:
+                        continue
+                    current = rows_by_filename.get(filename)
+                    if not isinstance(current, dict):
+                        rows_by_filename[filename] = dict(row)
+                        continue
+                    current_percent = self._safe_float(current.get("progress_percent", 0.0), fallback=0.0)
+                    incoming_percent = self._safe_float(row.get("progress_percent", 0.0), fallback=0.0)
+                    if incoming_percent >= current_percent:
+                        rows_by_filename[filename] = dict(row)
+                ordered_rows: list[dict[str, Any]] = []
+                for filename in filenames_order:
+                    row = rows_by_filename.pop(filename, None)
+                    if isinstance(row, dict):
+                        ordered_rows.append(row)
+                for row in rows_by_filename.values():
+                    ordered_rows.append(row)
+                return ordered_rows
+
+            grouped: dict[tuple[str, str, str], dict[str, Any]] = {}
+            ordered_refs: list[tuple[str, Any]] = []
+
+            for raw_item in items:
+                if not isinstance(raw_item, dict):
+                    continue
+                process_type = str(raw_item.get("type") or "").strip().lower()
+                metadata = raw_item.get("metadata") if isinstance(raw_item.get("metadata"), dict) else {}
+                submission_id = str(
+                    raw_item.get("submission_id")
+                    or metadata.get("submission_id")
+                    or "",
+                ).strip()
+                if process_type != "queue_job_completed" or not submission_id:
+                    ordered_refs.append(("item", raw_item))
+                    continue
+
+                case_id_value = str(raw_item.get("case_id") or "").strip()
+                job_kind_value = str(raw_item.get("job_kind") or "").strip().lower()
+                group_key = (case_id_value, job_kind_value, submission_id)
+                if group_key not in grouped:
+                    clone = dict(raw_item)
+                    clone_metadata = dict(metadata)
+                    clone["metadata"] = clone_metadata
+                    clone["submission_id"] = submission_id
+                    clone["submission_created_at"] = str(
+                        raw_item.get("submission_created_at")
+                        or clone_metadata.get("submission_created_at")
+                        or "",
+                    ).strip()
+                    clone["submission_kind"] = str(
+                        raw_item.get("submission_kind")
+                        or clone_metadata.get("submission_kind")
+                        or job_kind_value,
+                    ).strip().lower()
+                    grouped[group_key] = clone
+                    ordered_refs.append(("group", group_key))
+                    continue
+
+                aggregate = grouped[group_key]
+                aggregate_metadata = (
+                    aggregate.get("metadata")
+                    if isinstance(aggregate.get("metadata"), dict)
+                    else {}
+                )
+
+                merged_filenames = _merge_unique(
+                    self._normalize_filenames(aggregate.get("filenames")),
+                    self._normalize_filenames(raw_item.get("filenames")),
+                )
+                aggregate["filenames"] = merged_filenames
+                aggregate["filenames_count"] = len(merged_filenames)
+                aggregate["filenames_preview"] = merged_filenames[:5]
+
+                aggregate["queue_job_id"] = max(
+                    self._safe_int(aggregate.get("queue_job_id", 0)),
+                    self._safe_int(raw_item.get("queue_job_id", 0)),
+                )
+                aggregate["priority"] = min(
+                    max(0, self._safe_int(aggregate.get("priority", 0))),
+                    max(0, self._safe_int(raw_item.get("priority", 0))),
+                )
+                aggregate["queue_position"] = min(
+                    max(0, self._safe_int(aggregate.get("queue_position", 0))),
+                    max(0, self._safe_int(raw_item.get("queue_position", 0))),
+                )
+                aggregate["attempt_count"] = (
+                    max(0, self._safe_int(aggregate.get("attempt_count", 0)))
+                    + max(0, self._safe_int(raw_item.get("attempt_count", 0)))
+                )
+                aggregate["status"] = _merge_status(
+                    str(aggregate.get("status") or ""),
+                    str(raw_item.get("status") or ""),
+                )
+                aggregate["enqueued_at"] = _pick_earliest(
+                    str(aggregate.get("enqueued_at") or ""),
+                    str(raw_item.get("enqueued_at") or ""),
+                )
+                aggregate["started_at"] = _pick_earliest(
+                    str(aggregate.get("started_at") or ""),
+                    str(raw_item.get("started_at") or ""),
+                )
+                aggregate["finished_at"] = _pick_latest(
+                    str(aggregate.get("finished_at") or ""),
+                    str(raw_item.get("finished_at") or ""),
+                )
+                aggregate["updated_at"] = _pick_latest(
+                    str(aggregate.get("updated_at") or ""),
+                    str(raw_item.get("updated_at") or ""),
+                )
+
+                incoming_metadata = (
+                    raw_item.get("metadata")
+                    if isinstance(raw_item.get("metadata"), dict)
+                    else {}
+                )
+                aggregate_metadata["analysis_face_people"] = bool(
+                    aggregate_metadata.get("analysis_face_people", False)
+                ) or bool(incoming_metadata.get("analysis_face_people", False))
+                aggregate_metadata["analysis_vehicles"] = bool(
+                    aggregate_metadata.get("analysis_vehicles", False)
+                ) or bool(incoming_metadata.get("analysis_vehicles", False))
+                aggregate_metadata["analysis_face_identity"] = bool(
+                    aggregate_metadata.get("analysis_face_identity", False)
+                ) or bool(incoming_metadata.get("analysis_face_identity", False))
+                aggregate_metadata["analysis_only"] = bool(
+                    aggregate_metadata.get("analysis_only", False)
+                ) or bool(incoming_metadata.get("analysis_only", False))
+                if not str(aggregate_metadata.get("analysis_mode") or "").strip():
+                    aggregate_metadata["analysis_mode"] = str(incoming_metadata.get("analysis_mode") or "")
+
+                for key in (
+                    "analysis_face_people_filenames",
+                    "analysis_vehicles_filenames",
+                    "analysis_face_identity_filenames",
+                ):
+                    aggregate_metadata[key] = _merge_unique(
+                        self._normalize_filenames(aggregate_metadata.get(key)),
+                        self._normalize_filenames(incoming_metadata.get(key)),
+                    )
+
+                if not str(aggregate.get("submission_created_at") or "").strip():
+                    aggregate["submission_created_at"] = str(
+                        raw_item.get("submission_created_at")
+                        or incoming_metadata.get("submission_created_at")
+                        or "",
+                    ).strip()
+                if not str(aggregate.get("submission_kind") or "").strip():
+                    aggregate["submission_kind"] = str(
+                        raw_item.get("submission_kind")
+                        or incoming_metadata.get("submission_kind")
+                        or aggregate.get("job_kind")
+                        or "",
+                    ).strip().lower()
+                aggregate_metadata["submission_id"] = submission_id
+                aggregate_metadata["submission_created_at"] = str(
+                    aggregate.get("submission_created_at") or ""
+                ).strip()
+                aggregate_metadata["submission_kind"] = str(
+                    aggregate.get("submission_kind") or ""
+                ).strip().lower()
+                aggregate["metadata"] = aggregate_metadata
+
+                existing_progress = (
+                    aggregate.get("file_progress")
+                    if isinstance(aggregate.get("file_progress"), list)
+                    else []
+                )
+                incoming_progress = (
+                    raw_item.get("file_progress")
+                    if isinstance(raw_item.get("file_progress"), list)
+                    else []
+                )
+                aggregate["file_progress"] = _merge_file_progress(
+                    [row for row in existing_progress if isinstance(row, dict)],
+                    [row for row in incoming_progress if isinstance(row, dict)],
+                    filenames_order=merged_filenames,
+                )
+
+            collapsed: list[dict[str, Any]] = []
+            for ref_kind, ref_value in ordered_refs:
+                if ref_kind == "item":
+                    if isinstance(ref_value, dict):
+                        collapsed.append(ref_value)
+                    continue
+                if ref_kind != "group":
+                    continue
+                grouped_item = grouped.get(ref_value)
+                if isinstance(grouped_item, dict):
+                    collapsed.append(grouped_item)
+            return collapsed
 
         if queue_store is not None and hasattr(queue_store, "list_active_jobs"):
             try:
@@ -445,6 +714,7 @@ class ProcessControlService:
         else:
             processes = list(processes_all)
             completed_processes = list(completed_processes_all)
+        completed_processes = _collapse_completed_by_submission(completed_processes)
 
         blocked_by_other_case = False
         blocking_case_id = ""
@@ -473,6 +743,9 @@ class ProcessControlService:
                     blocking_kind = "semantic_index"
                 blocking_label = {
                     "semantic_index": "Semantic Index",
+                    "analysis_face_people": "Face & People Analysis",
+                    "analysis_face_identity": "Face Identity Top-up",
+                    "analysis_vehicles": "Vehicle Analysis",
                     "analysis": "Analysis",
                     "triage_timeline": "Triage Timeline",
                 }.get(blocking_kind, "background task")

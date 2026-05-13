@@ -114,6 +114,35 @@ class InsightsService:
         bottom = max(top + 1, min(height, int(y2)))
         return image.crop((left, top, right, bottom))
 
+    @staticmethod
+    def _normalize_requested_filenames(filenames: list[str] | None) -> set[str] | None:
+        if filenames is None:
+            return None
+        normalized: set[str] = set()
+        for item in filenames:
+            safe_name = Path(str(item or "")).name.strip()
+            if safe_name:
+                normalized.add(safe_name)
+        return normalized
+
+    @staticmethod
+    def _filter_items_by_requested_filenames(
+        items: list[dict[str, Any]],
+        requested_filenames: set[str] | None,
+    ) -> list[dict[str, Any]]:
+        if requested_filenames is None:
+            return list(items)
+        if not requested_filenames:
+            return []
+        filtered: list[dict[str, Any]] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            safe_name = Path(str(item.get("video_filename") or "")).name.strip()
+            if safe_name and safe_name in requested_filenames:
+                filtered.append(item)
+        return filtered
+
     async def suspect_photo_search(
         self,
         *,
@@ -122,6 +151,7 @@ class InsightsService:
         mode: str,
         top_k: int,
         min_score: float | None,
+        video_filenames: list[str] | None,
     ) -> dict:
         try:
             selected_case_id = await asyncio.to_thread(
@@ -141,6 +171,7 @@ class InsightsService:
             requested_mode = self._normalize_suspect_mode(mode)
             safe_top_k = max(1, min(500, int(top_k)))
             safe_min_score = None if min_score is None else float(min_score)
+            requested_filenames = self._normalize_requested_filenames(video_filenames)
         except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc))
 
@@ -283,6 +314,10 @@ class InsightsService:
                 if safe_min_score is not None and score < safe_min_score:
                     continue
                 source_items.append(self.hydrate_crop_item(case_paths, item))
+        source_items = self._filter_items_by_requested_filenames(
+            source_items,
+            requested_filenames,
+        )
         for hydrated in source_items:
             video_filename = str(hydrated.get("video_filename") or "").strip()
             timestamp_seconds = float(hydrated.get("timestamp_seconds", 0.0))
@@ -362,6 +397,7 @@ class InsightsService:
         query: str,
         top_k: int,
         limit: int,
+        filenames: list[str] | None,
     ) -> dict:
         try:
             selected_case_id = await asyncio.to_thread(
@@ -379,6 +415,7 @@ class InsightsService:
 
         clean_query = query.strip()
         try:
+            requested_filenames = self._normalize_requested_filenames(filenames)
             if clean_query:
                 query_embedding = await asyncio.to_thread(
                     self.app.state.embedder.encode_text,
@@ -396,6 +433,10 @@ class InsightsService:
                     category=category,
                     limit=limit,
                 )
+            raw_items = self._filter_items_by_requested_filenames(
+                raw_items,
+                requested_filenames,
+            )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
         except Exception as exc:
@@ -443,10 +484,15 @@ class InsightsService:
                 case_id=selected_case_id,
                 filename=filename,
                 bucket_seconds=bucket_seconds,
+                allow_stale=True,
             )
             cache_status = str(cached_payload.get("cache_status") or "").strip().lower()
             if cache_status == "hit" or bool(cached_payload.get("cached", False)):
                 return cached_payload
+            has_stale_timeline = (
+                cache_status == "stale"
+                or bool(cached_payload.get("stale", False))
+            )
 
             queue_store = getattr(self.app.state, "index_queue_store", None)
             if queue_store is None:
@@ -489,7 +535,7 @@ class InsightsService:
             created = bool(queued_job.get("created", False))
             reason = str(queued_job.get("reason") or "")
 
-            return {
+            queue_payload = {
                 "case_id": selected_case_id,
                 "filename": safe_filename,
                 "bucket_seconds": float(bucket_seconds),
@@ -505,12 +551,24 @@ class InsightsService:
                     "created": created,
                     "reason": reason,
                 },
-                "message": (
-                    "Triage timeline queued."
-                    if created
-                    else "Triage timeline already queued/running."
-                ),
             }
+            if has_stale_timeline:
+                queue_payload["stale"] = True
+                queue_payload["message"] = (
+                    "Showing last saved triage timeline while refresh is queued."
+                    if created
+                    else "Showing last saved triage timeline while existing queued/running job refreshes."
+                )
+                merged_payload = dict(cached_payload)
+                merged_payload.update(queue_payload)
+                return merged_payload
+
+            queue_payload["message"] = (
+                "Triage timeline queued."
+                if created
+                else "Triage timeline already queued/running."
+            )
+            return queue_payload
         except FileNotFoundError:
             raise HTTPException(status_code=404, detail=f"Video not found: {filename}")
         except KeyError:
@@ -537,6 +595,7 @@ class InsightsService:
                 case_id=selected_case_id,
                 filename=filename,
                 bucket_seconds=bucket_seconds,
+                allow_stale=False,
             )
         except FileNotFoundError:
             raise HTTPException(status_code=404, detail=f"Video not found: {filename}")
@@ -556,6 +615,7 @@ class InsightsService:
         min_score: float | None,
         diversity_seconds: float | None,
         oversample_factor: int | None,
+        filenames: list[str] | None,
     ) -> dict:
         clean_query = query.strip()
         if not clean_query:
@@ -715,6 +775,8 @@ class InsightsService:
             fused.sort(key=lambda item: float(item.get("similarity_score", -1.0)), reverse=True)
             return fused
 
+        requested_filenames = self._normalize_requested_filenames(filenames)
+
         def _run_search(resolved_case_id: str) -> tuple[str, list[dict], dict[str, Any]]:
             case_paths, vector_store = self.get_vector_store_for_case(resolved_case_id)
             _, temporal_store = self.get_temporal_store_for_case(resolved_case_id)
@@ -725,8 +787,14 @@ class InsightsService:
             frame_weight, temporal_weight, mode = _resolve_intent_weights(intent, intent_margin)
             frame_results = vector_store.search(query_embedding, top_k=search_top_k)
             temporal_results = temporal_store.search(query_embedding, top_k=search_top_k)
-            fallback_used = False
-
+            frame_results = self._filter_items_by_requested_filenames(
+                frame_results,
+                requested_filenames,
+            )
+            temporal_results = self._filter_items_by_requested_filenames(
+                temporal_results,
+                requested_filenames,
+            )
             fused_candidates = _fuse_dual_results(
                 frame_results,
                 temporal_results,
@@ -734,37 +802,54 @@ class InsightsService:
                 temporal_weight=temporal_weight,
             )
 
-            post_filtered = self.apply_semantic_post_filters(
-                fused_candidates,
-                top_k=resolved_top_k,
-                min_score=resolved_min_score,
-                diversity_seconds=resolved_diversity,
-                near_duplicate_seconds=resolved_near_duplicate,
-                per_video_cap=resolved_per_video_cap,
-                return_stats=True,
-            )
-            if isinstance(post_filtered, tuple):
-                filtered_results, filter_stats = post_filtered
-            else:
-                filtered_results = post_filtered
-                filter_stats = {}
+            relaxation_step = max(0.01, self.float_from_env("SEMANTIC_RELAX_STEP", 0.05))
+            relaxation_floor = max(-1.0, min(1.0, self.float_from_env("SEMANTIC_RELAX_FLOOR", 0.08)))
+            configured_relax_target = max(1, self.int_from_env("SEMANTIC_RELAX_TARGET_RESULTS", 20))
+            relaxation_target = max(1, min(int(resolved_top_k), configured_relax_target))
+            effective_min_score = float(resolved_min_score)
+            relaxation_steps: list[dict[str, Any]] = []
 
-            if not filtered_results and fused_candidates:
-                fallback_used = True
+            def _filter_candidates(min_score_value: float) -> tuple[list[dict], dict[str, Any]]:
                 post_filtered = self.apply_semantic_post_filters(
                     fused_candidates,
                     top_k=resolved_top_k,
-                    min_score=-1.0,
-                    diversity_seconds=max(0.0, resolved_diversity * 0.5),
-                    near_duplicate_seconds=max(0.0, resolved_near_duplicate * 0.6),
-                    per_video_cap=max(0, resolved_per_video_cap + 2),
+                    min_score=min_score_value,
+                    diversity_seconds=resolved_diversity,
+                    near_duplicate_seconds=resolved_near_duplicate,
+                    per_video_cap=resolved_per_video_cap,
                     return_stats=True,
                 )
                 if isinstance(post_filtered, tuple):
-                    filtered_results, filter_stats = post_filtered
-                else:
-                    filtered_results = post_filtered
-                    filter_stats = {}
+                    filtered, stats = post_filtered
+                    if isinstance(stats, dict):
+                        return filtered, stats
+                    return filtered, {}
+                return post_filtered, {}
+
+            filtered_results, filter_stats = _filter_candidates(effective_min_score)
+            initial_result_count = int(len(filtered_results))
+
+            while (
+                fused_candidates
+                and len(filtered_results) < relaxation_target
+                and effective_min_score > (relaxation_floor + 1e-9)
+            ):
+                next_min_score = max(
+                    relaxation_floor,
+                    round(float(effective_min_score) - float(relaxation_step), 4),
+                )
+                if next_min_score >= (effective_min_score - 1e-9):
+                    break
+                effective_min_score = float(next_min_score)
+                filtered_results, filter_stats = _filter_candidates(effective_min_score)
+                relaxation_steps.append(
+                    {
+                        "min_score": float(round(effective_min_score, 3)),
+                        "result_count": int(len(filtered_results)),
+                    }
+                )
+
+            fallback_used = bool(relaxation_steps)
 
             print(
                 f"[semantic][{case_paths.case_id}] query={clean_query!r} "
@@ -772,7 +857,9 @@ class InsightsService:
                 f"top_k={resolved_top_k} searched={search_top_k} "
                 f"frame_raw={len(frame_results)} temporal_raw={len(temporal_results)} "
                 f"fused={len(fused_candidates)} filtered={len(filtered_results)} "
-                f"min_score={resolved_min_score:.3f} diversity_seconds={resolved_diversity:.2f} "
+                f"requested_min_score={resolved_min_score:.3f} "
+                f"effective_min_score={effective_min_score:.3f} "
+                f"relax_steps={len(relaxation_steps)} diversity_seconds={resolved_diversity:.2f} "
                 f"near_dup={resolved_near_duplicate:.2f} per_video_cap={resolved_per_video_cap}"
             )
 
@@ -813,7 +900,13 @@ class InsightsService:
                 "fallback_used": fallback_used,
                 "frame_weight": float(frame_weight),
                 "temporal_weight": float(temporal_weight),
-                "effective_min_score": float(resolved_min_score),
+                "requested_min_score": float(resolved_min_score),
+                "effective_min_score": float(effective_min_score),
+                "relaxation_step": float(relaxation_step),
+                "relaxation_floor": float(relaxation_floor),
+                "relaxation_target_results": int(relaxation_target),
+                "initial_result_count": int(initial_result_count),
+                "relaxation_steps": relaxation_steps,
                 "effective_diversity_seconds": float(resolved_diversity),
                 "effective_near_duplicate_seconds": float(resolved_near_duplicate),
                 "effective_per_video_cap": int(resolved_per_video_cap),
@@ -865,6 +958,21 @@ class InsightsService:
                     "intent": search_meta.get("intent"),
                     "mode": search_meta.get("search_mode"),
                     "fallback_used": bool(search_meta.get("fallback_used")),
+                    "requested_min_score": float(
+                        search_meta.get("requested_min_score", resolved_min_score)
+                    ),
+                    "effective_min_score": float(
+                        search_meta.get("effective_min_score", resolved_min_score)
+                    ),
+                    "relaxation_target_results": int(
+                        search_meta.get("relaxation_target_results", 0)
+                    ),
+                    "initial_result_count": int(search_meta.get("initial_result_count", 0)),
+                    "relaxation_steps": (
+                        search_meta.get("relaxation_steps")
+                        if isinstance(search_meta.get("relaxation_steps"), list)
+                        else []
+                    ),
                     "weights": {
                         "frame": float(search_meta.get("frame_weight", 0.0)),
                         "temporal": float(search_meta.get("temporal_weight", 0.0)),

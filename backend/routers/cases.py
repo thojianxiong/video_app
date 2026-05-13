@@ -383,6 +383,18 @@ def build_cases_router(
                         f"[pipeline][{deleted['case_id']}] delete_case_failed error={exc}"
                     )
 
+            triage_timeline_store = getattr(request.app.state, "triage_timeline_store", None)
+            if triage_timeline_store is not None and hasattr(triage_timeline_store, "delete_case"):
+                try:
+                    await asyncio.to_thread(
+                        triage_timeline_store.delete_case,
+                        deleted["case_id"],
+                    )
+                except Exception as exc:
+                    print(
+                        f"[triage-cache][{deleted['case_id']}] delete_case_failed error={exc}"
+                    )
+
             try:
                 cases = await asyncio.to_thread(list_cases_sync)
             except Exception:

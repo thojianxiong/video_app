@@ -13,7 +13,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from threading import Lock
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
 import numpy as np
 import cv2
@@ -61,6 +61,7 @@ from backend.services.process_control_service import ProcessControlService
 from backend.stores.index_job_store import IndexJobStore
 from backend.stores.index_queue_store import IndexQueueStore
 from backend.stores.face_identity_store import FaceIdentityStore
+from backend.stores.triage_timeline_store import TriageTimelineStore
 from backend.stores.upload_session_store import UploadSessionStore
 from backend.stores.video_pipeline_store import VideoPipelineStore
 from backend.temporal_store import TemporalWindowStore
@@ -83,16 +84,24 @@ INDEX_JOBS_DB_PATH = CASES_DIR / "index_jobs.db"
 INDEX_QUEUE_DB_PATH = CASES_DIR / "index_queue.db"
 VIDEO_PIPELINE_DB_PATH = CASES_DIR / "video_pipeline.db"
 UPLOAD_SESSIONS_DB_PATH = CASES_DIR / "upload_sessions.db"
+TRIAGE_TIMELINE_DB_PATH = CASES_DIR / "triage_timeline.db"
 
 SEMANTIC_OBJECT = "object"
 SEMANTIC_ACTION = "action"
 SEMANTIC_SCENE = "scene"
 SEMANTIC_INTENT_OPTIONS = [SEMANTIC_OBJECT, SEMANTIC_ACTION, SEMANTIC_SCENE]
-TRIAGE_CACHE_VERSION = 2
 QUEUE_JOB_KIND_SEMANTIC_INDEX = "semantic_index"
 QUEUE_JOB_KIND_TRIAGE_TIMELINE = "triage_timeline"
-QUEUE_JOB_KIND_ANALYSIS = "analysis"
-QUEUE_WORKER_GPU_KINDS = {QUEUE_JOB_KIND_SEMANTIC_INDEX, QUEUE_JOB_KIND_ANALYSIS}
+QUEUE_JOB_KIND_ANALYSIS_LEGACY = "analysis"
+QUEUE_JOB_KIND_ANALYSIS_FACE_PEOPLE = "analysis_face_people"
+QUEUE_JOB_KIND_ANALYSIS_FACE_IDENTITY = "analysis_face_identity"
+QUEUE_JOB_KIND_ANALYSIS_VEHICLES = "analysis_vehicles"
+QUEUE_WORKER_GPU_KINDS = {
+    QUEUE_JOB_KIND_SEMANTIC_INDEX,
+    QUEUE_JOB_KIND_ANALYSIS_FACE_PEOPLE,
+    QUEUE_JOB_KIND_ANALYSIS_FACE_IDENTITY,
+    QUEUE_JOB_KIND_ANALYSIS_VEHICLES,
+}
 QUEUE_WORKER_CPU_KINDS = {QUEUE_JOB_KIND_TRIAGE_TIMELINE}
 QUEUE_PRIORITY_TRIAGE_TIMELINE = 20
 QUEUE_PRIORITY_SEMANTIC_INDEX = 50
@@ -103,6 +112,9 @@ DEFAULT_SEARCH_RESULT_LIMIT = 120
 SEARCH_MIN_RESULT_LIMIT = 10
 SEARCH_MAX_RESULT_LIMIT = 500
 DEFAULT_FACE_IDENTITY_ENABLED = False
+PIPELINE_STAGE_ANALYSIS_FACE_PEOPLE = "analysis_face_people"
+PIPELINE_STAGE_ANALYSIS_FACE_IDENTITY = "analysis_face_identity"
+PIPELINE_STAGE_ANALYSIS_VEHICLES = "analysis_vehicles"
 
 INTENT_PROMPTS = {
     SEMANTIC_OBJECT: [
@@ -188,12 +200,22 @@ async def _startup_application(application: FastAPI) -> None:
     application.state.index_queue_store = index_queue_store
     video_pipeline_store = await asyncio.to_thread(VideoPipelineStore, VIDEO_PIPELINE_DB_PATH)
     application.state.video_pipeline_store = video_pipeline_store
+    triage_timeline_store = await asyncio.to_thread(TriageTimelineStore, TRIAGE_TIMELINE_DB_PATH)
+    application.state.triage_timeline_store = triage_timeline_store
     upload_session_store = await asyncio.to_thread(UploadSessionStore, UPLOAD_SESSIONS_DB_PATH)
     application.state.upload_session_store = upload_session_store
     application.state.upload_session_chunk_lock = Lock()
 
     interrupted_jobs = await asyncio.to_thread(index_job_store.mark_incomplete_jobs_interrupted)
     recovered_queue_jobs = await asyncio.to_thread(index_queue_store.recover_running_jobs_to_queued)
+    legacy_analysis_cancelled = await asyncio.to_thread(
+        index_queue_store.cancel_active_by_job_kind,
+        job_kind=QUEUE_JOB_KIND_ANALYSIS_LEGACY,
+        reason=(
+            "Cancelled on startup: legacy 'analysis' queue job kind is no longer supported. "
+            "Resubmit using Face & People, FACE-02 top-up, or Vehicle analysis."
+        ),
+    )
     interrupted_pipeline = await asyncio.to_thread(video_pipeline_store.mark_running_as_interrupted)
     raw_snapshots = await asyncio.to_thread(index_job_store.load_all_snapshots)
     restored_jobs: dict[str, dict] = {}
@@ -226,6 +248,11 @@ async def _startup_application(application: FastAPI) -> None:
         print(f"[startup] Marked {interrupted_jobs} incomplete index job(s) as interrupted.")
     if recovered_queue_jobs > 0:
         print(f"[startup] Re-queued {recovered_queue_jobs} in-flight queue job(s) after restart.")
+    if legacy_analysis_cancelled > 0:
+        print(
+            f"[startup] Cancelled {legacy_analysis_cancelled} legacy analysis queue job(s); "
+            "resubmit using split analysis kinds."
+        )
     if interrupted_pipeline > 0:
         print(f"[startup] Marked {interrupted_pipeline} running pipeline stage(s) as interrupted.")
     if restored_jobs:
@@ -917,6 +944,13 @@ def _pipeline_store() -> VideoPipelineStore | None:
     return None
 
 
+def _triage_timeline_store() -> TriageTimelineStore | None:
+    store = getattr(app.state, "triage_timeline_store", None)
+    if isinstance(store, TriageTimelineStore):
+        return store
+    return None
+
+
 def _pipeline_update_stage_sync(
     *,
     case_id: str,
@@ -1313,14 +1347,32 @@ async def _run_analysis_queue_job_async(
     queue_store: IndexQueueStore,
     job_id: int,
     case_id: str,
+    job_kind: str,
     payload: dict[str, Any],
     filenames: list[str],
 ) -> tuple[str, str]:
+    normalized_job_kind = str(job_kind or "").strip().lower()
     metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
-    analysis_face_people = bool(metadata.get("analysis_face_people", False))
-    analysis_vehicles = bool(metadata.get("analysis_vehicles", False))
-    analysis_face_identity = bool(metadata.get("analysis_face_identity", False))
-    if not analysis_face_people and not analysis_vehicles and not analysis_face_identity:
+
+    if normalized_job_kind == QUEUE_JOB_KIND_ANALYSIS_FACE_PEOPLE:
+        analysis_face_people = True
+        analysis_vehicles = False
+        analysis_face_identity = bool(metadata.get("analysis_face_identity", False))
+        stage_name = PIPELINE_STAGE_ANALYSIS_FACE_PEOPLE
+    elif normalized_job_kind == QUEUE_JOB_KIND_ANALYSIS_VEHICLES:
+        analysis_face_people = False
+        analysis_vehicles = True
+        analysis_face_identity = False
+        stage_name = PIPELINE_STAGE_ANALYSIS_VEHICLES
+    elif normalized_job_kind == QUEUE_JOB_KIND_ANALYSIS_LEGACY:
+        analysis_face_people = bool(metadata.get("analysis_face_people", False))
+        analysis_vehicles = bool(metadata.get("analysis_vehicles", False))
+        analysis_face_identity = bool(metadata.get("analysis_face_identity", False))
+        stage_name = "analysis"
+    else:
+        return "failed", f"Unsupported analysis queue job kind: {job_kind}"
+
+    if not analysis_face_people and not analysis_vehicles:
         return "failed", "Analysis queue payload missing analysis type."
 
     try:
@@ -1338,13 +1390,6 @@ async def _run_analysis_queue_job_async(
     failed = 0
     errors: list[str] = []
 
-    def _cancel_check() -> bool:
-        if _is_case_delete_in_progress(case_id):
-            return True
-        if _is_video_delete_in_progress(case_id, filename):
-            return True
-        return _is_queue_job_cancelled_sync(queue_store, int(job_id))
-
     for filename in filenames:
         if await asyncio.to_thread(_is_queue_job_cancelled_sync, queue_store, int(job_id)):
             return "cancelled", "Cancelled by user request."
@@ -1353,22 +1398,27 @@ async def _run_analysis_queue_job_async(
             await _pipeline_update_stage(
                 case_id=case_id,
                 filename=filename,
-                stage="analysis",
+                stage=stage_name,
                 status="skipped",
                 event="background_analysis_skipped_delete_in_progress",
-                details={"source": "queue", "reason": "delete_in_progress"},
+                details={
+                    "source": "queue",
+                    "reason": "delete_in_progress",
+                    "analysis_job_kind": normalized_job_kind,
+                },
             )
             continue
 
         await _pipeline_update_stage(
             case_id=case_id,
             filename=filename,
-            stage="analysis",
+            stage=stage_name,
             status="running",
             increment_attempt=True,
             event="background_analysis_started",
             details={
                 "source": "queue",
+                "analysis_job_kind": normalized_job_kind,
                 "analysis_face_people": bool(analysis_face_people),
                 "analysis_vehicles": bool(analysis_vehicles),
                 "analysis_face_identity": bool(analysis_face_identity),
@@ -1379,6 +1429,7 @@ async def _run_analysis_queue_job_async(
                 "phase_label": _analysis_phase_label("frame_scan"),
             },
         )
+
         progress_state: dict[str, float | int] = {
             "latest_processed": 0,
             "latest_estimated": 0,
@@ -1388,6 +1439,13 @@ async def _run_analysis_queue_job_async(
             "last_emit_ts": 0.0,
             "last_emit_phase": "",
         }
+
+        def _cancel_check() -> bool:
+            if _is_case_delete_in_progress(case_id):
+                return True
+            if _is_video_delete_in_progress(case_id, filename):
+                return True
+            return _is_queue_job_cancelled_sync(queue_store, int(job_id))
 
         def _on_analysis_progress(
             processed_frames: int,
@@ -1435,11 +1493,12 @@ async def _run_analysis_queue_job_async(
                 _pipeline_update_stage_sync(
                     case_id=case_id,
                     filename=filename,
-                    stage="analysis",
+                    stage=stage_name,
                     status="running",
                     event="background_analysis_progress",
                     details={
                         "source": "queue",
+                        "analysis_job_kind": normalized_job_kind,
                         "analysis_face_people": bool(analysis_face_people),
                         "analysis_vehicles": bool(analysis_vehicles),
                         "analysis_face_identity": bool(analysis_face_identity),
@@ -1471,11 +1530,20 @@ async def _run_analysis_queue_job_async(
                 progress_callback=_on_analysis_progress,
                 cancel_check=_cancel_check,
             )
-            analysis_payload = result.get("analysis") if isinstance(result.get("analysis"), dict) else {}
+            analysis_payload = (
+                result.get("analysis")
+                if isinstance(result, dict) and isinstance(result.get("analysis"), dict)
+                else {}
+            )
             analysis_status = str(analysis_payload.get("status") or "").strip().lower()
             analysis_summary = (
                 analysis_payload.get("summary")
                 if isinstance(analysis_payload.get("summary"), dict)
+                else {}
+            )
+            face_identity_payload = (
+                analysis_payload.get("face_identity")
+                if isinstance(analysis_payload.get("face_identity"), dict)
                 else {}
             )
             processed_frames = max(
@@ -1485,11 +1553,21 @@ async def _run_analysis_queue_job_async(
                         "processed_frames",
                         progress_state.get("latest_processed", 0),
                     )
+                    or 0
                 ),
             )
             estimated_total_frames = max(
                 0,
-                int(progress_state.get("latest_estimated", processed_frames)),
+                int(
+                    analysis_summary.get(
+                        "estimated_total_frames",
+                        analysis_summary.get(
+                            "total_frames",
+                            progress_state.get("latest_estimated", processed_frames),
+                        ),
+                    )
+                    or 0
+                ),
             )
             if estimated_total_frames < processed_frames:
                 estimated_total_frames = processed_frames
@@ -1499,74 +1577,90 @@ async def _run_analysis_queue_job_async(
                     100.0,
                     max(0.0, (float(processed_frames) / float(estimated_total_frames)) * 100.0),
                 )
-            if analysis_status in {"processed", "completed", "skipped"} and processed_frames > 0:
-                progress_percent = 100.0
+
+            common_details = {
+                "source": "queue",
+                "analysis_job_kind": normalized_job_kind,
+                "analysis_status": analysis_status,
+                "analysis_face_people": bool(analysis_face_people),
+                "analysis_vehicles": bool(analysis_vehicles),
+                "analysis_face_identity": bool(analysis_face_identity),
+                "processed_frames": processed_frames,
+                "estimated_total_frames": estimated_total_frames,
+                "progress_percent": float(progress_percent),
+                "face_identity_status": str(face_identity_payload.get("status") or "").strip().lower(),
+                "face_identity_indexed": max(0, int(face_identity_payload.get("indexed", 0) or 0)),
+                "face_identity_reason": str(face_identity_payload.get("reason") or "").strip(),
+            }
+
             if analysis_status in {"processed", "completed"}:
                 completed += 1
                 await _pipeline_update_stage(
                     case_id=case_id,
                     filename=filename,
-                    stage="analysis",
+                    stage=stage_name,
                     status="completed",
                     event="background_analysis_completed",
                     details={
-                        "source": "queue",
-                        "analysis_status": analysis_status or "processed",
-                        "processed_frames": processed_frames,
-                        "estimated_total_frames": estimated_total_frames,
-                        "progress_percent": float(progress_percent),
+                        **common_details,
                         "phase": "finalizing",
                         "phase_label": _analysis_phase_label("finalizing"),
+                        "progress_percent": 100.0,
                     },
                 )
-            elif analysis_status in {"skipped", "not_requested"}:
+                continue
+
+            if analysis_status in {"skipped", "not_requested", "analysis_only"}:
                 skipped += 1
                 await _pipeline_update_stage(
                     case_id=case_id,
                     filename=filename,
-                    stage="analysis",
+                    stage=stage_name,
                     status="skipped",
                     event="background_analysis_skipped",
                     details={
-                        "source": "queue",
-                        "analysis_status": analysis_status or "skipped",
-                        "processed_frames": processed_frames,
-                        "estimated_total_frames": estimated_total_frames,
-                        "progress_percent": float(progress_percent),
+                        **common_details,
                         "phase": "finalizing",
                         "phase_label": _analysis_phase_label("finalizing"),
+                        "progress_percent": 100.0,
                     },
                 )
-            else:
-                failed += 1
-                reason = str(analysis_payload.get("reason") or "analysis unavailable")
-                errors.append(f"{filename}: {reason}")
-                await _pipeline_update_stage(
-                    case_id=case_id,
-                    filename=filename,
-                    stage="analysis",
-                    status="failed",
-                    event="background_analysis_failed",
-                    error=_truncate_error(reason),
-                    details={
-                        "source": "queue",
-                        "processed_frames": processed_frames,
-                        "estimated_total_frames": estimated_total_frames,
-                        "progress_percent": float(progress_percent),
-                        "phase": str(progress_state.get("latest_phase") or ""),
-                        "phase_label": _analysis_phase_label(str(progress_state.get("latest_phase") or "")),
-                    },
-                )
+                continue
+
+            failed += 1
+            reason = str(
+                analysis_payload.get("reason")
+                or analysis_payload.get("error")
+                or "analysis unavailable"
+            )
+            errors.append(f"{filename}: {reason}")
+            await _pipeline_update_stage(
+                case_id=case_id,
+                filename=filename,
+                stage=stage_name,
+                status="failed",
+                event="background_analysis_failed",
+                error=_truncate_error(reason),
+                details={
+                    **common_details,
+                    "phase": str(progress_state.get("latest_phase") or ""),
+                    "phase_label": _analysis_phase_label(str(progress_state.get("latest_phase") or "")),
+                },
+            )
         except _IndexCancellationRequested:
             await _pipeline_update_stage(
                 case_id=case_id,
                 filename=filename,
-                stage="analysis",
+                stage=stage_name,
                 status="interrupted",
                 event="background_analysis_cancelled",
                 error="Background analysis cancelled.",
                 details={
                     "source": "queue",
+                    "analysis_job_kind": normalized_job_kind,
+                    "analysis_face_people": bool(analysis_face_people),
+                    "analysis_vehicles": bool(analysis_vehicles),
+                    "analysis_face_identity": bool(analysis_face_identity),
                     "processed_frames": max(0, int(progress_state.get("latest_processed", 0))),
                     "estimated_total_frames": max(0, int(progress_state.get("latest_estimated", 0))),
                     "progress_percent": float(progress_state.get("latest_percent", 0.0)),
@@ -1581,12 +1675,16 @@ async def _run_analysis_queue_job_async(
             await _pipeline_update_stage(
                 case_id=case_id,
                 filename=filename,
-                stage="analysis",
+                stage=stage_name,
                 status="failed",
                 event="background_analysis_failed",
                 error=_truncate_error(str(exc)),
                 details={
                     "source": "queue",
+                    "analysis_job_kind": normalized_job_kind,
+                    "analysis_face_people": bool(analysis_face_people),
+                    "analysis_vehicles": bool(analysis_vehicles),
+                    "analysis_face_identity": bool(analysis_face_identity),
                     "processed_frames": max(0, int(progress_state.get("latest_processed", 0))),
                     "estimated_total_frames": max(0, int(progress_state.get("latest_estimated", 0))),
                     "progress_percent": float(progress_state.get("latest_percent", 0.0)),
@@ -1597,6 +1695,339 @@ async def _run_analysis_queue_job_async(
 
     if failed > 0 and completed == 0 and skipped == 0:
         return "failed", _truncate_error(errors[-1] if errors else "Background analysis failed.")
+    if failed > 0:
+        return "completed", _truncate_error(
+            f"Completed with errors ({failed}/{len(filenames)} failed)."
+        )
+    return "completed", ""
+
+
+def _media_url_to_case_path(case_id: str, media_url: str) -> Path | None:
+    safe_case_id = str(case_id or "").strip()
+    safe_url = str(media_url or "").strip()
+    if not safe_case_id or not safe_url.startswith("/media/cases/"):
+        return None
+    relative_value = unquote(safe_url[len("/media/cases/") :]).strip("/")
+    if not relative_value:
+        return None
+    relative_path = Path(relative_value)
+    if not relative_path.parts:
+        return None
+    if str(relative_path.parts[0]).strip() != safe_case_id:
+        return None
+    try:
+        resolved = (CASES_DIR / relative_path).resolve()
+        resolved.relative_to(CASES_DIR.resolve())
+    except Exception:
+        return None
+    if not resolved.exists() or not resolved.is_file():
+        return None
+    return resolved
+
+
+async def _run_face_identity_topup_queue_job_async(
+    *,
+    queue_store: IndexQueueStore,
+    job_id: int,
+    case_id: str,
+    payload: dict[str, Any],
+    filenames: list[str],
+) -> tuple[str, str]:
+    try:
+        _case_paths, vector_store = await asyncio.to_thread(_get_vector_store_for_case, case_id)
+        _, analysis_store = await asyncio.to_thread(_get_analysis_store_for_case, case_id)
+        _, face_identity_store = await asyncio.to_thread(_get_face_identity_store_for_case, case_id)
+    except Exception as exc:
+        return "failed", _truncate_error(str(exc))
+
+    face_embedder = getattr(app.state, "face_embedder", None)
+    embedder_available = bool(face_embedder is not None and bool(getattr(face_embedder, "available", False)))
+    if embedder_available:
+        face_embedder_error = ""
+    else:
+        face_embedder_error = _truncate_error(
+            str(getattr(face_embedder, "error_message", "FACE-02 engine unavailable"))
+        )
+
+    completed = 0
+    skipped = 0
+    failed = 0
+    errors: list[str] = []
+    stage_name = PIPELINE_STAGE_ANALYSIS_FACE_IDENTITY
+    analysis_summary_by_filename = await asyncio.to_thread(vector_store.analysis_summary_by_filename)
+    if not isinstance(analysis_summary_by_filename, dict):
+        analysis_summary_by_filename = {}
+
+    for filename in filenames:
+        if await asyncio.to_thread(_is_queue_job_cancelled_sync, queue_store, int(job_id)):
+            return "cancelled", "Cancelled by user request."
+        if _is_video_delete_in_progress(case_id, filename):
+            skipped += 1
+            await _pipeline_update_stage(
+                case_id=case_id,
+                filename=filename,
+                stage=stage_name,
+                status="skipped",
+                event="background_face_identity_topup_skipped_delete_in_progress",
+                details={
+                    "source": "queue",
+                    "analysis_job_kind": QUEUE_JOB_KIND_ANALYSIS_FACE_IDENTITY,
+                    "analysis_face_people": False,
+                    "analysis_vehicles": False,
+                    "analysis_face_identity": True,
+                    "reason": "delete_in_progress",
+                    "face_identity_status": "skipped",
+                },
+            )
+            continue
+
+        await _pipeline_update_stage(
+            case_id=case_id,
+            filename=filename,
+            stage=stage_name,
+            status="running",
+            increment_attempt=True,
+            event="background_face_identity_topup_started",
+            details={
+                "source": "queue",
+                "analysis_job_kind": QUEUE_JOB_KIND_ANALYSIS_FACE_IDENTITY,
+                "analysis_face_people": False,
+                "analysis_vehicles": False,
+                "analysis_face_identity": True,
+                "phase": "face_identity",
+                "phase_label": _analysis_phase_label("face_identity"),
+            },
+        )
+
+        try:
+            summary = (
+                analysis_summary_by_filename.get(filename)
+                if isinstance(analysis_summary_by_filename.get(filename), dict)
+                else {}
+            )
+            face_people_summary = (
+                summary.get("face_people")
+                if isinstance(summary.get("face_people"), dict)
+                else {}
+            )
+            face_people_ready = bool(face_people_summary.get("processed", False))
+            has_face_people_crops = await asyncio.to_thread(
+                analysis_store.has_video_entries,
+                category=AnalysisCropStore.FACE_PEOPLE,
+                video_filename=filename,
+            )
+            if not face_people_ready or not has_face_people_crops:
+                skipped += 1
+                reason = "face_people_not_ready"
+                await _pipeline_update_stage(
+                    case_id=case_id,
+                    filename=filename,
+                    stage=stage_name,
+                    status="skipped",
+                    event="background_face_identity_topup_skipped",
+                    details={
+                        "source": "queue",
+                        "analysis_job_kind": QUEUE_JOB_KIND_ANALYSIS_FACE_IDENTITY,
+                        "analysis_face_people": False,
+                        "analysis_vehicles": False,
+                        "analysis_face_identity": True,
+                        "reason": reason,
+                        "face_identity_status": "skipped",
+                        "face_identity_reason": "FACE-01 must be completed before FACE-02 top-up.",
+                        "face_identity_indexed": 0,
+                        "phase": "finalizing",
+                        "phase_label": _analysis_phase_label("finalizing"),
+                    },
+                )
+                continue
+
+            if not embedder_available:
+                failed += 1
+                errors.append(f"{filename}: {face_embedder_error}")
+                await _pipeline_update_stage(
+                    case_id=case_id,
+                    filename=filename,
+                    stage=stage_name,
+                    status="failed",
+                    event="background_face_identity_topup_failed",
+                    error=face_embedder_error,
+                    details={
+                        "source": "queue",
+                        "analysis_job_kind": QUEUE_JOB_KIND_ANALYSIS_FACE_IDENTITY,
+                        "analysis_face_people": False,
+                        "analysis_vehicles": False,
+                        "analysis_face_identity": True,
+                        "face_identity_status": "unavailable",
+                        "face_identity_reason": face_embedder_error,
+                        "face_identity_indexed": 0,
+                        "phase": "face_identity",
+                        "phase_label": _analysis_phase_label("face_identity"),
+                    },
+                )
+                continue
+
+            raw_face_items = await asyncio.to_thread(
+                analysis_store.list_video_items,
+                category=AnalysisCropStore.FACE_PEOPLE,
+                video_filename=filename,
+                limit=200000,
+                kind="face",
+            )
+            face_items = [item for item in raw_face_items if isinstance(item, dict)]
+            face_records: list[dict[str, Any]] = []
+            face_images: list[Image.Image] = []
+            for item in face_items:
+                crop_url = str(item.get("crop_path") or "").strip()
+                crop_path = _media_url_to_case_path(case_id, crop_url)
+                if crop_path is None:
+                    continue
+                try:
+                    with Image.open(crop_path) as source_image:
+                        face_images.append(source_image.convert("RGB"))
+                except Exception:
+                    continue
+                face_records.append(
+                    {
+                        "timestamp_seconds": float(item.get("timestamp_seconds", 0.0)),
+                        "crop_path": crop_url,
+                        "kind": "face",
+                    }
+                )
+
+            if not face_images or not face_records:
+                skipped += 1
+                await _pipeline_update_stage(
+                    case_id=case_id,
+                    filename=filename,
+                    stage=stage_name,
+                    status="skipped",
+                    event="background_face_identity_topup_skipped",
+                    details={
+                        "source": "queue",
+                        "analysis_job_kind": QUEUE_JOB_KIND_ANALYSIS_FACE_IDENTITY,
+                        "analysis_face_people": False,
+                        "analysis_vehicles": False,
+                        "analysis_face_identity": True,
+                        "reason": "face_crops_missing",
+                        "face_identity_status": "skipped",
+                        "face_identity_reason": "No FACE-01 face crops were available for top-up.",
+                        "face_identity_indexed": 0,
+                        "phase": "finalizing",
+                        "phase_label": _analysis_phase_label("finalizing"),
+                    },
+                )
+                continue
+
+            if await asyncio.to_thread(_is_queue_job_cancelled_sync, queue_store, int(job_id)):
+                raise _IndexCancellationRequested("Background face identity top-up cancelled.")
+
+            face_vectors, matched_indices = await asyncio.to_thread(
+                face_embedder.encode_face_crops,
+                face_images,
+            )
+            matched_records: list[dict[str, Any]] = []
+            safe_matched_indices: list[int] = []
+            for raw_index in matched_indices or []:
+                try:
+                    parsed_index = int(raw_index)
+                except Exception:
+                    continue
+                if parsed_index < 0 or parsed_index >= len(face_records):
+                    continue
+                safe_matched_indices.append(parsed_index)
+                matched_records.append(face_records[parsed_index])
+
+            if isinstance(face_vectors, np.ndarray) and face_vectors.ndim == 2:
+                trimmed_vectors = face_vectors
+                if safe_matched_indices and len(safe_matched_indices) != len(face_vectors):
+                    trimmed_vectors = np.asarray(
+                        [face_vectors[index] for index in safe_matched_indices if 0 <= index < len(face_vectors)],
+                        dtype=np.float32,
+                    )
+            else:
+                embedding_dim = max(1, int(getattr(face_embedder, "embedding_dim", 512) or 512))
+                trimmed_vectors = np.empty((0, embedding_dim), dtype=np.float32)
+
+            upsert_result = await asyncio.to_thread(
+                face_identity_store.upsert_faces,
+                video_filename=filename,
+                records=matched_records,
+                embeddings=trimmed_vectors,
+                force=True,
+            )
+            face_identity_status = str(upsert_result.get("status") or "processed").strip().lower() or "processed"
+            face_identity_indexed = max(0, int(upsert_result.get("indexed", 0)))
+            completed += 1
+            await _pipeline_update_stage(
+                case_id=case_id,
+                filename=filename,
+                stage=stage_name,
+                status="completed",
+                event="background_face_identity_topup_completed",
+                details={
+                    "source": "queue",
+                    "analysis_job_kind": QUEUE_JOB_KIND_ANALYSIS_FACE_IDENTITY,
+                    "analysis_face_people": False,
+                    "analysis_vehicles": False,
+                    "analysis_face_identity": True,
+                    "face_identity_status": face_identity_status,
+                    "face_identity_indexed": face_identity_indexed,
+                    "face_identity_reason": "",
+                    "processed_frames": len(face_records),
+                    "estimated_total_frames": len(face_records),
+                    "progress_percent": 100.0,
+                    "phase": "finalizing",
+                    "phase_label": _analysis_phase_label("finalizing"),
+                },
+            )
+        except _IndexCancellationRequested:
+            await _pipeline_update_stage(
+                case_id=case_id,
+                filename=filename,
+                stage=stage_name,
+                status="interrupted",
+                event="background_face_identity_topup_cancelled",
+                error="Background face identity top-up cancelled.",
+                details={
+                    "source": "queue",
+                    "analysis_job_kind": QUEUE_JOB_KIND_ANALYSIS_FACE_IDENTITY,
+                    "analysis_face_people": False,
+                    "analysis_vehicles": False,
+                    "analysis_face_identity": True,
+                    "face_identity_status": "interrupted",
+                    "face_identity_indexed": 0,
+                    "face_identity_reason": "Cancelled by user request.",
+                    "phase": "face_identity",
+                    "phase_label": _analysis_phase_label("face_identity"),
+                },
+            )
+            return "cancelled", "Cancelled by user request."
+        except Exception as exc:
+            failed += 1
+            errors.append(f"{filename}: {exc}")
+            await _pipeline_update_stage(
+                case_id=case_id,
+                filename=filename,
+                stage=stage_name,
+                status="failed",
+                event="background_face_identity_topup_failed",
+                error=_truncate_error(str(exc)),
+                details={
+                    "source": "queue",
+                    "analysis_job_kind": QUEUE_JOB_KIND_ANALYSIS_FACE_IDENTITY,
+                    "analysis_face_people": False,
+                    "analysis_vehicles": False,
+                    "analysis_face_identity": True,
+                    "face_identity_status": "failed",
+                    "face_identity_indexed": 0,
+                    "face_identity_reason": _truncate_error(str(exc)),
+                    "phase": "face_identity",
+                    "phase_label": _analysis_phase_label("face_identity"),
+                },
+            )
+
+    if failed > 0 and completed == 0 and skipped == 0:
+        return "failed", _truncate_error(errors[-1] if errors else "Background face identity top-up failed.")
     if failed > 0:
         return "completed", _truncate_error(
             f"Completed with errors ({failed}/{len(filenames)} failed)."
@@ -1789,6 +2220,7 @@ async def _index_queue_worker_loop(
                                 if isinstance(effective_payload.get("metadata"), dict)
                                 else {}
                             ),
+                            append_to_case_queued=False,
                         )
                         if not isinstance(requeued, dict):
                             return 0, len(effective_filenames)
@@ -1823,7 +2255,13 @@ async def _index_queue_worker_loop(
 
                 queue_status = "failed"
                 queue_error = ""
-                if job_kind == QUEUE_JOB_KIND_TRIAGE_TIMELINE:
+                if job_kind == QUEUE_JOB_KIND_ANALYSIS_LEGACY:
+                    queue_status = "cancelled"
+                    queue_error = (
+                        "Legacy 'analysis' queue jobs are no longer supported. "
+                        "Resubmit using Face & People, FACE-02 top-up, or Vehicle analysis."
+                    )
+                elif job_kind == QUEUE_JOB_KIND_TRIAGE_TIMELINE:
                     queue_status, queue_error = await _run_triage_queue_job_async(
                         queue_store=queue_store,
                         job_id=job_id,
@@ -1831,8 +2269,20 @@ async def _index_queue_worker_loop(
                         payload=current_payload,
                         filenames=[current_filename],
                     )
-                elif job_kind == QUEUE_JOB_KIND_ANALYSIS:
+                elif job_kind in {
+                    QUEUE_JOB_KIND_ANALYSIS_FACE_PEOPLE,
+                    QUEUE_JOB_KIND_ANALYSIS_VEHICLES,
+                }:
                     queue_status, queue_error = await _run_analysis_queue_job_async(
+                        queue_store=queue_store,
+                        job_id=job_id,
+                        case_id=case_id,
+                        job_kind=job_kind,
+                        payload=current_payload,
+                        filenames=[current_filename],
+                    )
+                elif job_kind == QUEUE_JOB_KIND_ANALYSIS_FACE_IDENTITY:
+                    queue_status, queue_error = await _run_face_identity_topup_queue_job_async(
                         queue_store=queue_store,
                         job_id=job_id,
                         case_id=case_id,
@@ -2630,20 +3080,6 @@ def _preview_thumbnail_path(case_paths: CasePaths, filename: str) -> Path:
     return case_paths.thumbnails_dir / "_previews" / f"{safe_stem}_{digest}.jpg"
 
 
-def _triage_cache_video_dir(case_paths: CasePaths, filename: str) -> Path:
-    safe_stem = _safe_preview_stem(filename)
-    digest = hashlib.sha1(str(filename).encode("utf-8")).hexdigest()[:16]
-    return case_paths.data_dir / "triage_cache" / f"{safe_stem}_{digest}"
-
-
-def _triage_bucket_key(bucket_seconds: float) -> str:
-    return f"{float(bucket_seconds):.3f}".replace(".", "_")
-
-
-def _triage_cache_path(case_paths: CasePaths, filename: str, bucket_seconds: float) -> Path:
-    return _triage_cache_video_dir(case_paths, filename) / f"bucket_{_triage_bucket_key(bucket_seconds)}.json"
-
-
 def _triage_analysis_signature(face_people: dict, vehicles: dict) -> str:
     payload = {
         "face_people": face_people if isinstance(face_people, dict) else {},
@@ -2659,88 +3095,92 @@ def _triage_analysis_signature(face_people: dict, vehicles: dict) -> str:
     return hashlib.sha1(serialized.encode("utf-8")).hexdigest()
 
 
-def _metadata_mtime_ns(path: Path) -> int:
-    try:
-        if path.exists():
-            return int(path.stat().st_mtime_ns)
-    except Exception:
-        return 0
-    return 0
-
-
 def _load_triage_cache_sync(
     *,
-    cache_path: Path,
+    case_id: str,
+    filename: str,
     bucket_seconds: float,
     video_signature: str,
     analysis_signature: str,
-    face_people_metadata_mtime_ns: int,
-    vehicles_metadata_mtime_ns: int,
 ) -> dict | None:
-    if not cache_path.exists() or not cache_path.is_file():
+    store = _triage_timeline_store()
+    if store is None:
         return None
 
     try:
-        cached = json.loads(cache_path.read_text(encoding="utf-8"))
+        return store.load_payload_exact(
+            case_id=case_id,
+            filename=filename,
+            bucket_seconds=bucket_seconds,
+            video_signature=video_signature,
+            analysis_signature=analysis_signature,
+        )
     except Exception:
         return None
-    if not isinstance(cached, dict):
+
+
+def _load_stale_triage_cache_sync(
+    *,
+    case_id: str,
+    filename: str,
+    bucket_seconds: float,
+    video_signature: str,
+) -> dict | None:
+    store = _triage_timeline_store()
+    if store is None:
         return None
 
-    if int(cached.get("cache_version", 0)) != TRIAGE_CACHE_VERSION:
-        return None
-    if str(cached.get("video_signature", "")) != str(video_signature):
-        return None
-    if str(cached.get("analysis_signature", "")) != str(analysis_signature):
-        return None
-    if int(cached.get("face_people_metadata_mtime_ns", 0)) != int(face_people_metadata_mtime_ns):
-        return None
-    if int(cached.get("vehicles_metadata_mtime_ns", 0)) != int(vehicles_metadata_mtime_ns):
-        return None
     try:
-        cached_bucket_seconds = float(cached.get("bucket_seconds", -1.0))
+        return store.load_payload_stale_for_video(
+            case_id=case_id,
+            filename=filename,
+            bucket_seconds=bucket_seconds,
+            video_signature=video_signature,
+        )
     except Exception:
         return None
-    if abs(cached_bucket_seconds - float(bucket_seconds)) > 1e-6:
-        return None
-
-    payload = cached.get("payload")
-    if not isinstance(payload, dict):
-        return None
-    return dict(payload)
 
 
 def _save_triage_cache_sync(
     *,
-    cache_path: Path,
+    case_id: str,
+    filename: str,
     bucket_seconds: float,
     video_signature: str,
     analysis_signature: str,
-    face_people_metadata_mtime_ns: int,
-    vehicles_metadata_mtime_ns: int,
     payload: dict,
 ) -> None:
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    wrapped = {
-        "cache_version": TRIAGE_CACHE_VERSION,
-        "bucket_seconds": float(bucket_seconds),
-        "video_signature": str(video_signature),
-        "analysis_signature": str(analysis_signature),
-        "face_people_metadata_mtime_ns": int(face_people_metadata_mtime_ns),
-        "vehicles_metadata_mtime_ns": int(vehicles_metadata_mtime_ns),
-        "payload": payload,
-        "updated_at": _utc_now_iso(),
-    }
-    cache_path.write_text(
-        json.dumps(wrapped, ensure_ascii=False),
-        encoding="utf-8",
+    store = _triage_timeline_store()
+    if store is None:
+        return
+    store.upsert_payload(
+        case_id=case_id,
+        filename=filename,
+        bucket_seconds=bucket_seconds,
+        video_signature=video_signature,
+        analysis_signature=analysis_signature,
+        payload=payload,
     )
 
 
-def _clear_triage_cache_for_video(case_paths: CasePaths, filename: str) -> None:
-    video_cache_dir = _triage_cache_video_dir(case_paths, filename)
-    if video_cache_dir.exists() and video_cache_dir.is_dir():
-        shutil.rmtree(video_cache_dir, ignore_errors=True)
+def _clear_triage_cache_for_video(case_id: str, filename: str) -> None:
+    store = _triage_timeline_store()
+    if store is None:
+        return
+    try:
+        store.delete_video(case_id=case_id, filename=filename)
+    except Exception:
+        pass
+
+
+def _clear_triage_cache_for_case(case_id: str) -> None:
+    store = _triage_timeline_store()
+    if store is None:
+        return
+    try:
+        store.delete_case(case_id)
+    except Exception:
+        pass
 
 
 def _semantic_result_unique_key(item: dict) -> tuple[str, float, str]:
@@ -2782,7 +3222,8 @@ def _apply_semantic_post_filters(
         for item in sorted_results
         if float(item.get("similarity_score", -1.0)) >= float(min_score)
     ]
-    candidates = thresholded if thresholded else sorted_results
+    # Keep thresholding strict: callers decide if/when to relax min_score.
+    candidates = thresholded
 
     safe_diversity_seconds = max(0.0, float(diversity_seconds))
     safe_near_dup_seconds = max(0.0, float(near_duplicate_seconds))
@@ -3732,7 +4173,7 @@ def _delete_video_sync(case_id: str, filename: str) -> dict:
         shutil.rmtree(detections_dir, ignore_errors=True)
     preview_path = _preview_thumbnail_path(case_paths, safe_filename)
     preview_path.unlink(missing_ok=True)
-    _clear_triage_cache_for_video(case_paths, safe_filename)
+    _clear_triage_cache_for_video(case_paths.case_id, safe_filename)
 
     return {
         "case_id": case_paths.case_id,
@@ -3863,23 +4304,15 @@ def _build_video_triage_sync(
 
     safe_bucket_seconds = max(0.5, float(bucket_seconds))
     video_signature = compute_video_signature(video_path)
-    face_people_mtime_ns = _metadata_mtime_ns(case_paths.face_people_metadata_path)
-    vehicles_mtime_ns = _metadata_mtime_ns(case_paths.vehicles_metadata_path)
     analysis_signature = _triage_analysis_signature(face_people, vehicles)
-    cache_path = _triage_cache_path(
-        case_paths,
-        resolved_filename,
-        safe_bucket_seconds,
-    )
 
     if not force:
         cached_payload = _load_triage_cache_sync(
-            cache_path=cache_path,
+            case_id=case_paths.case_id,
+            filename=resolved_filename,
             bucket_seconds=safe_bucket_seconds,
             video_signature=video_signature,
             analysis_signature=analysis_signature,
-            face_people_metadata_mtime_ns=face_people_mtime_ns,
-            vehicles_metadata_mtime_ns=vehicles_mtime_ns,
         )
         if isinstance(cached_payload, dict):
             _pipeline_update_stage_sync(
@@ -3939,12 +4372,11 @@ def _build_video_triage_sync(
 
     try:
         _save_triage_cache_sync(
-            cache_path=cache_path,
+            case_id=case_paths.case_id,
+            filename=resolved_filename,
             bucket_seconds=safe_bucket_seconds,
             video_signature=video_signature,
             analysis_signature=analysis_signature,
-            face_people_metadata_mtime_ns=face_people_mtime_ns,
-            vehicles_metadata_mtime_ns=vehicles_mtime_ns,
             payload=payload,
         )
     except Exception as exc:
@@ -3974,6 +4406,7 @@ def _load_cached_video_triage_sync(
     case_id: str,
     filename: str,
     bucket_seconds: float,
+    allow_stale: bool = False,
 ) -> dict:
     case_paths, vector_store = _get_vector_store_for_case(case_id)
     resolved_filename, video_path = _resolve_video_path_for_processing(
@@ -4008,40 +4441,52 @@ def _load_cached_video_triage_sync(
 
     safe_bucket_seconds = max(0.5, float(bucket_seconds))
     video_signature = compute_video_signature(video_path)
-    face_people_mtime_ns = _metadata_mtime_ns(case_paths.face_people_metadata_path)
-    vehicles_mtime_ns = _metadata_mtime_ns(case_paths.vehicles_metadata_path)
     analysis_signature = _triage_analysis_signature(face_people, vehicles)
-    cache_path = _triage_cache_path(
-        case_paths,
-        resolved_filename,
-        safe_bucket_seconds,
-    )
     cached_payload = _load_triage_cache_sync(
-        cache_path=cache_path,
+        case_id=case_paths.case_id,
+        filename=resolved_filename,
         bucket_seconds=safe_bucket_seconds,
         video_signature=video_signature,
         analysis_signature=analysis_signature,
-        face_people_metadata_mtime_ns=face_people_mtime_ns,
-        vehicles_metadata_mtime_ns=vehicles_mtime_ns,
     )
-    if not isinstance(cached_payload, dict):
-        return {
-            "case_id": case_paths.case_id,
-            "filename": resolved_filename,
-            "bucket_seconds": safe_bucket_seconds,
-            "video_url": _media_url_for_case_path(case_paths.videos_dir / resolved_filename),
-            "cache_status": "miss",
-            "cached": False,
-        }
+    if isinstance(cached_payload, dict):
+        cached_payload["case_id"] = case_paths.case_id
+        cached_payload["filename"] = resolved_filename
+        cached_payload["video_url"] = _media_url_for_case_path(
+            case_paths.videos_dir / resolved_filename
+        )
+        cached_payload["cache_status"] = "hit"
+        cached_payload["cached"] = True
+        cached_payload["stale"] = False
+        return cached_payload
 
-    cached_payload["case_id"] = case_paths.case_id
-    cached_payload["filename"] = resolved_filename
-    cached_payload["video_url"] = _media_url_for_case_path(
-        case_paths.videos_dir / resolved_filename
-    )
-    cached_payload["cache_status"] = "hit"
-    cached_payload["cached"] = True
-    return cached_payload
+    if allow_stale:
+        stale_payload = _load_stale_triage_cache_sync(
+            case_id=case_paths.case_id,
+            filename=resolved_filename,
+            bucket_seconds=safe_bucket_seconds,
+            video_signature=video_signature,
+        )
+        if isinstance(stale_payload, dict):
+            stale_payload["case_id"] = case_paths.case_id
+            stale_payload["filename"] = resolved_filename
+            stale_payload["video_url"] = _media_url_for_case_path(
+                case_paths.videos_dir / resolved_filename
+            )
+            stale_payload["cache_status"] = "stale"
+            stale_payload["cached"] = False
+            stale_payload["stale"] = True
+            return stale_payload
+
+    return {
+        "case_id": case_paths.case_id,
+        "filename": resolved_filename,
+        "bucket_seconds": safe_bucket_seconds,
+        "video_url": _media_url_for_case_path(case_paths.videos_dir / resolved_filename),
+        "cache_status": "miss",
+        "cached": False,
+        "stale": False,
+    }
 
 
 _insights_service = InsightsService(

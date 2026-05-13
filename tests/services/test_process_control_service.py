@@ -317,6 +317,72 @@ class ProcessControlServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(payload["updated"])
         self.assertEqual(payload["front_applied_count"], 1)
 
+    def test_list_active_processes_sync_collapses_completed_submission_items(self) -> None:
+        queue_store = self.app.state.index_queue_store
+        queue_store.list_active_jobs = lambda limit=500: []
+        queue_store.list_recent_jobs = lambda limit=500: [
+            {
+                "job_id": 201,
+                "case_id": "case_done",
+                "job_kind": "analysis",
+                "priority": 70,
+                "status": "completed",
+                "attempt_count": 1,
+                "queue_position": 0,
+                "enqueued_at": "2026-01-01T00:00:00+00:00",
+                "started_at": "2026-01-01T00:00:10+00:00",
+                "finished_at": "2026-01-01T00:01:00+00:00",
+                "updated_at": "2026-01-01T00:01:00+00:00",
+                "payload": {
+                    "filenames": ["a.mp4"],
+                    "metadata": {
+                        "analysis_face_people": True,
+                        "analysis_face_people_filenames": ["a.mp4"],
+                        "submission_id": "sub-1",
+                        "submission_created_at": "2026-01-01T00:00:00+00:00",
+                        "submission_kind": "analysis",
+                    },
+                },
+            },
+            {
+                "job_id": 202,
+                "case_id": "case_done",
+                "job_kind": "analysis",
+                "priority": 70,
+                "status": "failed",
+                "attempt_count": 1,
+                "queue_position": 0,
+                "enqueued_at": "2026-01-01T00:01:05+00:00",
+                "started_at": "2026-01-01T00:01:15+00:00",
+                "finished_at": "2026-01-01T00:02:00+00:00",
+                "updated_at": "2026-01-01T00:02:00+00:00",
+                "payload": {
+                    "filenames": ["b.mp4"],
+                    "metadata": {
+                        "analysis_vehicles": True,
+                        "analysis_vehicles_filenames": ["b.mp4"],
+                        "submission_id": "sub-1",
+                        "submission_created_at": "2026-01-01T00:00:00+00:00",
+                        "submission_kind": "analysis",
+                    },
+                },
+            },
+        ]
+
+        payload = self.service.list_active_processes_sync(case_id="case_done")
+        completed = payload["completed_processes"]
+        self.assertEqual(payload["completed_count"], 1)
+        self.assertEqual(len(completed), 1)
+        item = completed[0]
+        self.assertEqual(item["submission_id"], "sub-1")
+        self.assertEqual(item["submission_kind"], "analysis")
+        self.assertEqual(item["status"], "completed_with_errors")
+        self.assertEqual(item["filenames_count"], 2)
+        self.assertEqual(sorted(item["filenames"]), ["a.mp4", "b.mp4"])
+        metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+        self.assertTrue(bool(metadata.get("analysis_face_people")))
+        self.assertTrue(bool(metadata.get("analysis_vehicles")))
+
     async def test_graceful_shutdown_sets_state(self) -> None:
         # Prevent signal-based exit scheduling during test runs.
         self.service.schedule_process_exit = lambda _delay_seconds=1.0: None

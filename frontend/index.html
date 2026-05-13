@@ -105,6 +105,23 @@
             </p>
             <p id="searchSettingsMeta" class="status"></p>
           </section>
+          <section class="embedding-settings-panel face-identity-panel">
+            <h2>FACE-02 Identity (ArcFace)</h2>
+            <p class="analysis-note">
+              FACE-02 builds identity embeddings on detected faces to improve suspect-photo matching precision.
+            </p>
+            <p id="faceIdentityToggleState" class="face-identity-toggle-state">Current state: off</p>
+            <div class="face-identity-controls">
+              <label class="analysis-toggle" for="faceIdentityEnabledToggle">
+                <input id="faceIdentityEnabledToggle" type="checkbox" />
+                Enable FACE-02 during Face &amp; People analysis
+              </label>
+              <button id="saveFaceIdentitySettingsBtn" type="button" class="ghost">
+                Save FACE-02 Setting
+              </button>
+            </div>
+            <p id="faceIdentitySettingsMeta" class="status"></p>
+          </section>
         </section>
         <section id="workspaceReportPage" class="panel workspace-report-page" hidden>
           <h2>Report</h2>
@@ -125,45 +142,12 @@
 
         <section id="tabTriage" class="tab-pane active">
           <section class="panel upload-panel">
-            <h1 class="ingestion-title">Video Ingestion &amp; Indexing</h1>
+            <h1 class="ingestion-title">Video Ingestion</h1>
             <p id="uploadStatus" class="status"></p>
-            <div class="queue-summary-row">
-              <button id="indexQueueSummaryBtn" type="button" class="ghost queue-summary-btn" hidden>
-                0 files queued for indexing
-              </button>
-            </div>
             <div class="upload-controls">
               <input id="videoInput" type="file" multiple accept="video/*" />
-              <label for="intervalInput">Frame Interval (s)</label>
-              <input id="intervalInput" type="number" min="0.25" step="0.25" value="1" />
-              <button id="uploadBtn" type="button">Upload + Base Index</button>
-              <button id="refreshBtn" type="button" class="ghost">Refresh List</button>
+              <button id="uploadBtn" type="button">Upload</button>
             </div>
-            <section id="preUploadIndexPanel" class="preupload-index-panel" hidden>
-              <div class="preupload-index-head">
-                <h3>Choose Files To Semantic Index (Before Upload)</h3>
-                <label class="preupload-select-all">
-                  <input id="preUploadSelectAll" type="checkbox" />
-                  Select All
-                </label>
-              </div>
-              <div id="preUploadIndexList" class="analysis-video-list"></div>
-            </section>
-            <section id="existingIndexPanel" class="preupload-index-panel" hidden>
-              <div class="preupload-index-head">
-                <h3>Index Existing Uploaded Videos</h3>
-                <label class="preupload-select-all">
-                  <input id="existingIndexSelectAll" type="checkbox" />
-                  Select All
-                </label>
-              </div>
-              <div id="existingIndexList" class="analysis-video-list"></div>
-              <div class="analysis-select-actions">
-                <button id="runExistingIndexBtn" type="button" class="ghost">
-                  Run Semantic Index For Selected
-                </button>
-              </div>
-            </section>
             <section id="taskProgress" class="task-progress" hidden>
               <div class="task-progress-head">
                 <span id="taskProgressLabel">Working...</span>
@@ -220,6 +204,53 @@
         </section>
 
         <section id="tabSemantic" class="tab-pane">
+          <section class="analysis-split-grid">
+            <section class="panel search-panel analysis-split-panel">
+              <h2>Semantic Index</h2>
+              <p class="analysis-note">
+                Select existing uploaded videos to build semantic index.
+              </p>
+              <div class="queue-summary-row">
+                <button id="indexQueueSummaryBtn" type="button" class="ghost queue-summary-btn" hidden>
+                  0 files queued for indexing
+                </button>
+              </div>
+              <div class="upload-controls">
+                <label for="intervalInput">Frame Interval (s)</label>
+                <input id="intervalInput" type="number" min="0.25" step="0.25" value="1" />
+              </div>
+              <section id="existingIndexPanel" class="preupload-index-panel" hidden>
+                <div class="preupload-index-head">
+                  <h3>Index Existing Uploaded Videos</h3>
+                  <label class="preupload-select-all">
+                    <input id="existingIndexSelectAll" type="checkbox" />
+                    Select All
+                  </label>
+                </div>
+                <div id="existingIndexList" class="analysis-video-list"></div>
+                <div class="analysis-select-actions">
+                  <button id="runExistingIndexBtn" type="button" class="ghost">
+                    Run Semantic Index For Selected
+                  </button>
+                </div>
+              </section>
+            </section>
+            <section class="panel search-panel analysis-split-panel">
+              <h2>Semantic Search Scope</h2>
+              <p class="analysis-note">
+                Choose which ready indexed videos Semantic Search should query.
+              </p>
+              <div id="semanticSearchScopeList" class="analysis-video-list"></div>
+              <div class="analysis-select-actions">
+                <label class="analysis-select-all">
+                  <input id="semanticScopeSelectAll" type="checkbox" />
+                  Select All Ready
+                </label>
+                <span id="semanticScopeSelectionMeta" class="analysis-select-meta">0 selected</span>
+              </div>
+            </section>
+          </section>
+
           <section class="panel search-panel">
             <h2>Semantic Search</h2>
             <div class="search-controls">
@@ -246,42 +277,41 @@
         </section>
 
         <section id="tabFacePeople" class="tab-pane">
-          <section class="panel face-identity-panel">
-            <h2>FACE-02 Identity (ArcFace)</h2>
-            <p class="analysis-note">
-              FACE-02 builds identity embeddings on detected faces to improve suspect-photo matching precision.
-            </p>
-            <p id="faceIdentityToggleState" class="face-identity-toggle-state">Current state: off</p>
-            <div class="face-identity-controls">
-              <label class="analysis-toggle" for="faceIdentityEnabledToggle">
-                <input id="faceIdentityEnabledToggle" type="checkbox" />
-                Enable FACE-02 during Face &amp; People analysis
-              </label>
-              <button id="saveFaceIdentitySettingsBtn" type="button" class="ghost">
-                Save FACE-02 Setting
-              </button>
-            </div>
-            <p id="faceIdentitySettingsMeta" class="status"></p>
-          </section>
-
-          <section class="panel analysis-select-panel">
-            <h2>Run Face &amp; People Analysis</h2>
-            <p class="analysis-note">Select ingested videos, then run analysis.</p>
-            <div id="facePeopleVideoSelectList" class="analysis-video-list"></div>
-            <div class="analysis-select-actions">
-              <label class="analysis-select-all">
-                <input id="facePeopleAnalysisSelectAll" type="checkbox" />
-                Select All
-              </label>
-              <button id="runFacePeopleSelectedBtn" type="button" class="ghost">Run Face &amp; People For Selected</button>
-              <span id="facePeopleAnalysisSelectionMeta" class="analysis-select-meta">0 selected</span>
-            </div>
-            <p id="analysisStatus" class="status"></p>
-            <div class="queue-summary-row">
-              <button id="facePeopleQueueSummaryBtn" type="button" class="ghost queue-summary-btn" hidden>
-                0 files queued for analysis
-              </button>
-            </div>
+          <section class="analysis-split-grid">
+            <section class="panel analysis-select-panel analysis-split-panel">
+              <h2>Run Face &amp; People Analysis</h2>
+              <p class="analysis-note">Select ingested videos, then run analysis.</p>
+              <div id="facePeopleVideoSelectList" class="analysis-video-list"></div>
+              <div class="analysis-select-actions">
+                <label class="analysis-select-all">
+                  <input id="facePeopleAnalysisSelectAll" type="checkbox" />
+                  Select All
+                </label>
+                <button id="runFacePeopleSelectedBtn" type="button" class="ghost">Run Face &amp; People For Selected</button>
+                <button id="runFaceIdentityTopupSelectedBtn" type="button" class="ghost">Run FACE-02 Top-up For Selected</button>
+                <span id="facePeopleAnalysisSelectionMeta" class="analysis-select-meta">0 selected</span>
+              </div>
+              <p id="analysisStatus" class="status"></p>
+              <div class="queue-summary-row">
+                <button id="facePeopleQueueSummaryBtn" type="button" class="ghost queue-summary-btn" hidden>
+                  0 files queued for analysis
+                </button>
+              </div>
+            </section>
+            <section class="panel search-panel analysis-split-panel">
+              <h2>Face &amp; People Search Scope</h2>
+              <p class="analysis-note">
+                Choose which ready FACE-01 analyzed videos Face &amp; People search should query.
+              </p>
+              <div id="facePeopleSearchScopeList" class="analysis-video-list"></div>
+              <div class="analysis-select-actions">
+                <label class="analysis-select-all">
+                  <input id="facePeopleScopeSelectAll" type="checkbox" />
+                  Select All Ready
+                </label>
+                <span id="facePeopleScopeSelectionMeta" class="analysis-select-meta">0 selected</span>
+              </div>
+            </section>
           </section>
 
           <section class="panel search-panel">
@@ -336,24 +366,40 @@
         </section>
 
         <section id="tabVehicles" class="tab-pane">
-          <section class="panel analysis-select-panel">
-            <h2>Run Vehicle Analysis</h2>
-            <p class="analysis-note">Select ingested videos, then run analysis.</p>
-            <div id="vehicleVideoSelectList" class="analysis-video-list"></div>
-            <div class="analysis-select-actions">
-              <label class="analysis-select-all">
-                <input id="vehicleAnalysisSelectAll" type="checkbox" />
-                Select All
-              </label>
-              <button id="runVehiclesSelectedBtn" type="button" class="ghost">Run Vehicle Analysis For Selected</button>
-              <span id="vehicleAnalysisSelectionMeta" class="analysis-select-meta">0 selected</span>
-            </div>
-            <p id="vehicleStatus" class="status"></p>
-            <div class="queue-summary-row">
-              <button id="vehicleQueueSummaryBtn" type="button" class="ghost queue-summary-btn" hidden>
-                0 files queued for analysis
-              </button>
-            </div>
+          <section class="analysis-split-grid">
+            <section class="panel analysis-select-panel analysis-split-panel">
+              <h2>Run Vehicle Analysis</h2>
+              <p class="analysis-note">Select ingested videos, then run analysis.</p>
+              <div id="vehicleVideoSelectList" class="analysis-video-list"></div>
+              <div class="analysis-select-actions">
+                <label class="analysis-select-all">
+                  <input id="vehicleAnalysisSelectAll" type="checkbox" />
+                  Select All
+                </label>
+                <button id="runVehiclesSelectedBtn" type="button" class="ghost">Run Vehicle Analysis For Selected</button>
+                <span id="vehicleAnalysisSelectionMeta" class="analysis-select-meta">0 selected</span>
+              </div>
+              <p id="vehicleStatus" class="status"></p>
+              <div class="queue-summary-row">
+                <button id="vehicleQueueSummaryBtn" type="button" class="ghost queue-summary-btn" hidden>
+                  0 files queued for analysis
+                </button>
+              </div>
+            </section>
+            <section class="panel search-panel analysis-split-panel">
+              <h2>Vehicle Search Scope</h2>
+              <p class="analysis-note">
+                Choose which ready vehicle-analyzed videos Vehicle search should query.
+              </p>
+              <div id="vehicleSearchScopeList" class="analysis-video-list"></div>
+              <div class="analysis-select-actions">
+                <label class="analysis-select-all">
+                  <input id="vehicleScopeSelectAll" type="checkbox" />
+                  Select All Ready
+                </label>
+                <span id="vehicleScopeSelectionMeta" class="analysis-select-meta">0 selected</span>
+              </div>
+            </section>
           </section>
 
           <section class="panel search-panel">
@@ -426,6 +472,6 @@
         </section>
       </div>
     </div>
-    <script src="/static/script.js?v=20260510b"></script>
+    <script src="/static/script.js?v=20260513b"></script>
   </body>
 </html>

@@ -17,6 +17,7 @@ def build_insights_router(*, insights_service: InsightsService) -> APIRouter:
             query=request.query,
             top_k=request.top_k,
             limit=request.limit,
+            filenames=request.filenames,
         )
 
     @router.post("/triage_timeline")
@@ -45,6 +46,7 @@ def build_insights_router(*, insights_service: InsightsService) -> APIRouter:
             min_score=request.min_score,
             diversity_seconds=request.diversity_seconds,
             oversample_factor=request.oversample_factor,
+            filenames=request.filenames,
         )
 
     @router.post("/suspect_photo_search")
@@ -53,6 +55,7 @@ def build_insights_router(*, insights_service: InsightsService) -> APIRouter:
         mode: str = Form(default="auto"),
         top_k: int = Form(default=120),
         min_score: float | None = Form(default=None),
+        video_filenames: list[str] | None = Form(default=None),
         probe_image: UploadFile = File(...),
     ) -> dict:
         probe_bytes = await probe_image.read()
@@ -63,6 +66,7 @@ def build_insights_router(*, insights_service: InsightsService) -> APIRouter:
                 mode=mode,
                 top_k=top_k,
                 min_score=min_score,
+                video_filenames=video_filenames,
             )
         finally:
             await probe_image.close()

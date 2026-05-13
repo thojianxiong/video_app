@@ -10,7 +10,17 @@ from typing import Any
 
 
 class VideoPipelineStore:
-    STAGES = ("ingest", "normalize", "triage", "base_index", "analysis")
+    STAGES = (
+        "ingest",
+        "normalize",
+        "triage",
+        "base_index",
+        "analysis_face_people",
+        "analysis_face_identity",
+        "analysis_vehicles",
+        # Keep legacy stage for backward compatibility with old snapshots.
+        "analysis",
+    )
     STAGE_TERMINAL = {"completed", "failed", "skipped", "interrupted"}
 
     def __init__(self, db_path: Path) -> None:

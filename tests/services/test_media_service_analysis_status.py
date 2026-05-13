@@ -360,6 +360,56 @@ class MediaServiceAnalysisStatusTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(bool(payload["analysis"]["face_people"]))
         self.assertFalse(bool(payload["analysis"]["vehicles"]))
 
+    async def test_get_background_analysis_status_ignores_explicit_terminal_when_new_active_exists(self) -> None:
+        completed_face_job = self._enqueue_analysis_job(
+            filenames=["fp_done.mp4"],
+            metadata={
+                "analysis_face_people": True,
+                "analysis_vehicles": False,
+                "analysis_face_people_filenames": ["fp_done.mp4"],
+            },
+        )
+        claimed_done = self.queue_store.claim_next_queued()
+        self.assertIsNotNone(claimed_done)
+        self.assertEqual(int(claimed_done["job_id"]), int(completed_face_job["job_id"]))
+        self.queue_store.complete_job(
+            job_id=int(completed_face_job["job_id"]),
+            status="completed",
+            error="",
+        )
+
+        active_face_job = self._enqueue_analysis_job(
+            filenames=["fp_running_2.mp4"],
+            metadata={
+                "analysis_face_people": True,
+                "analysis_vehicles": False,
+                "analysis_face_people_filenames": ["fp_running_2.mp4"],
+            },
+        )
+        claimed_active = self.queue_store.claim_next_queued()
+        self.assertIsNotNone(claimed_active)
+        self.assertEqual(int(claimed_active["job_id"]), int(active_face_job["job_id"]))
+        self.pipeline_store.update_stage(
+            case_id="case_a",
+            filename="fp_running_2.mp4",
+            stage="analysis",
+            status="running",
+            event="analysis_running",
+        )
+
+        payload = await self.service.get_background_analysis_status(
+            "case_a",
+            "face_people",
+            int(completed_face_job["job_id"]),
+        )
+        self.assertEqual(payload["status"], "running")
+        self.assertEqual(int(payload["queue"]["job_id"]), int(active_face_job["job_id"]))
+        self.assertEqual(payload["filenames"], ["fp_running_2.mp4"])
+        self.assertEqual(
+            payload.get("active_analysis_face_people_filenames"),
+            ["fp_running_2.mp4"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -5,9 +5,6 @@ let refreshBtn = null;
 let refreshTriageBtn = null;
 let uploadStatus = null;
 let indexQueueSummaryBtn = null;
-let preUploadIndexPanel = null;
-let preUploadSelectAll = null;
-let preUploadIndexList = null;
 let existingIndexPanel = null;
 let existingIndexSelectAll = null;
 let existingIndexList = null;
@@ -37,12 +34,19 @@ let faceIdentityToggleState = null;
 let analysisStatus = null;
 let facePeopleQueueSummaryBtn = null;
 let runFacePeopleSelectedBtn = null;
+let runFaceIdentityTopupSelectedBtn = null;
 let runVehiclesSelectedBtn = null;
 let vehicleQueueSummaryBtn = null;
 let facePeopleAnalysisSelectAll = null;
 let vehicleAnalysisSelectAll = null;
 let facePeopleAnalysisSelectionMeta = null;
 let vehicleAnalysisSelectionMeta = null;
+let semanticScopeSelectAll = null;
+let facePeopleScopeSelectAll = null;
+let vehicleScopeSelectAll = null;
+let semanticScopeSelectionMeta = null;
+let facePeopleScopeSelectionMeta = null;
+let vehicleScopeSelectionMeta = null;
 let mainTabTriageBtn = null;
 let mainTabSemanticBtn = null;
 let mainTabFacePeopleBtn = null;
@@ -59,6 +63,9 @@ let tabFacePeople = null;
 let tabVehicles = null;
 let facePeopleVideoSelectList = null;
 let vehicleVideoSelectList = null;
+let semanticSearchScopeList = null;
+let facePeopleSearchScopeList = null;
+let vehicleSearchScopeList = null;
 let facePeopleQueryInput = null;
 let facePeopleSearchBtn = null;
 let suspectProbeInput = null;
@@ -152,11 +159,11 @@ const triageLoading = new Set();
 const triageErrors = new Map();
 const triageSelection = new Map();
 const videoSelectionByCase = new Map();
-let pendingUploadItems = [];
 let triageRefreshToken = 0;
 let indexStatusPollToken = 0;
 let indexStatusPollCaseId = "";
 const ANALYSIS_CATEGORIES = ["face_people", "vehicles"];
+const SEARCH_SCOPE_CATEGORIES = ["semantic", "face_people", "vehicles"];
 const analysisStatusPollStateByCategory = {
   face_people: { token: 0, caseId: "", jobId: 0 },
   vehicles: { token: 0, caseId: "", jobId: 0 },
@@ -171,6 +178,15 @@ let queueTaskPopupLoadToken = 0;
 let queueTaskPopupRecoveryContext = null;
 let queueTaskPopupCurrentItem = null;
 const analysisQueueStatusByCase = {
+  face_people: new Map(),
+  vehicles: new Map(),
+};
+const analysisSelectionByCase = {
+  face_people: new Map(),
+  vehicles: new Map(),
+};
+const searchScopeSelectionByCase = {
+  semantic: new Map(),
   face_people: new Map(),
   vehicles: new Map(),
 };
@@ -192,9 +208,6 @@ function bindDomElements() {
   refreshTriageBtn = document.getElementById("refreshTriageBtn");
   uploadStatus = document.getElementById("uploadStatus");
   indexQueueSummaryBtn = document.getElementById("indexQueueSummaryBtn");
-  preUploadIndexPanel = document.getElementById("preUploadIndexPanel");
-  preUploadSelectAll = document.getElementById("preUploadSelectAll");
-  preUploadIndexList = document.getElementById("preUploadIndexList");
   existingIndexPanel = document.getElementById("existingIndexPanel");
   existingIndexSelectAll = document.getElementById("existingIndexSelectAll");
   existingIndexList = document.getElementById("existingIndexList");
@@ -224,12 +237,19 @@ function bindDomElements() {
   analysisStatus = document.getElementById("analysisStatus");
   facePeopleQueueSummaryBtn = document.getElementById("facePeopleQueueSummaryBtn");
   runFacePeopleSelectedBtn = document.getElementById("runFacePeopleSelectedBtn");
+  runFaceIdentityTopupSelectedBtn = document.getElementById("runFaceIdentityTopupSelectedBtn");
   runVehiclesSelectedBtn = document.getElementById("runVehiclesSelectedBtn");
   vehicleQueueSummaryBtn = document.getElementById("vehicleQueueSummaryBtn");
   facePeopleAnalysisSelectAll = document.getElementById("facePeopleAnalysisSelectAll");
   vehicleAnalysisSelectAll = document.getElementById("vehicleAnalysisSelectAll");
   facePeopleAnalysisSelectionMeta = document.getElementById("facePeopleAnalysisSelectionMeta");
   vehicleAnalysisSelectionMeta = document.getElementById("vehicleAnalysisSelectionMeta");
+  semanticScopeSelectAll = document.getElementById("semanticScopeSelectAll");
+  facePeopleScopeSelectAll = document.getElementById("facePeopleScopeSelectAll");
+  vehicleScopeSelectAll = document.getElementById("vehicleScopeSelectAll");
+  semanticScopeSelectionMeta = document.getElementById("semanticScopeSelectionMeta");
+  facePeopleScopeSelectionMeta = document.getElementById("facePeopleScopeSelectionMeta");
+  vehicleScopeSelectionMeta = document.getElementById("vehicleScopeSelectionMeta");
   mainTabTriageBtn = document.getElementById("mainTabTriageBtn");
   mainTabSemanticBtn = document.getElementById("mainTabSemanticBtn");
   mainTabFacePeopleBtn = document.getElementById("mainTabFacePeopleBtn");
@@ -246,6 +266,9 @@ function bindDomElements() {
   tabVehicles = document.getElementById("tabVehicles");
   facePeopleVideoSelectList = document.getElementById("facePeopleVideoSelectList");
   vehicleVideoSelectList = document.getElementById("vehicleVideoSelectList");
+  semanticSearchScopeList = document.getElementById("semanticSearchScopeList");
+  facePeopleSearchScopeList = document.getElementById("facePeopleSearchScopeList");
+  vehicleSearchScopeList = document.getElementById("vehicleSearchScopeList");
   facePeopleQueryInput = document.getElementById("facePeopleQueryInput");
   facePeopleSearchBtn = document.getElementById("facePeopleSearchBtn");
   suspectProbeInput = document.getElementById("suspectProbeInput");
@@ -538,14 +561,6 @@ function formatBytes(bytes) {
   return `${value.toFixed(index === 0 ? 0 : 1)} ${units[index]}`;
 }
 
-function makePendingUploadSourceKey(file, sourceIndex) {
-  const safeIndex = Number.isFinite(Number(sourceIndex)) ? Number(sourceIndex) : 0;
-  const safeName = String(file?.name || "");
-  const safeSize = Number(file?.size || 0);
-  const safeModified = Number(file?.lastModified || 0);
-  return `${safeIndex}::${safeName}::${safeSize}::${safeModified}`;
-}
-
 function normalizeDuplicateName(name) {
   return String(name || "").trim().toLowerCase();
 }
@@ -809,218 +824,6 @@ function reviewDuplicateUploadCandidates(duplicateCandidates, files) {
   return skippedSourceIndices;
 }
 
-function syncPreUploadSelectAllControl() {
-  if (!preUploadSelectAll) {
-    return;
-  }
-  if (!pendingUploadItems.length) {
-    preUploadSelectAll.checked = false;
-    preUploadSelectAll.indeterminate = false;
-    preUploadSelectAll.disabled = true;
-    return;
-  }
-
-  const selectedCount = pendingUploadItems.reduce(
-    (count, item) => count + (item.selectedForIndex ? 1 : 0),
-    0,
-  );
-  preUploadSelectAll.disabled = false;
-  preUploadSelectAll.checked = selectedCount === pendingUploadItems.length;
-  preUploadSelectAll.indeterminate = selectedCount > 0 && selectedCount < pendingUploadItems.length;
-}
-
-function renderPreUploadIndexSelection() {
-  if (!preUploadIndexPanel || !preUploadIndexList) {
-    return;
-  }
-
-  preUploadIndexList.innerHTML = "";
-  if (!pendingUploadItems.length) {
-    preUploadIndexPanel.hidden = true;
-    syncPreUploadSelectAllControl();
-    return;
-  }
-
-  preUploadIndexPanel.hidden = false;
-  pendingUploadItems.forEach((item) => {
-    const row = document.createElement("div");
-    row.className = "analysis-video-item";
-
-    const label = document.createElement("label");
-    label.className = "analysis-video-label";
-
-    const checkbox = document.createElement("input");
-    checkbox.type = "checkbox";
-    checkbox.className = "analysis-select-checkbox";
-    checkbox.checked = Boolean(item.selectedForIndex);
-    checkbox.dataset.sourceIndex = String(item.sourceIndex);
-    checkbox.addEventListener("change", () => {
-      item.selectedForIndex = Boolean(checkbox.checked);
-      syncPreUploadSelectAllControl();
-    });
-
-    const text = document.createElement("span");
-    text.className = "analysis-video-name";
-    text.textContent = item.name;
-
-    label.appendChild(checkbox);
-    label.appendChild(text);
-
-    const status = document.createElement("div");
-    status.className = "analysis-video-status";
-    if (item.isDuplicateExisting) {
-      status.classList.add("duplicate-existing");
-      status.textContent = `${formatBytes(item.sizeBytes)} | already in this case`;
-    } else {
-      status.textContent = formatBytes(item.sizeBytes);
-    }
-
-    row.appendChild(label);
-    row.appendChild(status);
-    preUploadIndexList.appendChild(row);
-  });
-
-  syncPreUploadSelectAllControl();
-}
-
-function refreshPendingUploadItemsFromInput() {
-  const files = Array.from(videoInput?.files || []);
-  const duplicateSet = new Set(
-    detectDuplicateUploadCandidates(files, state.activeCaseId).map(
-      (item) => Number(item.sourceIndex),
-    ),
-  );
-  const previousSelection = new Map(
-    pendingUploadItems.map((item) => [item.sourceKey, Boolean(item.selectedForIndex)]),
-  );
-  pendingUploadItems = files.map((file, sourceIndex) => {
-    const sourceKey = makePendingUploadSourceKey(file, sourceIndex);
-    const selectedForIndex = previousSelection.has(sourceKey)
-      ? Boolean(previousSelection.get(sourceKey))
-      : true;
-    return {
-      sourceIndex,
-      sourceKey,
-      name: String(file?.name || ""),
-      sizeBytes: Number(file?.size || 0),
-      isDuplicateExisting: duplicateSet.has(sourceIndex),
-      selectedForIndex,
-    };
-  });
-  renderPreUploadIndexSelection();
-}
-
-function clearPendingUploadItems() {
-  pendingUploadItems = [];
-  renderPreUploadIndexSelection();
-}
-
-function refreshPendingUploadDuplicateFlags(caseId = null) {
-  const activeCaseId = String(caseId || state.activeCaseId || "").trim();
-  if (!activeCaseId || !pendingUploadItems.length) {
-    return;
-  }
-  const files = Array.from(videoInput?.files || []);
-  if (!files.length) {
-    return;
-  }
-  const duplicateSet = new Set(
-    detectDuplicateUploadCandidates(files, activeCaseId).map((item) => Number(item.sourceIndex)),
-  );
-  pendingUploadItems.forEach((item) => {
-    item.isDuplicateExisting = duplicateSet.has(Number(item.sourceIndex));
-  });
-  renderPreUploadIndexSelection();
-}
-
-function setAllPendingUploadSelection(checked) {
-  pendingUploadItems.forEach((item) => {
-    item.selectedForIndex = Boolean(checked);
-  });
-  renderPreUploadIndexSelection();
-}
-
-function getSelectedPendingUploadSourceIndices(files) {
-  const fileCount = Array.isArray(files) ? files.length : 0;
-  if (!fileCount) {
-    return new Set();
-  }
-
-  if (pendingUploadItems.length !== fileCount) {
-    return new Set(Array.from({ length: fileCount }, (_, index) => index));
-  }
-
-  const selected = new Set();
-  pendingUploadItems.forEach((item) => {
-    if (item.selectedForIndex) {
-      selected.add(Number(item.sourceIndex));
-    }
-  });
-  return selected;
-}
-
-function resolveSelectedSemanticIndexTargets(uploadResult, selectedSourceIndices, files) {
-  const uploadedItems = Array.isArray(uploadResult?.uploaded_items)
-    ? uploadResult.uploaded_items
-    : [];
-  const uploadedNames = Array.isArray(uploadResult?.uploaded) ? uploadResult.uploaded : [];
-  const targets = [];
-  const seen = new Set();
-
-  for (const item of uploadedItems) {
-    const sourceIndex = Number(item?.source_index);
-    const storedFilename = String(item?.stored_filename || "").trim();
-    if (!Number.isFinite(sourceIndex) || !storedFilename) {
-      continue;
-    }
-    if (!selectedSourceIndices.has(sourceIndex) || seen.has(storedFilename)) {
-      continue;
-    }
-    seen.add(storedFilename);
-    targets.push(storedFilename);
-  }
-
-  if (targets.length > 0) {
-    return targets;
-  }
-
-  const selectedSourceNames = new Set(
-    files
-      .map((file, sourceIndex) => ({ file, sourceIndex }))
-      .filter((item) => selectedSourceIndices.has(item.sourceIndex))
-      .map((item) => String(item.file?.name || "").trim())
-      .filter(Boolean),
-  );
-
-  for (const uploadedName of uploadedNames) {
-    const normalized = String(uploadedName || "").trim();
-    if (!normalized || seen.has(normalized)) {
-      continue;
-    }
-    if (selectedSourceNames.has(normalized)) {
-      seen.add(normalized);
-      targets.push(normalized);
-    }
-  }
-
-  if (
-    targets.length === 0
-    && selectedSourceIndices.size === files.length
-    && selectedSourceIndices.size > 0
-  ) {
-    for (const uploadedName of uploadedNames) {
-      const normalized = String(uploadedName || "").trim();
-      if (!normalized || seen.has(normalized)) {
-        continue;
-      }
-      seen.add(normalized);
-      targets.push(normalized);
-    }
-  }
-
-  return targets;
-}
-
 function isVideoSemanticallyIndexed(video) {
   const contract = video && typeof video.media_contract === "object" ? video.media_contract : null;
   const lifecycle = contract && typeof contract.lifecycle === "object" ? contract.lifecycle : null;
@@ -1158,6 +961,55 @@ function getActiveQueuedOrRunningIndexFilenames(caseId) {
   if (currentFilename) {
     queued.add(currentFilename);
   }
+  return queued;
+}
+
+function getActiveQueuedOrRunningAnalysisFilenames(caseId, category) {
+  const normalizedCaseId = String(caseId || "").trim();
+  if (!normalizedCaseId) {
+    return new Set();
+  }
+  const normalizedCategory = normalizeAnalysisCategory(category);
+  const activeField = normalizedCategory === "vehicles"
+    ? "active_analysis_vehicles_filenames"
+    : "active_analysis_face_people_filenames";
+  const statusSources = [
+    getAnalysisQueueStatusCache("face_people", normalizedCaseId),
+    getAnalysisQueueStatusCache("vehicles", normalizedCaseId),
+  ];
+  const queued = new Set();
+
+  statusSources.forEach((statusPayload) => {
+    if (!statusPayload || typeof statusPayload !== "object") {
+      return;
+    }
+    const explicitActive = normalizeStringList(statusPayload?.[activeField]);
+    explicitActive.forEach((filename) => {
+      queued.add(filename);
+    });
+
+    // Compatibility fallback for older payloads that don't expose active_* lists.
+    if (explicitActive.length > 0) {
+      return;
+    }
+    const analysis = statusPayload?.analysis && typeof statusPayload.analysis === "object"
+      ? statusPayload.analysis
+      : {};
+    const hasCategoryMode = normalizedCategory === "vehicles"
+      ? Boolean(analysis.vehicles)
+      : Boolean(analysis.face_people) || Boolean(analysis.face_identity);
+    if (!hasCategoryMode) {
+      return;
+    }
+    const queueJobId = Math.max(0, Number(statusPayload?.queue?.job_id || 0));
+    if (!isAnalysisQueueRunning(statusPayload, queueJobId)) {
+      return;
+    }
+    activeCaseFilenamesFromPayload(statusPayload).forEach((filename) => {
+      queued.add(filename);
+    });
+  });
+
   return queued;
 }
 
@@ -1745,6 +1597,10 @@ function openAnalysisQueueSummaryPopup(category) {
     return;
   }
   const queue = payload.queue && typeof payload.queue === "object" ? payload.queue : {};
+  const queueJobKind = String(
+    queue.job_kind
+    || (normalizedCategory === "vehicles" ? "analysis_vehicles" : "analysis_face_people"),
+  ).trim().toLowerCase();
   const analysis = payload.analysis && typeof payload.analysis === "object" ? payload.analysis : {};
   const analysisFaceIdentity = Boolean(analysis.face_identity);
   const facePeopleFilenames = Array.isArray(payload.analysis_face_people_filenames)
@@ -1761,7 +1617,7 @@ function openAnalysisQueueSummaryPopup(category) {
     case_id: caseId,
     status: String(queue.status || payload.status || ""),
     queue_job_id: Number(queue.job_id || 0),
-    job_kind: "analysis",
+    job_kind: queueJobKind || "analysis_face_people",
     queue_position: Number(queue.position_ahead || 0),
     priority: Number(queue.priority || 0),
     attempt_count: Number(queue.attempt_count || 0),
@@ -1785,8 +1641,73 @@ function normalizeAnalysisCategory(category) {
   return category === "vehicles" ? "vehicles" : "face_people";
 }
 
+function normalizeAnalysisRunMode(mode) {
+  const normalized = String(mode || "").trim().toLowerCase();
+  if (normalized === "face_identity_topup") {
+    return "face_identity_topup";
+  }
+  return "standard";
+}
+
 function analysisCategoryLabel(category) {
   return normalizeAnalysisCategory(category) === "vehicles" ? "Vehicles" : "Face & People";
+}
+
+function isFaceIdentityReadyStatus(status) {
+  const normalized = String(status || "").trim().toLowerCase();
+  return normalized === "processed" || normalized === "completed";
+}
+
+function eligibleAnalysisFilenamesForRun(caseId, category, mode, selectedFilenames) {
+  const normalizedCaseId = String(caseId || "").trim();
+  const normalizedCategory = normalizeAnalysisCategory(category);
+  const normalizedMode = normalizeAnalysisRunMode(mode);
+  const selected = normalizeStringList(selectedFilenames);
+  if (!normalizedCaseId || !selected.length) {
+    return [];
+  }
+
+  const videos = getCaseVideos(normalizedCaseId);
+  const videoByFilename = new Map();
+  videos.forEach((video) => {
+    const filename = String(video?.filename || "").trim();
+    if (!filename) {
+      return;
+    }
+    videoByFilename.set(filename, video);
+  });
+
+  const eligible = [];
+  selected.forEach((filename) => {
+    const video = videoByFilename.get(filename);
+    if (!video || typeof video !== "object") {
+      return;
+    }
+    const analysis = normalizedVideoAnalysis(video);
+    if (normalizedCategory === "vehicles") {
+      if (!Boolean(analysis.vehicles.processed)) {
+        eligible.push(filename);
+      }
+      return;
+    }
+
+    const face01Ready = Boolean(analysis.face_people.processed);
+    const faceIdentity = normalizedFaceIdentityAnalysis(video);
+    const face02Ready = isFaceIdentityReadyStatus(faceIdentity.status);
+
+    if (normalizedMode === "face_identity_topup") {
+      if (face01Ready && !face02Ready) {
+        eligible.push(filename);
+      }
+      return;
+    }
+
+    if (!face01Ready) {
+      eligible.push(filename);
+    }
+  });
+
+  return normalizeStringList(eligible);
 }
 
 function setCategoryAnalysisStatus(category, message, kind = "") {
@@ -2103,6 +2024,7 @@ function renderAnalysisQueueStatus(category, caseId, statusPayload, options = {}
 
   setAnalysisQueueStatusCache(normalizedCategory, normalizedCaseId, statusPayload);
   updateAnalysisQueueSummaryButton(normalizedCategory, normalizedCaseId, statusPayload);
+  renderAnalysisSelectionLists();
 
   const formatted = formatAnalysisQueueStatusMessage(normalizedCategory, statusPayload, {
     jobId: Math.max(0, Number(options?.jobId || 0)),
@@ -2152,6 +2074,9 @@ async function syncAnalysisQueueStatus(caseId, category, options = {}) {
     }
     setAnalysisQueueStatusCache(normalizedCategory, normalizedCaseId, null);
     updateAnalysisQueueSummaryButton(normalizedCategory, normalizedCaseId, null);
+    if (state.activeCaseId === normalizedCaseId) {
+      renderAnalysisSelectionLists();
+    }
     stopAnalysisStatusPolling(normalizedCategory);
     return null;
   }
@@ -2159,6 +2084,9 @@ async function syncAnalysisQueueStatus(caseId, category, options = {}) {
   if (!statusPayload || typeof statusPayload !== "object") {
     setAnalysisQueueStatusCache(normalizedCategory, normalizedCaseId, null);
     updateAnalysisQueueSummaryButton(normalizedCategory, normalizedCaseId, null);
+    if (state.activeCaseId === normalizedCaseId) {
+      renderAnalysisSelectionLists();
+    }
     stopAnalysisStatusPolling(normalizedCategory);
     return null;
   }
@@ -2362,12 +2290,37 @@ function normalizedFaceIdentityAnalysis(video) {
     payload.face_identity && typeof payload.face_identity === "object" ? payload.face_identity : {};
   const pipeline = video && typeof video.pipeline === "object" ? video.pipeline : {};
   const stages = pipeline && typeof pipeline.stages === "object" ? pipeline.stages : {};
-  const analysisStage =
+  const facePeopleStage = (
+    stages
+    && stages.analysis_face_people
+    && typeof stages.analysis_face_people === "object"
+  ) ? stages.analysis_face_people : {};
+  const faceIdentityStage = (
+    stages
+    && stages.analysis_face_identity
+    && typeof stages.analysis_face_identity === "object"
+  ) ? stages.analysis_face_identity : {};
+  const legacyAnalysisStage =
     stages && stages.analysis && typeof stages.analysis === "object" ? stages.analysis : {};
-  const details = analysisStage && typeof analysisStage.details === "object" ? analysisStage.details : {};
+  const facePeopleDetails = (
+    facePeopleStage && typeof facePeopleStage.details === "object"
+  ) ? facePeopleStage.details : {};
+  const faceIdentityDetails = (
+    faceIdentityStage && typeof faceIdentityStage.details === "object"
+  ) ? faceIdentityStage.details : {};
+  const legacyDetails = (
+    legacyAnalysisStage && typeof legacyAnalysisStage.details === "object"
+  ) ? legacyAnalysisStage.details : {};
+  const details = {
+    ...legacyDetails,
+    ...facePeopleDetails,
+    ...faceIdentityDetails,
+  };
   const metadata = pipeline && typeof pipeline.metadata === "object" ? pipeline.metadata : {};
 
-  const stageStatus = String(analysisStage.status || "").trim().toLowerCase();
+  const stageStatus = String(
+    faceIdentityStage.status || facePeopleStage.status || legacyAnalysisStage.status || "",
+  ).trim().toLowerCase();
   const explicitStatus = String(faceIdentity.status || details.face_identity_status || "").trim().toLowerCase();
   const requestedFromDetails = Boolean(details.analysis_face_identity);
   const requestedFromMetadata = Boolean(metadata.analysis_face_identity);
@@ -2511,14 +2464,26 @@ function setCaseUrl(caseId) {
 
 function queueJobKindLabel(jobKind, processItem = null) {
   const kind = String(jobKind || "").trim().toLowerCase();
+  const metadata = processItem && typeof processItem.metadata === "object" ? processItem.metadata : {};
   if (kind === "semantic_index") {
     return "Semantic Index";
   }
   if (kind === "triage_timeline") {
     return "Triage Timeline";
   }
+  if (kind === "analysis_face_people") {
+    const faceIdentityEnabled = Boolean(metadata.analysis_face_identity);
+    return faceIdentityEnabled
+      ? "Analysis (Face & People + Face Identity)"
+      : "Analysis (Face & People)";
+  }
+  if (kind === "analysis_face_identity") {
+    return "Analysis (Face Identity Top-up)";
+  }
+  if (kind === "analysis_vehicles") {
+    return "Analysis (Vehicles)";
+  }
   if (kind === "analysis") {
-    const metadata = processItem && typeof processItem.metadata === "object" ? processItem.metadata : {};
     const modesLabel = analysisModesLabelFromFlags(
       Boolean(metadata.analysis_face_people),
       Boolean(metadata.analysis_vehicles),
@@ -2593,6 +2558,15 @@ function queueTaskStageNameFromItem(item) {
   const kind = String(item?.job_kind || "").trim().toLowerCase();
   if (kind === "semantic_index") {
     return "base_index";
+  }
+  if (kind === "analysis_face_people") {
+    return "analysis_face_people";
+  }
+  if (kind === "analysis_face_identity") {
+    return "analysis_face_identity";
+  }
+  if (kind === "analysis_vehicles") {
+    return "analysis_vehicles";
   }
   if (kind === "analysis") {
     return "analysis";
@@ -2694,6 +2668,29 @@ function expandQueueRowsByAnalysisModes(item, rows) {
     if (!row || typeof row !== "object") {
       return row;
     }
+    if (jobKind === "analysis_face_people") {
+      const metadata = item?.metadata && typeof item.metadata === "object" ? item.metadata : {};
+      const chips = [{ label: "Face & People", key: "face_people" }];
+      if (Boolean(metadata.analysis_face_identity)) {
+        chips.push({ label: "Face Identity", key: "face_identity" });
+      }
+      return {
+        ...row,
+        analysisModes: chips,
+      };
+    }
+    if (jobKind === "analysis_face_identity") {
+      return {
+        ...row,
+        analysisModes: [{ label: "Face Identity", key: "face_identity" }],
+      };
+    }
+    if (jobKind === "analysis_vehicles") {
+      return {
+        ...row,
+        analysisModes: [{ label: "Vehicles", key: "vehicles" }],
+      };
+    }
     if (jobKind !== "analysis") {
       return {
         ...row,
@@ -2740,7 +2737,14 @@ function queueTaskPhaseLabel(phase, phaseLabel) {
     .replace(/\b[a-z]/g, (char) => char.toUpperCase());
 }
 
-const QUEUE_ACTIONABLE_KINDS = new Set(["semantic_index", "analysis", "triage_timeline"]);
+const QUEUE_ACTIONABLE_KINDS = new Set([
+  "semantic_index",
+  "analysis",
+  "analysis_face_people",
+  "analysis_face_identity",
+  "analysis_vehicles",
+  "triage_timeline",
+]);
 
 function queueTaskNormalizedJobKind(item) {
   return String(item?.job_kind || "")
@@ -3182,6 +3186,7 @@ function queueTaskPopupConfigureRecovery(item, rows) {
     mode: "analysis_recovery",
     caseId: String(item?.case_id || "").trim(),
     category,
+    jobKind: String(item?.job_kind || "").trim().toLowerCase(),
     jobId: Math.max(0, Number(item?.queue_job_id || 0)),
     filenames: uniqueFilenames,
     selected: new Set(uniqueFilenames),
@@ -3193,8 +3198,9 @@ function queueTaskPopupConfigureRecovery(item, rows) {
   });
   queueTaskPopupRecovery.removeAttribute("hidden");
   queueTaskPopupUpdateRecoverySelectionMeta();
+  const recoveryKindLabel = queueJobKindLabel(item?.job_kind, item) || `${analysisCategoryLabel(category)} Analysis`;
   queueTaskPopupSetRecoveryStatus(
-    `Interrupted ${analysisCategoryLabel(category)} analysis: select files to restart or cancel.`,
+    `Interrupted ${recoveryKindLabel}: select files to restart or cancel.`,
     "working",
   );
 }
@@ -3609,6 +3615,7 @@ function openQueueTaskPopup(item) {
     const analysisModes = analysisModesLabelFromFlags(
       Boolean(metadata.analysis_face_people),
       Boolean(metadata.analysis_vehicles),
+      Boolean(metadata.analysis_face_identity),
     );
     const analysisModePart = analysisModes ? ` | modes: ${analysisModes}` : "";
     const addedLabel = formatQueueTimestamp(item?.enqueued_at || "");
@@ -3760,12 +3767,15 @@ async function listInterruptedAnalysisQueueItems(caseId) {
     const vehiclesFilenames = Array.isArray(payload.analysis_vehicles_filenames)
       ? payload.analysis_vehicles_filenames
       : [];
+    const faceIdentityFilenames = Array.isArray(payload.analysis_face_identity_filenames)
+      ? payload.analysis_face_identity_filenames
+      : [];
     output.push({
       type: "analysis_interrupted",
       case_id: normalizedCaseId,
       status: "interrupted",
       queue_job_id: Number(queue.job_id || 0),
-      job_kind: "analysis",
+      job_kind: String(queue.job_kind || "analysis_face_people").trim().toLowerCase(),
       queue_position: Number(queue.position_ahead || 0),
       priority: Number(queue.priority || 0),
       attempt_count: Number(queue.attempt_count || 0),
@@ -3778,6 +3788,7 @@ async function listInterruptedAnalysisQueueItems(caseId) {
         analysis_face_identity: analysisFaceIdentity,
         analysis_face_people_filenames: facePeopleFilenames,
         analysis_vehicles_filenames: vehiclesFilenames,
+        analysis_face_identity_filenames: faceIdentityFilenames,
       },
       file_progress: Array.isArray(payload.file_progress) ? payload.file_progress : [],
       recovery_category: normalizedCategory,
@@ -3873,6 +3884,7 @@ function renderReportQueueList(processesPayload, options = {}) {
       const analysisModes = analysisModesLabelFromFlags(
         Boolean(metadata.analysis_face_people),
         Boolean(metadata.analysis_vehicles),
+        Boolean(metadata.analysis_face_identity),
       );
       const analysisModePart = analysisModes ? ` | modes: ${analysisModes}` : "";
       meta.textContent =
@@ -3934,6 +3946,113 @@ function dedupeReportQueueItems(processItems) {
   });
 }
 
+function collapseCompletedQueueItemsBySubmission(processItems) {
+  const items = Array.isArray(processItems) ? processItems : [];
+  if (!items.length) {
+    return [];
+  }
+
+  const grouped = new Map();
+  const output = [];
+  items.forEach((item) => {
+    const type = String(item?.type || "").trim().toLowerCase();
+    const metadata = item?.metadata && typeof item.metadata === "object" ? item.metadata : {};
+    const submissionId = String(item?.submission_id || metadata.submission_id || "").trim();
+    if (type !== "queue_job_completed" || !submissionId) {
+      output.push(item);
+      return;
+    }
+
+    const caseId = String(item?.case_id || "").trim();
+    const jobKind = String(item?.job_kind || "").trim().toLowerCase();
+    const key = `${caseId}\u0000${jobKind}\u0000${submissionId}`;
+    if (!grouped.has(key)) {
+      const clone = {
+        ...item,
+        submission_id: submissionId,
+        submission_created_at: String(
+          item?.submission_created_at || metadata.submission_created_at || "",
+        ).trim(),
+        submission_kind: String(
+          item?.submission_kind || metadata.submission_kind || jobKind,
+        ).trim().toLowerCase(),
+        metadata: {
+          ...metadata,
+          submission_id: submissionId,
+          submission_created_at: String(
+            item?.submission_created_at || metadata.submission_created_at || "",
+          ).trim(),
+          submission_kind: String(
+            item?.submission_kind || metadata.submission_kind || jobKind,
+          ).trim().toLowerCase(),
+        },
+      };
+      grouped.set(key, clone);
+      output.push(clone);
+      return;
+    }
+
+    const aggregate = grouped.get(key);
+    if (!aggregate || typeof aggregate !== "object") {
+      return;
+    }
+    const aggregateMetadata = aggregate?.metadata && typeof aggregate.metadata === "object"
+      ? aggregate.metadata
+      : {};
+    const incomingMetadata = metadata;
+
+    const mergedFilenames = normalizeStringList([
+      ...normalizeStringList(aggregate.filenames),
+      ...normalizeStringList(item?.filenames),
+    ]);
+    aggregate.filenames = mergedFilenames;
+    aggregate.filenames_count = mergedFilenames.length;
+    aggregate.filenames_preview = mergedFilenames.slice(0, 5);
+    aggregate.queue_job_id = Math.max(
+      0,
+      Number(aggregate?.queue_job_id || 0),
+      Number(item?.queue_job_id || 0),
+    );
+    aggregate.attempt_count = Math.max(0, Number(aggregate?.attempt_count || 0))
+      + Math.max(0, Number(item?.attempt_count || 0));
+    const aggregateStatus = String(aggregate?.status || "").trim().toLowerCase();
+    const incomingStatus = String(item?.status || "").trim().toLowerCase();
+    if (aggregateStatus !== incomingStatus && incomingStatus) {
+      aggregate.status = "completed_with_errors";
+    }
+
+    aggregateMetadata.analysis_face_people = Boolean(aggregateMetadata.analysis_face_people)
+      || Boolean(incomingMetadata.analysis_face_people);
+    aggregateMetadata.analysis_vehicles = Boolean(aggregateMetadata.analysis_vehicles)
+      || Boolean(incomingMetadata.analysis_vehicles);
+    aggregateMetadata.analysis_face_identity = Boolean(aggregateMetadata.analysis_face_identity)
+      || Boolean(incomingMetadata.analysis_face_identity);
+    aggregateMetadata.analysis_only = Boolean(aggregateMetadata.analysis_only)
+      || Boolean(incomingMetadata.analysis_only);
+    aggregateMetadata.analysis_face_people_filenames = normalizeStringList([
+      ...normalizeStringList(aggregateMetadata.analysis_face_people_filenames),
+      ...normalizeStringList(incomingMetadata.analysis_face_people_filenames),
+    ]);
+    aggregateMetadata.analysis_vehicles_filenames = normalizeStringList([
+      ...normalizeStringList(aggregateMetadata.analysis_vehicles_filenames),
+      ...normalizeStringList(incomingMetadata.analysis_vehicles_filenames),
+    ]);
+    aggregateMetadata.analysis_face_identity_filenames = normalizeStringList([
+      ...normalizeStringList(aggregateMetadata.analysis_face_identity_filenames),
+      ...normalizeStringList(incomingMetadata.analysis_face_identity_filenames),
+    ]);
+    aggregateMetadata.submission_id = submissionId;
+    aggregateMetadata.submission_created_at = String(
+      aggregate?.submission_created_at || aggregateMetadata.submission_created_at || "",
+    ).trim();
+    aggregateMetadata.submission_kind = String(
+      aggregate?.submission_kind || aggregateMetadata.submission_kind || jobKind,
+    ).trim().toLowerCase();
+    aggregate.metadata = aggregateMetadata;
+  });
+  return output;
+}
+
 async function refreshReportQueue(options = {}) {
   const silent = Boolean(options?.silent);
   if (!reportQueueList) {
@@ -3959,7 +4078,9 @@ async function refreshReportQueue(options = {}) {
   const completedItemsRaw = Array.isArray(payload?.completed_processes)
     ? payload.completed_processes
     : [];
-  const completedItems = dedupeReportQueueItems(completedItemsRaw);
+  const completedItems = collapseCompletedQueueItemsBySubmission(
+    dedupeReportQueueItems(completedItemsRaw),
+  );
   const count = mergedItems.length;
   renderReportQueueList({
     ...payload,
@@ -4014,6 +4135,8 @@ async function restartInterruptedAnalysisFromPopup() {
   }
   const caseId = String(context.caseId || "").trim();
   const category = normalizeQueueTaskRecoveryCategory(context.category);
+  const recoveryJobKind = String(context.jobKind || "").trim().toLowerCase();
+  const isFaceIdentityTopupRecovery = recoveryJobKind === "analysis_face_identity";
   const filenames = queueTaskPopupSelectedFilenames();
   if (!caseId || !category) {
     queueTaskPopupSetRecoveryStatus("Recovery context is invalid.", "error");
@@ -4023,14 +4146,21 @@ async function restartInterruptedAnalysisFromPopup() {
     queueTaskPopupSetRecoveryStatus("Select one or more files first.", "error");
     return;
   }
-  const label = analysisCategoryLabel(category);
-  const confirmed = window.confirm(`Restart ${label} analysis for ${filenames.length} selected interrupted file(s)?`);
+  const label = isFaceIdentityTopupRecovery
+    ? "FACE-02 top-up"
+    : `${analysisCategoryLabel(category)} analysis`;
+  const confirmed = window.confirm(`Restart ${label} for ${filenames.length} selected interrupted file(s)?`);
   if (!confirmed) {
     return;
   }
 
   const frameInterval = Number.parseFloat(intervalInput?.value || "1");
   const safeFrameInterval = Number.isFinite(frameInterval) && frameInterval > 0 ? frameInterval : 2;
+  const requestFacePeople = category === "face_people" && !isFaceIdentityTopupRecovery;
+  const requestVehicles = category === "vehicles";
+  const requestFaceIdentity = category === "face_people"
+    ? (isFaceIdentityTopupRecovery || isFaceIdentityEnabledSetting())
+    : false;
   try {
     queueTaskPopupSetRecoveryStatus(`Queueing restart for ${filenames.length} file(s)...`, "working");
     const payload = await fetchJson("/analysis/start", {
@@ -4042,9 +4172,9 @@ async function restartInterruptedAnalysisFromPopup() {
         frame_interval_seconds: safeFrameInterval,
         batch_size: 32,
         force: false,
-        analysis_face_people: category === "face_people",
-        analysis_vehicles: category === "vehicles",
-        analysis_face_identity: category === "face_people" && isFaceIdentityEnabledSetting(),
+        analysis_face_people: requestFacePeople,
+        analysis_vehicles: requestVehicles,
+        analysis_face_identity: requestFaceIdentity,
       }),
     });
     const queueJobId = Math.max(0, Number(payload?.queue?.job_id || payload?.job_id || 0));
@@ -4300,6 +4430,10 @@ function applyWorkspaceView() {
   } else {
     stopReportQueuePolling();
   }
+
+  if (settingsActive || reportActive || queueActive) {
+    pauseAllAnalysisPlayers();
+  }
 }
 
 function setWorkspaceView(viewKey) {
@@ -4315,6 +4449,45 @@ function setWorkspaceView(viewKey) {
   applyWorkspaceView();
 }
 
+function pauseMediaPlayer(player) {
+  if (!player) {
+    return;
+  }
+  try {
+    player.pause();
+  } catch {
+    // Ignore transient media errors during rapid source switching.
+  }
+}
+
+function pauseAllAnalysisPlayers() {
+  pauseMediaPlayer(videoPlayer);
+  pauseMediaPlayer(triagePlayer);
+  pauseMediaPlayer(facePeoplePlayer);
+  pauseMediaPlayer(vehiclePlayer);
+  closeSemanticPopup();
+}
+
+function pauseInactiveMainTabPlayers(activeTab) {
+  const normalized =
+    activeTab === "triage" || activeTab === "face_people" || activeTab === "vehicles"
+      ? activeTab
+      : "semantic";
+  if (normalized !== "triage") {
+    pauseMediaPlayer(triagePlayer);
+  }
+  if (normalized !== "semantic") {
+    pauseMediaPlayer(videoPlayer);
+    closeSemanticPopup();
+  }
+  if (normalized !== "face_people") {
+    pauseMediaPlayer(facePeoplePlayer);
+  }
+  if (normalized !== "vehicles") {
+    pauseMediaPlayer(vehiclePlayer);
+  }
+}
+
 function setActiveMainTab(tabKey) {
   const normalized =
     tabKey === "triage" || tabKey === "face_people" || tabKey === "vehicles"
@@ -4322,6 +4495,7 @@ function setActiveMainTab(tabKey) {
       : "semantic";
   state.activeMainTab = normalized;
   renderMainTabs();
+  pauseInactiveMainTabPlayers(normalized);
 }
 
 function setPlaybackCache(caseId, filename, timestampSeconds) {
@@ -5337,10 +5511,17 @@ function setThresholdUiValue(value) {
   }
 }
 
-function searchKey(query, threshold, resultLimit) {
+function searchScopeCacheKey(filenames) {
+  return normalizeStringList(filenames)
+    .sort((left, right) => left.localeCompare(right))
+    .join("|");
+}
+
+function searchKey(query, threshold, resultLimit, filenames = []) {
   const thresholdKey = normalizeScoreThreshold(threshold, defaultSearchThreshold()).toFixed(2);
   const limitKey = normalizeResultLimit(resultLimit, defaultSearchResultLimit());
-  return `${query}\u0000${thresholdKey}\u0000${limitKey}`;
+  const scopeKey = searchScopeCacheKey(filenames);
+  return `${query}\u0000${thresholdKey}\u0000${limitKey}\u0000${scopeKey}`;
 }
 
 function ensureCaseSearchCache(caseId) {
@@ -5359,7 +5540,7 @@ function ensureCaseSearchCache(caseId) {
   return caseCache;
 }
 
-function cacheSearchResults(caseId, query, threshold, resultLimit, results, count) {
+function cacheSearchResults(caseId, query, threshold, resultLimit, filenames, results, count) {
   const caseCache = ensureCaseSearchCache(caseId);
   if (!caseCache) {
     return;
@@ -5367,12 +5548,14 @@ function cacheSearchResults(caseId, query, threshold, resultLimit, results, coun
   const normalizedQuery = String(query || "").trim();
   const normalizedThreshold = normalizeScoreThreshold(threshold, defaultSearchThreshold());
   const normalizedResultLimit = normalizeResultLimit(resultLimit, defaultSearchResultLimit());
-  const key = searchKey(normalizedQuery, normalizedThreshold, normalizedResultLimit);
+  const normalizedFilenames = normalizeStringList(filenames);
+  const key = searchKey(normalizedQuery, normalizedThreshold, normalizedResultLimit, normalizedFilenames);
   const normalizedResults = Array.isArray(results) ? results : [];
   caseCache.entries.set(key, {
     query: normalizedQuery,
     threshold: normalizedThreshold,
     resultLimit: normalizedResultLimit,
+    filenames: normalizedFilenames,
     results: normalizedResults,
     count: Number.isFinite(Number(count)) ? Number(count) : normalizedResults.length,
   });
@@ -5758,6 +5941,28 @@ async function loadCases() {
   }
   for (const category of ANALYSIS_CATEGORIES) {
     const cache = analysisStatusCacheMap(category);
+    if (!(cache instanceof Map)) {
+      continue;
+    }
+    for (const cachedCaseId of cache.keys()) {
+      if (!validCaseIds.has(cachedCaseId)) {
+        cache.delete(cachedCaseId);
+      }
+    }
+  }
+  for (const category of ANALYSIS_CATEGORIES) {
+    const cache = analysisSelectionCacheMap(category);
+    if (!(cache instanceof Map)) {
+      continue;
+    }
+    for (const cachedCaseId of cache.keys()) {
+      if (!validCaseIds.has(cachedCaseId)) {
+        cache.delete(cachedCaseId);
+      }
+    }
+  }
+  for (const category of SEARCH_SCOPE_CATEGORIES) {
+    const cache = searchScopeSelectionCacheMap(category);
     if (!(cache instanceof Map)) {
       continue;
     }
@@ -6326,7 +6531,8 @@ function playTriageAt(video, timestampSeconds, options = {}) {
     );
   }
   updateTriageTimelinePlayheads(safeTimestamp);
-  playVideoAt(video.filename, videoUrl, safeTimestamp, { autoPlay: shouldAutoPlay });
+  // Keep semantic player synchronized but never autoplay from triage interactions.
+  playVideoAt(video.filename, videoUrl, safeTimestamp, { autoPlay: false });
 }
 
 function createTriageTimelineRow({
@@ -6789,7 +6995,8 @@ async function selectTriageVideo(filename) {
     return;
   }
   triageSelection.set(state.activeCaseId, target);
-  const videoUrl = String(selectedVideo.video_url || "");
+  const fallbackVideoUrl = `/media/cases/${encodeURIComponent(state.activeCaseId)}/videos/${encodeURIComponent(selectedVideo.filename)}`;
+  const videoUrl = String(selectedVideo.video_url || fallbackVideoUrl);
   if (videoUrl && triagePlayer && triagePlayerMeta) {
     playInPlayer(
       triagePlayer,
@@ -6881,6 +7088,14 @@ async function loadTriageForVideo(caseId, filename, force = false) {
     });
     const cacheStatus = String(payload?.cache_status || "").toLowerCase();
     if (cacheStatus === "queued" || payload?.queued === true) {
+      const hasInlineTimeline = Boolean(
+        payload
+        && Array.isArray(payload?.activity_timeline?.values)
+        && Array.isArray(payload?.audio_timeline?.values),
+      );
+      if (hasInlineTimeline) {
+        setTriagePayload(normalizedCaseId, normalizedFilename, payload);
+      }
       deferLoadingClear = true;
       triageErrors.delete(key);
       if (normalizedCaseId === state.activeCaseId) {
@@ -6970,7 +7185,8 @@ async function refreshTriageList(force = false) {
   }
   const selectedVideo = videos.find((item) => item && item.filename === selected) || null;
   if (selectedVideo && triagePlayer && triagePlayerMeta) {
-    const selectedUrl = String(selectedVideo.video_url || "");
+    const fallbackSelectedUrl = `/media/cases/${encodeURIComponent(caseId)}/videos/${encodeURIComponent(selectedVideo.filename)}`;
+    const selectedUrl = String(selectedVideo.video_url || fallbackSelectedUrl);
     const currentFilename = String(triagePlayer.dataset.filename || "").trim();
     const hasSource = Boolean(String(triagePlayer.getAttribute("src") || "").trim());
     if (selectedUrl && (currentFilename !== selectedVideo.filename || !hasSource)) {
@@ -7004,6 +7220,13 @@ async function refreshTriageList(force = false) {
   }
   const cacheStatus = String(payload.cache_status || "").toLowerCase();
   if (cacheStatus === "queued" || payload.queued === true) {
+    if (payload?.stale === true) {
+      setTriageStatus(
+        `Showing last saved timeline for ${selected} while refresh is queued...`,
+        "working",
+      );
+      return;
+    }
     setTriageStatus(`Timeline queued for ${selected}. Waiting for worker...`, "working");
     return;
   }
@@ -7079,6 +7302,10 @@ function playInPlayer(
   player.preload = "auto";
 
   const seek = () => {
+    if (!autoPlay) {
+      // Prevent stale audio from continuing while seek/decode settles.
+      pauseMediaPlayer(player);
+    }
     const duration = Number.isFinite(player.duration) ? player.duration : null;
     const safeTime = duration && duration > 0
       ? Math.min(targetTime, Math.max(0, duration - 0.05))
@@ -7320,9 +7547,16 @@ function renderAnalysisSelectionList(container, category) {
   if (!container) {
     return;
   }
+  const activeCaseId = String(state.activeCaseId || "").trim();
+  const selector = `input.analysis-select-checkbox[data-category="${safeCategory}"]:checked`;
+  const persistedSelection = new Set(getAnalysisSelectionFilenames(safeCategory, activeCaseId));
+  Array.from(container.querySelectorAll(selector))
+    .map((input) => String(input.dataset.filename || "").trim())
+    .filter(Boolean)
+    .forEach((filename) => persistedSelection.add(filename));
   container.innerHTML = "";
 
-  if (!state.activeCaseId) {
+  if (!activeCaseId) {
     container.appendChild(
       createInsightEmptyElement("Select a case first."),
     );
@@ -7332,6 +7566,7 @@ function renderAnalysisSelectionList(container, category) {
 
   const videos = getCaseVideos();
   if (!videos.length) {
+    setAnalysisSelectionForCase(safeCategory, activeCaseId, []);
     container.appendChild(
       createInsightEmptyElement("No videos in this case yet."),
     );
@@ -7340,17 +7575,47 @@ function renderAnalysisSelectionList(container, category) {
   }
 
   const sortedVideos = [...videos].sort((a, b) => String(a.filename).localeCompare(String(b.filename)));
+  const activeQueuedOrRunning = getActiveQueuedOrRunningAnalysisFilenames(activeCaseId, safeCategory);
+  const allowedSelection = new Set();
   sortedVideos.forEach((video) => {
     const analysis = normalizedVideoAnalysis(video)[safeCategory];
+    const faceIdentity = normalizedFaceIdentityAnalysis(video);
+    const faceIdentityStatus = String(faceIdentity.status || "").trim().toLowerCase();
+    const faceIdentityReady = faceIdentityStatus === "processed" || faceIdentityStatus === "completed";
+    const safeFilename = String(video?.filename || "").trim();
+    const queuedOrRunning = Boolean(safeFilename) && activeQueuedOrRunning.has(safeFilename);
     const row = document.createElement("div");
     row.className = "analysis-video-item";
 
     const label = buildSelectionLabel(video, safeCategory);
     const checkbox = label.querySelector("input.analysis-select-checkbox");
     if (checkbox) {
-      checkbox.disabled = analysis.processed;
-      checkbox.checked = false;
+      const faceFullyReady = safeCategory === "face_people"
+        ? Boolean(analysis.processed && faceIdentityReady)
+        : false;
+      checkbox.disabled = safeCategory === "face_people"
+        ? Boolean(queuedOrRunning || faceFullyReady)
+        : Boolean(analysis.processed || queuedOrRunning);
+      const selectable = !checkbox.disabled && Boolean(safeFilename);
+      if (selectable) {
+        allowedSelection.add(safeFilename);
+      }
+      checkbox.checked = selectable && persistedSelection.has(safeFilename);
+      if (queuedOrRunning) {
+        checkbox.title = "Already queued/running for this analysis mode.";
+      } else if (safeCategory === "face_people" && faceFullyReady) {
+        checkbox.title = "Already FACE-01 + FACE-02 ready.";
+      } else if (safeCategory === "face_people" && analysis.processed && !faceIdentityReady) {
+        checkbox.title = "Eligible for FACE-02 top-up.";
+      } else if (analysis.processed) {
+        checkbox.title = "Already analyzed for this mode.";
+      } else if (safeCategory === "face_people") {
+        checkbox.title = "Eligible for FACE-01 analysis.";
+      } else {
+        checkbox.title = "";
+      }
       checkbox.addEventListener("change", () => {
+        syncAnalysisSelectionFromDom(safeCategory);
         syncAnalysisSelectAllControl(safeCategory);
       });
     }
@@ -7369,8 +7634,16 @@ function renderAnalysisSelectionList(container, category) {
 
       status.appendChild(face01);
       status.appendChild(face02);
+      if (queuedOrRunning) {
+        const queued = document.createElement("span");
+        queued.className = "analysis-status-chip chip-face02";
+        queued.textContent = "Queued/running";
+        status.appendChild(queued);
+      }
     } else {
-      if (analysis.processed) {
+      if (queuedOrRunning) {
+        status.textContent = "Queued/running";
+      } else if (analysis.processed) {
         status.textContent = `Done | vehicles ${analysis.vehicle_count} | first ${formatFirstHit(analysis.first_hit_seconds)}`;
       } else {
         status.textContent = "Not analyzed";
@@ -7380,6 +7653,11 @@ function renderAnalysisSelectionList(container, category) {
     row.appendChild(status);
     container.appendChild(row);
   });
+  setAnalysisSelectionForCase(
+    safeCategory,
+    activeCaseId,
+    Array.from(allowedSelection).filter((filename) => persistedSelection.has(filename)),
+  );
   syncAnalysisSelectAllControl(safeCategory);
 }
 
@@ -7469,8 +7747,9 @@ function renderWall(
   });
 }
 
-async function fetchAnalysisGallery(category, query = "") {
+async function fetchAnalysisGallery(category, query = "", filenames = null) {
   const caseId = ensureActiveCaseId();
+  const normalizedFilenames = normalizeStringList(filenames);
   const payload = await fetchJson("/analysis_gallery", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -7480,12 +7759,14 @@ async function fetchAnalysisGallery(category, query = "") {
       query: String(query || "").trim(),
       top_k: 180,
       limit: 500,
+      ...(normalizedFilenames.length ? { filenames: normalizedFilenames } : {}),
     }),
   });
   return payload && typeof payload === "object" ? payload : {};
 }
 
-async function refreshFacePeopleWall() {
+async function refreshFacePeopleWall(options = {}) {
+  const requireSelection = Boolean(options && options.requireSelection);
   if (!state.activeCaseId) {
     renderWall(faceWall, [], "Select a case first.", facePeoplePlayer, facePeoplePlayerMeta);
     renderWall(peopleWall, [], "Select a case first.", facePeoplePlayer, facePeoplePlayerMeta);
@@ -7493,7 +7774,20 @@ async function refreshFacePeopleWall() {
   }
   try {
     const query = String(facePeopleQueryInput?.value || "").trim();
-    const payload = await fetchAnalysisGallery("face_people", query);
+    const scopedFilenames = getSelectedSearchScopeFilenames("face_people");
+    if (!scopedFilenames.length) {
+      const emptyMessage = "No ready selected videos in Face & People Search Scope.";
+      renderWall(faceWall, [], emptyMessage, facePeoplePlayer, facePeoplePlayerMeta);
+      renderWall(peopleWall, [], emptyMessage, facePeoplePlayer, facePeoplePlayerMeta);
+      if (requireSelection) {
+        setAnalysisStatus(
+          "Select at least one ready video in Face & People Search Scope.",
+          "error",
+        );
+      }
+      return;
+    }
+    const payload = await fetchAnalysisGallery("face_people", query, scopedFilenames);
     const faces = Array.isArray(payload.faces) ? payload.faces : [];
     const people = Array.isArray(payload.people) ? payload.people : [];
     renderWall(
@@ -7515,14 +7809,24 @@ async function refreshFacePeopleWall() {
   }
 }
 
-async function refreshVehicleWall() {
+async function refreshVehicleWall(options = {}) {
+  const requireSelection = Boolean(options && options.requireSelection);
   if (!state.activeCaseId) {
     renderWall(vehicleWall, [], "Select a case first.", vehiclePlayer, vehiclePlayerMeta);
     return;
   }
   try {
     const query = String(vehicleQueryInput?.value || "").trim();
-    const payload = await fetchAnalysisGallery("vehicles", query);
+    const scopedFilenames = getSelectedSearchScopeFilenames("vehicles");
+    if (!scopedFilenames.length) {
+      const emptyMessage = "No ready selected videos in Vehicle Search Scope.";
+      renderWall(vehicleWall, [], emptyMessage, vehiclePlayer, vehiclePlayerMeta);
+      if (requireSelection) {
+        setVehicleStatus("Select at least one ready video in Vehicle Search Scope.", "error");
+      }
+      return;
+    }
+    const payload = await fetchAnalysisGallery("vehicles", query, scopedFilenames);
     const vehicles = Array.isArray(payload.vehicles) ? payload.vehicles : [];
     renderWall(
       vehicleWall,
@@ -7573,6 +7877,11 @@ async function runSuspectPhotoSearch() {
     setSuspectStatus("Select a probe image first.", "error");
     return;
   }
+  const scopedFilenames = getSelectedSearchScopeFilenames("face_people");
+  if (!scopedFilenames.length) {
+    setSuspectStatus("Select at least one ready video in Face & People Search Scope.", "error");
+    return;
+  }
 
   const selectedMode = String(suspectModeSelect?.value || "auto").trim().toLowerCase() || "auto";
   try {
@@ -7582,6 +7891,9 @@ async function runSuspectPhotoSearch() {
     formData.append("mode", selectedMode);
     formData.append("top_k", "180");
     formData.append("probe_image", probeFile);
+    scopedFilenames.forEach((filename) => {
+      formData.append("video_filenames", filename);
+    });
 
     const payload = await fetchJson("/suspect_photo_search", {
       method: "POST",
@@ -7614,22 +7926,21 @@ async function runSuspectPhotoSearch() {
 }
 
 async function runFacePeopleCropSearch() {
-  await refreshFacePeopleWall();
+  await refreshFacePeopleWall({ requireSelection: true });
 }
 
 async function runVehicleCropSearch() {
-  await refreshVehicleWall();
+  await refreshVehicleWall({ requireSelection: true });
 }
 
 function getSelectedInsightFilenames(category) {
-  const selector = `input.analysis-select-checkbox[data-category="${category}"]:checked`;
-  const roots = category === "vehicles" ? vehicleVideoSelectList : facePeopleVideoSelectList;
-  if (!roots) {
+  const safeCategory = normalizeAnalysisCategory(category);
+  const activeCaseId = String(state.activeCaseId || "").trim();
+  if (!activeCaseId) {
     return [];
   }
-  return Array.from(roots.querySelectorAll(selector))
-    .map((input) => String(input.dataset.filename || "").trim())
-    .filter((name) => Boolean(name));
+  syncAnalysisSelectionFromDom(safeCategory);
+  return getAnalysisSelectionFilenames(safeCategory, activeCaseId);
 }
 
 function getAnalysisSelectAllControl(category) {
@@ -7646,9 +7957,87 @@ function getAnalysisSelectionMetaElement(category) {
   return facePeopleAnalysisSelectionMeta;
 }
 
+function analysisSelectionCacheMap(category) {
+  const normalizedCategory = normalizeAnalysisCategory(category);
+  return analysisSelectionByCase[normalizedCategory];
+}
+
+function getAnalysisSelectionRoot(category) {
+  const safeCategory = normalizeAnalysisCategory(category);
+  return safeCategory === "vehicles" ? vehicleVideoSelectList : facePeopleVideoSelectList;
+}
+
+function getAnalysisSelectionSet(category, caseId = null, create = false) {
+  const normalizedCategory = normalizeAnalysisCategory(category);
+  const normalizedCaseId = String(caseId || state.activeCaseId || "").trim();
+  const cache = analysisSelectionCacheMap(normalizedCategory);
+  if (!cache || !normalizedCaseId) {
+    return null;
+  }
+  let selection = cache.get(normalizedCaseId);
+  if (!(selection instanceof Set)) {
+    if (!create) {
+      return null;
+    }
+    selection = new Set();
+    cache.set(normalizedCaseId, selection);
+  }
+  return selection;
+}
+
+function getAnalysisSelectionFilenames(category, caseId = null) {
+  const normalizedCaseId = String(caseId || state.activeCaseId || "").trim();
+  if (!normalizedCaseId) {
+    return [];
+  }
+  const selection = getAnalysisSelectionSet(category, normalizedCaseId, false);
+  if (!(selection instanceof Set) || !selection.size) {
+    return [];
+  }
+  return normalizeStringList(Array.from(selection));
+}
+
+function setAnalysisSelectionForCase(category, caseId, filenames) {
+  const normalizedCategory = normalizeAnalysisCategory(category);
+  const normalizedCaseId = String(caseId || state.activeCaseId || "").trim();
+  const cache = analysisSelectionCacheMap(normalizedCategory);
+  if (!cache || !normalizedCaseId) {
+    return;
+  }
+  const normalizedFilenames = normalizeStringList(
+    Array.isArray(filenames)
+      ? filenames
+      : filenames instanceof Set
+        ? Array.from(filenames)
+        : [],
+  );
+  if (!normalizedFilenames.length) {
+    cache.delete(normalizedCaseId);
+    return;
+  }
+  cache.set(normalizedCaseId, new Set(normalizedFilenames));
+}
+
+function syncAnalysisSelectionFromDom(category) {
+  const normalizedCategory = normalizeAnalysisCategory(category);
+  const activeCaseId = String(state.activeCaseId || "").trim();
+  if (!activeCaseId) {
+    return;
+  }
+  const root = getAnalysisSelectionRoot(normalizedCategory);
+  if (!root) {
+    return;
+  }
+  const selector = `input.analysis-select-checkbox[data-category="${normalizedCategory}"]:checked`;
+  const checkedFilenames = Array.from(root.querySelectorAll(selector))
+    .map((input) => String(input.dataset.filename || "").trim())
+    .filter(Boolean);
+  setAnalysisSelectionForCase(normalizedCategory, activeCaseId, checkedFilenames);
+}
+
 function getAnalysisSelectionCheckboxes(category) {
   const safeCategory = normalizeAnalysisCategory(category);
-  const root = safeCategory === "vehicles" ? vehicleVideoSelectList : facePeopleVideoSelectList;
+  const root = getAnalysisSelectionRoot(safeCategory);
   if (!root) {
     return [];
   }
@@ -7690,7 +8079,307 @@ function setAllAnalysisSelection(category, checked) {
   checkboxes.forEach((input) => {
     input.checked = Boolean(checked);
   });
+  syncAnalysisSelectionFromDom(safeCategory);
   syncAnalysisSelectAllControl(safeCategory);
+}
+
+function normalizeSearchScopeCategory(category) {
+  const normalized = String(category || "").trim().toLowerCase();
+  if (normalized === "semantic") {
+    return "semantic";
+  }
+  if (normalized === "vehicles") {
+    return "vehicles";
+  }
+  return "face_people";
+}
+
+function searchScopeSelectionCacheMap(category) {
+  const safeCategory = normalizeSearchScopeCategory(category);
+  return searchScopeSelectionByCase[safeCategory];
+}
+
+function getSearchScopeSelectionSet(category, caseId = null, create = false) {
+  const normalizedCategory = normalizeSearchScopeCategory(category);
+  const normalizedCaseId = String(caseId || state.activeCaseId || "").trim();
+  const cache = searchScopeSelectionCacheMap(normalizedCategory);
+  if (!cache || !normalizedCaseId) {
+    return null;
+  }
+  let selection = cache.get(normalizedCaseId);
+  if (!(selection instanceof Set)) {
+    if (!create) {
+      return null;
+    }
+    selection = new Set();
+    cache.set(normalizedCaseId, selection);
+  }
+  return selection;
+}
+
+function getSearchScopeSelectionFilenames(category, caseId = null) {
+  const normalizedCaseId = String(caseId || state.activeCaseId || "").trim();
+  if (!normalizedCaseId) {
+    return [];
+  }
+  const selection = getSearchScopeSelectionSet(category, normalizedCaseId, false);
+  if (!(selection instanceof Set) || !selection.size) {
+    return [];
+  }
+  return normalizeStringList(Array.from(selection));
+}
+
+function setSearchScopeSelectionForCase(category, caseId, filenames) {
+  const normalizedCategory = normalizeSearchScopeCategory(category);
+  const normalizedCaseId = String(caseId || state.activeCaseId || "").trim();
+  const cache = searchScopeSelectionCacheMap(normalizedCategory);
+  if (!cache || !normalizedCaseId) {
+    return;
+  }
+  const normalizedFilenames = normalizeStringList(
+    Array.isArray(filenames)
+      ? filenames
+      : filenames instanceof Set
+        ? Array.from(filenames)
+        : [],
+  );
+  if (!normalizedFilenames.length) {
+    cache.delete(normalizedCaseId);
+    return;
+  }
+  cache.set(normalizedCaseId, new Set(normalizedFilenames));
+}
+
+function getSearchScopeRoot(category) {
+  const normalizedCategory = normalizeSearchScopeCategory(category);
+  if (normalizedCategory === "semantic") {
+    return semanticSearchScopeList;
+  }
+  if (normalizedCategory === "vehicles") {
+    return vehicleSearchScopeList;
+  }
+  return facePeopleSearchScopeList;
+}
+
+function getSearchScopeSelectAllControl(category) {
+  const normalizedCategory = normalizeSearchScopeCategory(category);
+  if (normalizedCategory === "semantic") {
+    return semanticScopeSelectAll;
+  }
+  if (normalizedCategory === "vehicles") {
+    return vehicleScopeSelectAll;
+  }
+  return facePeopleScopeSelectAll;
+}
+
+function getSearchScopeSelectionMetaElement(category) {
+  const normalizedCategory = normalizeSearchScopeCategory(category);
+  if (normalizedCategory === "semantic") {
+    return semanticScopeSelectionMeta;
+  }
+  if (normalizedCategory === "vehicles") {
+    return vehicleScopeSelectionMeta;
+  }
+  return facePeopleScopeSelectionMeta;
+}
+
+function getSearchScopeCheckboxes(category) {
+  const safeCategory = normalizeSearchScopeCategory(category);
+  const root = getSearchScopeRoot(safeCategory);
+  if (!root) {
+    return [];
+  }
+  const selector = `input.search-scope-checkbox[data-category="${safeCategory}"]`;
+  return Array.from(root.querySelectorAll(selector))
+    .filter((input) => !input.disabled);
+}
+
+function syncSearchScopeSelectionFromDom(category) {
+  const normalizedCategory = normalizeSearchScopeCategory(category);
+  const activeCaseId = String(state.activeCaseId || "").trim();
+  if (!activeCaseId) {
+    return;
+  }
+  const root = getSearchScopeRoot(normalizedCategory);
+  if (!root) {
+    return;
+  }
+  const selector = `input.search-scope-checkbox[data-category="${normalizedCategory}"]:checked`;
+  const checkedFilenames = Array.from(root.querySelectorAll(selector))
+    .map((input) => String(input.dataset.filename || "").trim())
+    .filter(Boolean);
+  setSearchScopeSelectionForCase(normalizedCategory, activeCaseId, checkedFilenames);
+}
+
+function syncSearchScopeSelectAllControl(category) {
+  const safeCategory = normalizeSearchScopeCategory(category);
+  const selectAll = getSearchScopeSelectAllControl(safeCategory);
+  const meta = getSearchScopeSelectionMetaElement(safeCategory);
+  if (!selectAll || !meta) {
+    return;
+  }
+  const checkboxes = getSearchScopeCheckboxes(safeCategory);
+  if (!checkboxes.length) {
+    selectAll.checked = false;
+    selectAll.indeterminate = false;
+    selectAll.disabled = true;
+    meta.textContent = "0 selected";
+    return;
+  }
+  const selectedCount = checkboxes.reduce(
+    (count, input) => count + (input.checked ? 1 : 0),
+    0,
+  );
+  selectAll.disabled = false;
+  selectAll.checked = selectedCount === checkboxes.length;
+  selectAll.indeterminate = selectedCount > 0 && selectedCount < checkboxes.length;
+  meta.textContent = `${selectedCount} selected`;
+}
+
+function setAllSearchScopeSelection(category, checked) {
+  const safeCategory = normalizeSearchScopeCategory(category);
+  const checkboxes = getSearchScopeCheckboxes(safeCategory);
+  checkboxes.forEach((input) => {
+    input.checked = Boolean(checked);
+  });
+  syncSearchScopeSelectionFromDom(safeCategory);
+  syncSearchScopeSelectAllControl(safeCategory);
+}
+
+function isVideoReadyForSearchScope(video, category) {
+  const safeCategory = normalizeSearchScopeCategory(category);
+  if (safeCategory === "semantic") {
+    return isVideoSemanticallyIndexed(video);
+  }
+  const normalized = normalizedVideoAnalysis(video);
+  if (safeCategory === "vehicles") {
+    return Boolean(normalized.vehicles.processed);
+  }
+  return Boolean(normalized.face_people.processed);
+}
+
+function searchScopeStatusText(video, category, ready) {
+  const safeCategory = normalizeSearchScopeCategory(category);
+  if (safeCategory === "semantic") {
+    const indexedFrames = Math.max(0, Number(video?.indexed_frames || 0));
+    const indexedWindows = Math.max(0, Number(video?.indexed_windows || 0));
+    if (!ready) {
+      return `${formatBytes(video?.size_bytes)} | not indexed`;
+    }
+    return `${formatBytes(video?.size_bytes)} | indexed frames ${indexedFrames} | indexed windows ${indexedWindows}`;
+  }
+  const normalized = normalizedVideoAnalysis(video);
+  if (safeCategory === "vehicles") {
+    if (!ready) {
+      return "Vehicle analysis not run";
+    }
+    return `Ready | vehicles ${normalized.vehicles.vehicle_count} | first ${formatFirstHit(normalized.vehicles.first_hit_seconds)}`;
+  }
+  if (!ready) {
+    return "FACE-01 not run";
+  }
+  return `Ready | faces ${normalized.face_people.face_count} | people ${normalized.face_people.people_count}`;
+}
+
+function renderSearchScopeList(category) {
+  const safeCategory = normalizeSearchScopeCategory(category);
+  const container = getSearchScopeRoot(safeCategory);
+  if (!container) {
+    return;
+  }
+  const activeCaseId = String(state.activeCaseId || "").trim();
+  const selector = `input.search-scope-checkbox[data-category="${safeCategory}"]:checked`;
+  const existingSelection = getSearchScopeSelectionSet(safeCategory, activeCaseId, false);
+  const hasExistingSelection = existingSelection instanceof Set;
+  const persistedSelection = new Set(
+    hasExistingSelection ? normalizeStringList(Array.from(existingSelection)) : [],
+  );
+  Array.from(container.querySelectorAll(selector))
+    .map((input) => String(input.dataset.filename || "").trim())
+    .filter(Boolean)
+    .forEach((filename) => persistedSelection.add(filename));
+  container.innerHTML = "";
+
+  if (!activeCaseId) {
+    container.appendChild(createInsightEmptyElement("Select a case first."));
+    syncSearchScopeSelectAllControl(safeCategory);
+    return;
+  }
+
+  const videos = getCaseVideos(activeCaseId);
+  if (!videos.length) {
+    setSearchScopeSelectionForCase(safeCategory, activeCaseId, []);
+    container.appendChild(createInsightEmptyElement("No videos in this case yet."));
+    syncSearchScopeSelectAllControl(safeCategory);
+    return;
+  }
+
+  const sortedVideos = [...videos].sort((a, b) => String(a.filename).localeCompare(String(b.filename)));
+  const allowedReadyFilenames = [];
+  sortedVideos.forEach((video) => {
+    const safeFilename = String(video?.filename || "").trim();
+    const ready = Boolean(safeFilename) && isVideoReadyForSearchScope(video, safeCategory);
+    const row = document.createElement("div");
+    row.className = "analysis-video-item";
+
+    const label = document.createElement("label");
+    label.className = "analysis-video-label";
+
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.className = "analysis-select-checkbox search-scope-checkbox";
+    checkbox.dataset.category = safeCategory;
+    checkbox.dataset.filename = safeFilename;
+    checkbox.disabled = !ready;
+    checkbox.checked = ready && (hasExistingSelection ? persistedSelection.has(safeFilename) : true);
+    checkbox.title = ready ? "" : "Video is not ready for this search mode yet.";
+    checkbox.addEventListener("change", () => {
+      syncSearchScopeSelectionFromDom(safeCategory);
+      syncSearchScopeSelectAllControl(safeCategory);
+    });
+    if (ready) {
+      allowedReadyFilenames.push(safeFilename);
+    }
+
+    const text = document.createElement("span");
+    text.className = "analysis-video-name";
+    text.textContent = safeFilename;
+
+    label.appendChild(checkbox);
+    label.appendChild(text);
+
+    const status = document.createElement("div");
+    status.className = "analysis-video-status";
+    status.textContent = searchScopeStatusText(video, safeCategory, ready);
+
+    row.appendChild(label);
+    row.appendChild(status);
+    container.appendChild(row);
+  });
+
+  const allowedSet = new Set(allowedReadyFilenames);
+  const selectedFilenames = hasExistingSelection
+    ? allowedReadyFilenames.filter((filename) => persistedSelection.has(filename))
+    : allowedReadyFilenames;
+  const normalizedSelected = selectedFilenames.filter((filename) => allowedSet.has(filename));
+  setSearchScopeSelectionForCase(safeCategory, activeCaseId, normalizedSelected);
+  syncSearchScopeSelectAllControl(safeCategory);
+}
+
+function renderSearchScopeLists() {
+  SEARCH_SCOPE_CATEGORIES.forEach((category) => {
+    renderSearchScopeList(category);
+  });
+}
+
+function getSelectedSearchScopeFilenames(category) {
+  const safeCategory = normalizeSearchScopeCategory(category);
+  const activeCaseId = String(state.activeCaseId || "").trim();
+  if (!activeCaseId) {
+    return [];
+  }
+  syncSearchScopeSelectionFromDom(safeCategory);
+  return getSearchScopeSelectionFilenames(safeCategory, activeCaseId);
 }
 
 async function refreshVideos(caseId = null, expectedSwitchVersion = null, options = {}) {
@@ -7715,10 +8404,10 @@ async function refreshVideos(caseId = null, expectedSwitchVersion = null, option
   const videos = Array.isArray(payload.videos) ? payload.videos : [];
   state.caseVideos.set(String(resolvedCaseId), videos);
   renderVideoList(videos);
-  refreshPendingUploadDuplicateFlags(resolvedCaseId);
   renderTriagePanels();
   if (!skipFollowups && resolvedCaseId === state.activeCaseId) {
     renderAnalysisSelectionLists();
+    renderSearchScopeLists();
     await refreshAnalysisWalls();
     if (state.activeMainTab === "triage") {
       await refreshTriageList(false);
@@ -7731,7 +8420,8 @@ function playVideoAt(filename, videoUrl, timestampSeconds, options = {}) {
   if (!videoPlayer || !playerMeta) {
     return;
   }
-  const autoPlay = options.autoPlay !== false;
+  const requestedAutoPlay = options.autoPlay !== false;
+  const autoPlay = requestedAutoPlay && state.activeMainTab === "semantic";
   const targetTime = Math.max(0, Number(timestampSeconds) || 0);
   const activeCaseId = String(state.activeCaseId || "");
   playInPlayer(
@@ -8101,6 +8791,13 @@ async function deleteCase(caseId) {
     searchCache.delete(targetCaseId);
     state.caseVideos.delete(targetCaseId);
     videoSelectionByCase.delete(targetCaseId);
+    for (const category of ANALYSIS_CATEGORIES) {
+      analysisSelectionCacheMap(category)?.delete(targetCaseId);
+      analysisStatusCacheMap(category)?.delete(targetCaseId);
+    }
+    for (const category of SEARCH_SCOPE_CATEGORIES) {
+      searchScopeSelectionCacheMap(category)?.delete(targetCaseId);
+    }
     clearCaseTriageCache(targetCaseId);
     backgroundIndexTerminalSeen.delete(targetCaseId);
     markCaseStateChanged();
@@ -8143,20 +8840,11 @@ async function uploadAndIndex() {
     return;
   }
 
-  const frameInterval = Number.parseFloat(intervalInput.value);
-  if (!Number.isFinite(frameInterval) || frameInterval <= 0) {
-    hideTaskProgressUi();
-    setStatus("Frame interval must be greater than 0.", "error");
-    return;
-  }
-
   try {
     uploadFlowActive = true;
     stopBackgroundIndexPolling();
     const caseId = ensureActiveCaseId();
-    const selectedSourceIndicesOriginal = getSelectedPendingUploadSourceIndices(allFiles);
     let files = allFiles;
-    let selectedSourceIndices = new Set(selectedSourceIndicesOriginal);
     let duplicateSkippedCount = 0;
 
     setStatus("Checking selected files for duplicates...", "working");
@@ -8165,30 +8853,14 @@ async function uploadAndIndex() {
       const duplicateIndexSet = reviewDuplicateUploadCandidates(duplicateCandidates, allFiles);
       if (duplicateIndexSet.size > 0) {
         const filteredFiles = [];
-        const filteredSelectedIndices = new Set();
         for (let originalIndex = 0; originalIndex < allFiles.length; originalIndex += 1) {
           if (duplicateIndexSet.has(originalIndex)) {
             duplicateSkippedCount += 1;
             continue;
           }
-          const nextIndex = filteredFiles.length;
           filteredFiles.push(allFiles[originalIndex]);
-          if (selectedSourceIndicesOriginal.has(originalIndex)) {
-            filteredSelectedIndices.add(nextIndex);
-          }
         }
         files = filteredFiles;
-        selectedSourceIndices = filteredSelectedIndices;
-
-        if (pendingUploadItems.length === allFiles.length) {
-          pendingUploadItems.forEach((item) => {
-            const itemIndex = Number(item.sourceIndex);
-            if (duplicateIndexSet.has(itemIndex)) {
-              item.selectedForIndex = false;
-            }
-          });
-          renderPreUploadIndexSelection();
-        }
 
         if (!files.length) {
           hideTaskProgressUi();
@@ -8201,12 +8873,11 @@ async function uploadAndIndex() {
       }
     }
 
-    const selectedForIndexCount = selectedSourceIndices.size;
     const engineLabel = getLoadedEmbeddingEngineLabel();
     const totalUploadBytes = files.reduce((sum, file) => sum + Number(file.size || 0), 0);
     const uploadStartedAt = Date.now();
     setStatus(
-      `Transferring videos to ${caseId} (engine: ${engineLabel}) | semantic index selected: ${selectedForIndexCount}/${files.length}.`,
+      `Transferring videos to ${caseId} (engine: ${engineLabel}).`,
       "working",
     );
     const STEP1_LABEL = "Step 1/2: Upload ingest to server";
@@ -8216,7 +8887,6 @@ async function uploadAndIndex() {
       0,
       `${files.length} file(s) | ${formatBytes(totalUploadBytes)}`,
     );
-    const INDEX_QUEUE_STAGE = 100;
     const uploadSession = await resolveResumableUploadSession(caseId, files);
     const sessionId = String(uploadSession?.session?.session_id || "").trim();
     if (!sessionId) {
@@ -8237,7 +8907,7 @@ async function uploadAndIndex() {
     let transferredBytesForEta = sessionReceivedBytes;
     const resumedLabel = uploadSession?.resumed ? "resuming" : "starting";
     setStatus(
-      `Transferring videos to ${caseId} (engine: ${engineLabel}) | semantic index selected: ${selectedForIndexCount}/${files.length} | ${resumedLabel} resumable upload.`,
+      `Transferring videos to ${caseId} (engine: ${engineLabel}) | ${resumedLabel} resumable upload.`,
       "working",
     );
 
@@ -8490,7 +9160,7 @@ async function uploadAndIndex() {
     setTaskProgressUi(
       "Step 2/2 complete: Server convert/finalize",
       100,
-      "Preparing background indexing...",
+      "Finalizing upload summary...",
     );
     clearResumableUploadState();
 
@@ -8500,55 +9170,19 @@ async function uploadAndIndex() {
     const triageQueued = Array.isArray(uploadResult.triage_queued)
       ? uploadResult.triage_queued
       : [];
-    const selectedIndexTargets = resolveSelectedSemanticIndexTargets(
-      uploadResult,
-      selectedSourceIndices,
-      files,
-    );
 
     if (uploaded.length) {
       clearCaseTriageCache(caseId);
     }
     videoInput.value = "";
-    clearPendingUploadItems();
     await refreshVideos(caseId);
 
     const allErrors = [...errors];
-    let backgroundMessage = "No new videos queued for indexing.";
-    if (uploaded.length > 0 && selectedIndexTargets.length > 0) {
-      setTaskProgressUi(
-        "Queueing semantic indexing",
-        INDEX_QUEUE_STAGE,
-        `Preparing ${selectedIndexTargets.length} selected uploaded video(s) for background indexing...`,
-      );
-      try {
-        const startPayload = await fetchJson("/index/start", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            case_id: caseId,
-            filenames: selectedIndexTargets,
-            frame_interval_seconds: frameInterval,
-            batch_size: 32,
-            force: false,
-          }),
-        });
-        const started = Boolean(startPayload?.started);
-        if (started) {
-          backgroundMessage = `Background semantic indexing started for ${selectedIndexTargets.length} selected video(s).`;
-        } else {
-          backgroundMessage = String(startPayload?.message || "Background indexing already running.");
-        }
-        startBackgroundIndexPolling(caseId);
-      } catch (error) {
-        allErrors.push(`index start: ${formatError(error)}`);
-        backgroundMessage = "Upload finished, but background indexing failed to start.";
-      }
-    } else if (uploaded.length > 0) {
-      backgroundMessage = "Upload finished. No videos were selected for semantic indexing.";
-    }
+    const backgroundMessage = uploaded.length > 0
+      ? "Upload finished. Run Semantic Index from the Semantic Search tab when needed."
+      : "No new videos were uploaded.";
 
-    const summary = `Case ${caseId}: uploaded ${uploaded.length}, transcoded ${transcoded.length}, triage auto-queued ${triageQueued.length}, selected for semantic indexing ${selectedIndexTargets.length}, engine ${engineLabel}. ${backgroundMessage}`;
+    const summary = `Case ${caseId}: uploaded ${uploaded.length}, transcoded ${transcoded.length}, triage auto-queued ${triageQueued.length}, engine ${engineLabel}. ${backgroundMessage}`;
     const duplicateNote = duplicateSkippedCount > 0
       ? ` Skipped duplicate uploads: ${duplicateSkippedCount}.`
       : "";
@@ -8564,9 +9198,9 @@ async function uploadAndIndex() {
     uploadFlowActive = false;
     await syncBackgroundIndexStatus(caseId);
   } catch (error) {
-    setStatus(`Upload/index failed: ${formatError(error)}`, "error");
+    setStatus(`Upload failed: ${formatError(error)}`, "error");
     setTaskProgressUi(
-      "Upload/index failed",
+      "Upload failed",
       100,
       formatError(error),
     );
@@ -8649,13 +9283,18 @@ async function runExistingSemanticIndex() {
   }
 }
 
-async function runSelectedAnalysisForCategory(category) {
+async function runSelectedAnalysisForCategory(category, options = {}) {
   const normalizedCategory = normalizeAnalysisCategory(category);
+  const normalizedMode = normalizeAnalysisRunMode(options?.mode);
+  const isFaceIdentityTopup = normalizedMode === "face_identity_topup";
+  const actionLabel = isFaceIdentityTopup
+    ? "FACE-02 top-up"
+    : `${analysisCategoryLabel(normalizedCategory)} analysis`;
   const setCategoryStatus = (message, kind = "") => {
     setCategoryAnalysisStatus(normalizedCategory, message, kind);
   };
-  const filenames = getSelectedInsightFilenames(normalizedCategory);
-  if (!filenames.length) {
+  const selectedFilenames = getSelectedInsightFilenames(normalizedCategory);
+  if (!selectedFilenames.length) {
     const label = analysisCategoryLabel(normalizedCategory);
     setCategoryStatus(`Select one or more videos in the ${label} tab first.`, "error");
     return;
@@ -8669,18 +9308,46 @@ async function runSelectedAnalysisForCategory(category) {
     return;
   }
 
-  const label = analysisCategoryLabel(normalizedCategory);
-  const confirmed = window.confirm(`Run ${label} analysis for ${filenames.length} selected video(s)?`);
+  const eligibleFilenames = eligibleAnalysisFilenamesForRun(
+    caseId,
+    normalizedCategory,
+    normalizedMode,
+    selectedFilenames,
+  );
+  const skippedCount = Math.max(0, selectedFilenames.length - eligibleFilenames.length);
+  if (!eligibleFilenames.length) {
+    if (isFaceIdentityTopup) {
+      setCategoryStatus(
+        "No eligible files selected for FACE-02 top-up. Select files that are FACE-01 ready but FACE-02 not yet done.",
+        "error",
+      );
+    } else {
+      setCategoryStatus(
+        `No eligible files selected for ${actionLabel}. Already processed or currently queued.`,
+        "error",
+      );
+    }
+    return;
+  }
+
+  const confirmed = window.confirm(
+    `Run ${actionLabel} for ${eligibleFilenames.length} selected video(s)?`,
+  );
   if (!confirmed) {
     return;
   }
 
   const frameInterval = Number.parseFloat(intervalInput?.value || "1");
   const safeFrameInterval = Number.isFinite(frameInterval) && frameInterval > 0 ? frameInterval : 2;
+  const requestFacePeople = normalizedCategory === "face_people" && !isFaceIdentityTopup;
+  const requestVehicles = normalizedCategory === "vehicles";
+  const requestFaceIdentity = normalizedCategory === "face_people"
+    ? (isFaceIdentityTopup || isFaceIdentityEnabledSetting())
+    : false;
 
   try {
     setCategoryStatus(
-      `Queueing ${label} analysis for ${filenames.length} selected video(s)...`,
+      `Queueing ${actionLabel} for ${eligibleFilenames.length} selected video(s)...`,
       "working",
     );
     const payload = await fetchJson("/analysis/start", {
@@ -8688,13 +9355,13 @@ async function runSelectedAnalysisForCategory(category) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         case_id: caseId,
-        filenames,
+        filenames: eligibleFilenames,
         frame_interval_seconds: safeFrameInterval,
         batch_size: 32,
         force: false,
-        analysis_face_people: normalizedCategory === "face_people",
-        analysis_vehicles: normalizedCategory === "vehicles",
-        analysis_face_identity: normalizedCategory === "face_people" && isFaceIdentityEnabledSetting(),
+        analysis_face_people: requestFacePeople,
+        analysis_vehicles: requestVehicles,
+        analysis_face_identity: requestFaceIdentity,
       }),
     });
     const queue = payload && typeof payload.queue === "object" ? payload.queue : {};
@@ -8716,9 +9383,9 @@ async function runSelectedAnalysisForCategory(category) {
     if (message) {
       summaryParts.push(message);
     } else if (started) {
-      summaryParts.push(`${label} analysis queued.`);
+      summaryParts.push(`${actionLabel} queued.`);
     } else {
-      summaryParts.push(`${label} analysis queue updated.`);
+      summaryParts.push(`${actionLabel} queue updated.`);
     }
     if (queueAhead !== null) {
       summaryParts.push(`Queue ahead: ${queueAhead}.`);
@@ -8726,25 +9393,28 @@ async function runSelectedAnalysisForCategory(category) {
     if (queueId > 0) {
       summaryParts.push(`Job #${queueId}.`);
     }
+    if (skippedCount > 0) {
+      summaryParts.push(`${skippedCount} selected file(s) were not eligible and were skipped.`);
+    }
     setCategoryStatus(summaryParts.join(" "), "working");
     startAnalysisStatusPolling(caseId, normalizedCategory, { jobId: queueId });
     await refreshVideos(caseId);
   } catch (error) {
     if (isExactNotFoundError(error)) {
       setCategoryStatus(
-        "Queue endpoint missing on current backend build. Running direct analysis fallback...",
+        "Queue endpoint missing on current backend build. Running direct fallback...",
         "working",
       );
       let processedCount = 0;
       let skippedCount = 0;
       const failures = [];
-      for (let index = 0; index < filenames.length; index += 1) {
-        const filename = String(filenames[index] || "").trim();
+      for (let index = 0; index < eligibleFilenames.length; index += 1) {
+        const filename = String(eligibleFilenames[index] || "").trim();
         if (!filename) {
           continue;
         }
         setCategoryStatus(
-          `Running ${label} analysis (${index + 1}/${filenames.length})...`,
+          `Running ${actionLabel} (${index + 1}/${eligibleFilenames.length})...`,
           "working",
         );
         try {
@@ -8757,9 +9427,9 @@ async function runSelectedAnalysisForCategory(category) {
               frame_interval_seconds: safeFrameInterval,
               batch_size: 32,
               force: false,
-              analysis_face_people: normalizedCategory === "face_people",
-              analysis_vehicles: normalizedCategory === "vehicles",
-              analysis_face_identity: normalizedCategory === "face_people" && isFaceIdentityEnabledSetting(),
+              analysis_face_people: requestFacePeople,
+              analysis_vehicles: requestVehicles,
+              analysis_face_identity: requestFaceIdentity,
               analysis_only: true,
             }),
           });
@@ -8778,9 +9448,9 @@ async function runSelectedAnalysisForCategory(category) {
       }
 
       await refreshVideos(caseId);
-      await refreshInsightWalls();
+      await refreshAnalysisWalls();
 
-      const summary = `${label} analysis fallback completed: processed ${processedCount}, skipped ${skippedCount}, failed ${failures.length}.`;
+      const summary = `${actionLabel} fallback completed: processed ${processedCount}, skipped ${skippedCount}, failed ${failures.length}.`;
       if (failures.length) {
         setCategoryStatus(`${summary} Errors: ${failures.join(" | ")}`, "error");
       } else {
@@ -8789,7 +9459,7 @@ async function runSelectedAnalysisForCategory(category) {
       return;
     }
 
-    setCategoryStatus(`Run ${label} analysis failed: ${formatError(error)}`, "error");
+    setCategoryStatus(`Run ${actionLabel} failed: ${formatError(error)}`, "error");
   }
 }
 
@@ -8810,6 +9480,13 @@ async function runSearch() {
 
   try {
     const caseId = ensureActiveCaseId();
+    const scopedFilenames = getSelectedSearchScopeFilenames("semantic");
+    if (!scopedFilenames.length) {
+      setStatus("Select at least one ready video in Semantic Search Scope.", "error");
+      setSemanticSearchMeta("Select at least one ready video in Semantic Search Scope.", "error");
+      clearResults();
+      return;
+    }
     setStatus(`Searching in ${caseId}...`, "working");
     setSemanticSearchMeta("Analyzing query intent...", "working");
     const payload = await fetchJson("/search", {
@@ -8820,11 +9497,12 @@ async function runSearch() {
         query,
         top_k: resultLimit,
         min_score: threshold,
+        filenames: scopedFilenames,
       }),
     });
     const results = Array.isArray(payload.results) ? payload.results : [];
     renderResults(results);
-    cacheSearchResults(caseId, query, threshold, resultLimit, results, payload.count);
+    cacheSearchResults(caseId, query, threshold, resultLimit, scopedFilenames, results, payload.count);
     const intent = String(payload.intent || "").trim();
     const mode = String(payload.search_mode || "").trim();
     const engineLabel = formatEmbeddingEngineLabel(payload.embedding_engine);
@@ -9025,12 +9703,6 @@ function setupListeners() {
   });
 
   uploadBtn?.addEventListener("click", uploadAndIndex);
-  videoInput?.addEventListener("change", () => {
-    refreshPendingUploadItemsFromInput();
-  });
-  preUploadSelectAll?.addEventListener("change", () => {
-    setAllPendingUploadSelection(Boolean(preUploadSelectAll.checked));
-  });
   existingIndexSelectAll?.addEventListener("change", () => {
     setAllExistingIndexSelection(Boolean(existingIndexSelectAll.checked));
   });
@@ -9091,6 +9763,9 @@ function setupListeners() {
   runFacePeopleSelectedBtn?.addEventListener("click", () => {
     runSelectedAnalysisForCategory("face_people");
   });
+  runFaceIdentityTopupSelectedBtn?.addEventListener("click", () => {
+    runSelectedAnalysisForCategory("face_people", { mode: "face_identity_topup" });
+  });
   runVehiclesSelectedBtn?.addEventListener("click", () => {
     runSelectedAnalysisForCategory("vehicles");
   });
@@ -9099,6 +9774,15 @@ function setupListeners() {
   });
   vehicleAnalysisSelectAll?.addEventListener("change", () => {
     setAllAnalysisSelection("vehicles", Boolean(vehicleAnalysisSelectAll.checked));
+  });
+  semanticScopeSelectAll?.addEventListener("change", () => {
+    setAllSearchScopeSelection("semantic", Boolean(semanticScopeSelectAll.checked));
+  });
+  facePeopleScopeSelectAll?.addEventListener("change", () => {
+    setAllSearchScopeSelection("face_people", Boolean(facePeopleScopeSelectAll.checked));
+  });
+  vehicleScopeSelectAll?.addEventListener("change", () => {
+    setAllSearchScopeSelection("vehicles", Boolean(vehicleScopeSelectAll.checked));
   });
   mainTabTriageBtn?.addEventListener("click", async () => {
     setActiveMainTab("triage");
@@ -9256,6 +9940,7 @@ function setupListeners() {
 
   renderMainTabs();
   renderAnalysisSelectionLists();
+  renderSearchScopeLists();
   setTaskProgressStopCase("");
   listenersBound = true;
 }

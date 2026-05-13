@@ -451,6 +451,74 @@ class IndexQueueStoreTests(unittest.TestCase):
         )
         self.assertEqual(first["job_id"], second["job_id"])
 
+    def test_submission_id_isolation_when_appending_case_queued(self) -> None:
+        first = self.store.enqueue_or_get_active(
+            case_id="case_a",
+            filenames=["a.mp4"],
+            frame_interval_seconds=1.0,
+            batch_size=1,
+            force=False,
+            job_kind="triage_timeline",
+            priority=20,
+            metadata={
+                "submission_id": "upload-sub-1",
+                "submission_created_at": "2026-05-12T00:00:00+00:00",
+                "submission_kind": "triage_timeline",
+            },
+        )
+        second = self.store.enqueue_or_get_active(
+            case_id="case_a",
+            filenames=["b.mp4"],
+            frame_interval_seconds=1.0,
+            batch_size=1,
+            force=False,
+            job_kind="triage_timeline",
+            priority=20,
+            metadata={
+                "submission_id": "upload-sub-2",
+                "submission_created_at": "2026-05-12T00:01:00+00:00",
+                "submission_kind": "triage_timeline",
+            },
+        )
+        self.assertTrue(bool(second.get("created")))
+        self.assertNotEqual(int(first["job_id"]), int(second["job_id"]))
+
+    def test_same_submission_id_appends_into_single_case_queued_job(self) -> None:
+        first = self.store.enqueue_or_get_active(
+            case_id="case_a",
+            filenames=["a.mp4"],
+            frame_interval_seconds=1.0,
+            batch_size=1,
+            force=False,
+            job_kind="triage_timeline",
+            priority=20,
+            metadata={
+                "submission_id": "upload-sub-1",
+                "submission_created_at": "2026-05-12T00:00:00+00:00",
+                "submission_kind": "triage_timeline",
+            },
+        )
+        second = self.store.enqueue_or_get_active(
+            case_id="case_a",
+            filenames=["b.mp4"],
+            frame_interval_seconds=1.0,
+            batch_size=1,
+            force=False,
+            job_kind="triage_timeline",
+            priority=20,
+            metadata={
+                "submission_id": "upload-sub-1",
+                "submission_created_at": "2026-05-12T00:00:00+00:00",
+                "submission_kind": "triage_timeline",
+            },
+        )
+        self.assertFalse(bool(second.get("created")))
+        self.assertEqual(str(second.get("reason")), "appended_case_active_job")
+        self.assertEqual(int(first["job_id"]), int(second["job_id"]))
+        payload = second.get("payload") if isinstance(second.get("payload"), dict) else {}
+        filenames = payload.get("filenames") if isinstance(payload.get("filenames"), list) else []
+        self.assertEqual(filenames, ["a.mp4", "b.mp4"])
+
     def test_get_case_latest_returns_terminal_job(self) -> None:
         first = self.store.enqueue_or_get_active(
             case_id="case_a",
