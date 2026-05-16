@@ -17,11 +17,16 @@ class InsightFaceArcEmbedder:
         *,
         model_name: str = "buffalo_l",
         model_root: str | None = None,
+        model_root_source: str = "default",
         device_preference: str = "auto",
         det_size: int = 640,
     ) -> None:
         self.model_name = str(model_name or "buffalo_l").strip() or "buffalo_l"
         self.model_root = str(model_root or "").strip() or None
+        normalized_root_source = str(model_root_source or "default").strip().lower() or "default"
+        if normalized_root_source not in {"env", "fallback", "default"}:
+            normalized_root_source = "default"
+        self.model_root_source = normalized_root_source
         self.device_preference = str(device_preference or "auto").strip().lower() or self.DEVICE_AUTO
         self.det_size = max(320, int(det_size))
 
@@ -33,6 +38,13 @@ class InsightFaceArcEmbedder:
         self._analysis = None
 
         self._initialize()
+
+    def _model_root_context(self) -> tuple[str, str]:
+        source = str(self.model_root_source or "default").strip().lower() or "default"
+        if source not in {"env", "fallback", "default"}:
+            source = "default"
+        root_value = str(self.model_root or "").strip() or "<insightface_default>"
+        return source, root_value
 
     @staticmethod
     def _normalize_embedding(vector: np.ndarray) -> np.ndarray:
@@ -59,6 +71,7 @@ class InsightFaceArcEmbedder:
         ]
 
     def _initialize(self) -> None:
+        root_source, root_value = self._model_root_context()
         try:
             from insightface.app import FaceAnalysis  # type: ignore
         except Exception as exc:
@@ -68,17 +81,22 @@ class InsightFaceArcEmbedder:
             self.available = False
             if str(exc):
                 self.error_message += f" ({exc})"
+            self.error_message += (
+                f" (model_root_source={root_source}, model_root={root_value})"
+            )
             return
 
         last_error = ""
         for providers, ctx_id, device_label in self._provider_attempts():
             try:
-                analysis = FaceAnalysis(
-                    name=self.model_name,
-                    root=self.model_root,
-                    providers=providers,
-                    allowed_modules=["detection", "recognition"],
-                )
+                analysis_kwargs = {
+                    "name": self.model_name,
+                    "providers": providers,
+                    "allowed_modules": ["detection", "recognition"],
+                }
+                if self.model_root:
+                    analysis_kwargs["root"] = self.model_root
+                analysis = FaceAnalysis(**analysis_kwargs)
                 analysis.prepare(ctx_id=ctx_id, det_size=(self.det_size, self.det_size))
                 self._analysis = analysis
                 self.providers = list(providers)
@@ -90,7 +108,15 @@ class InsightFaceArcEmbedder:
                 last_error = str(exc)
 
         self.available = False
-        self.error_message = last_error or "Unable to initialize InsightFace."
+        if last_error:
+            self.error_message = (
+                f"{last_error} (model_root_source={root_source}, model_root={root_value})"
+            )
+        else:
+            self.error_message = (
+                "Unable to initialize InsightFace. "
+                f"(model_root_source={root_source}, model_root={root_value})"
+            )
 
     def engine_label(self) -> str:
         if self.available:

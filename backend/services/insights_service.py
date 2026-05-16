@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import re
+from collections import defaultdict
+from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
 from threading import Lock
 from typing import Any
+from uuid import uuid4
 
 import numpy as np
 from fastapi import HTTPException
@@ -19,6 +23,11 @@ class InsightsService:
     SUSPECT_MODE_AUTO = "auto"
     SUSPECT_MODE_FACE = "face"
     SUSPECT_MODE_PERSON = "person"
+    FACE_GROUP_GAP_SECONDS = 1.5
+    _FACE_CROP_NAME_RE = re.compile(
+        r"^face_(\d{1,12})_(\d{1,6})\.(?:jpg|jpeg|png|webp)$",
+        re.IGNORECASE,
+    )
 
     def __init__(
         self,
@@ -142,6 +151,203 @@ class InsightsService:
             if safe_name and safe_name in requested_filenames:
                 filtered.append(item)
         return filtered
+
+    @staticmethod
+    def _safe_timestamp_seconds(value: Any) -> float:
+        try:
+            return max(0.0, float(value))
+        except Exception:
+            return 0.0
+
+    @staticmethod
+    def _safe_similarity_score(value: Any, *, default: float = -1.0) -> float:
+        try:
+            return float(value)
+        except Exception:
+            return float(default)
+
+    @classmethod
+    def _parse_face_lane_index_from_crop_url(cls, crop_url: str) -> int | None:
+        safe_raw = str(crop_url or "").split("?", 1)[0].split("#", 1)[0]
+        safe_name = Path(safe_raw).name.strip()
+        if not safe_name:
+            return None
+        matched = cls._FACE_CROP_NAME_RE.match(safe_name)
+        if matched is None:
+            return None
+        try:
+            return int(matched.group(2))
+        except Exception:
+            return None
+
+    @classmethod
+    def _group_face_items_temporal_track(
+        cls,
+        face_items: list[dict[str, Any]],
+        *,
+        query_mode: bool,
+        gap_seconds: float,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        safe_gap = max(0.0, float(gap_seconds))
+        lanes: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+
+        for item in face_items:
+            if not isinstance(item, dict):
+                continue
+            safe_video = Path(str(item.get("video_filename") or "")).name.strip()
+            if not safe_video:
+                continue
+            lane_index = cls._parse_face_lane_index_from_crop_url(
+                str(item.get("crop_url") or item.get("crop_path") or ""),
+            )
+            lane_key = (
+                f"lane:{int(lane_index)}"
+                if lane_index is not None
+                else "lane:fallback"
+            )
+            normalized = dict(item)
+            normalized["video_filename"] = safe_video
+            normalized["timestamp_seconds"] = cls._safe_timestamp_seconds(
+                item.get("timestamp_seconds"),
+            )
+            if "similarity_score" in normalized:
+                normalized["similarity_score"] = cls._safe_similarity_score(
+                    normalized.get("similarity_score"),
+                    default=-1.0,
+                )
+            lanes[(safe_video, lane_key)].append(normalized)
+
+        grouped_payload: list[dict[str, Any]] = []
+
+        for (safe_video, lane_key), lane_items in lanes.items():
+            if not lane_items:
+                continue
+            lane_items.sort(
+                key=lambda payload: cls._safe_timestamp_seconds(
+                    payload.get("timestamp_seconds"),
+                ),
+            )
+
+            lane_groups: list[list[dict[str, Any]]] = []
+            current_group: list[dict[str, Any]] = []
+            previous_ts: float | None = None
+            for payload in lane_items:
+                timestamp = cls._safe_timestamp_seconds(payload.get("timestamp_seconds"))
+                if not current_group:
+                    current_group = [payload]
+                    previous_ts = timestamp
+                    continue
+                if previous_ts is not None and (timestamp - previous_ts) <= (safe_gap + 1e-9):
+                    current_group.append(payload)
+                else:
+                    lane_groups.append(current_group)
+                    current_group = [payload]
+                previous_ts = timestamp
+            if current_group:
+                lane_groups.append(current_group)
+
+            for group_items in lane_groups:
+                if not group_items:
+                    continue
+                timestamps = [
+                    cls._safe_timestamp_seconds(item.get("timestamp_seconds"))
+                    for item in group_items
+                ]
+                start_ts = min(timestamps) if timestamps else 0.0
+                end_ts = max(timestamps) if timestamps else start_ts
+
+                if query_mode:
+                    representative = max(
+                        group_items,
+                        key=lambda item: (
+                            cls._safe_similarity_score(
+                                item.get("similarity_score"),
+                                default=-1.0,
+                            ),
+                            cls._safe_timestamp_seconds(item.get("timestamp_seconds")),
+                        ),
+                    )
+                    representative_score = cls._safe_similarity_score(
+                        representative.get("similarity_score"),
+                        default=-1.0,
+                    )
+                else:
+                    representative = max(
+                        group_items,
+                        key=lambda item: cls._safe_timestamp_seconds(
+                            item.get("timestamp_seconds"),
+                        ),
+                    )
+                    representative_score = cls._safe_similarity_score(
+                        representative.get("similarity_score"),
+                        default=-1.0,
+                    )
+
+                payload = dict(representative)
+                payload["video_filename"] = safe_video
+                payload["timestamp_seconds"] = float(
+                    round(
+                        cls._safe_timestamp_seconds(representative.get("timestamp_seconds")),
+                        3,
+                    ),
+                )
+                payload["group_size"] = int(len(group_items))
+                payload["group_start_seconds"] = float(round(start_ts, 3))
+                payload["group_end_seconds"] = float(round(end_ts, 3))
+                if lane_key.startswith("lane:") and lane_key != "lane:fallback":
+                    try:
+                        payload["group_lane_index"] = int(lane_key.split(":", 1)[1])
+                    except Exception:
+                        pass
+                payload["_group_sort_score"] = float(representative_score)
+                payload["_group_sort_end"] = float(end_ts)
+                payload["_group_lane"] = str(lane_key)
+                grouped_payload.append(payload)
+
+        if query_mode:
+            grouped_payload.sort(
+                key=lambda item: (
+                    cls._safe_similarity_score(
+                        item.get("_group_sort_score"),
+                        default=-1.0,
+                    ),
+                    cls._safe_timestamp_seconds(item.get("_group_sort_end")),
+                ),
+                reverse=True,
+            )
+        else:
+            grouped_payload.sort(
+                key=lambda item: cls._safe_timestamp_seconds(item.get("_group_sort_end")),
+                reverse=True,
+            )
+
+        for index, payload in enumerate(grouped_payload, start=1):
+            safe_video = Path(str(payload.get("video_filename") or "")).name.strip()
+            lane_key = str(payload.get("_group_lane") or "lane:fallback").replace(":", "_")
+            start_ms = int(
+                round(
+                    cls._safe_timestamp_seconds(payload.get("group_start_seconds")) * 1000.0,
+                ),
+            )
+            end_ms = int(
+                round(
+                    cls._safe_timestamp_seconds(payload.get("group_end_seconds")) * 1000.0,
+                ),
+            )
+            payload["group_id"] = (
+                f"{safe_video}::{lane_key}::{start_ms:09d}-{end_ms:09d}-{int(index):05d}"
+            )
+            payload.pop("_group_sort_score", None)
+            payload.pop("_group_sort_end", None)
+            payload.pop("_group_lane", None)
+
+        grouping_meta = {
+            "mode": "temporal_track",
+            "gap_seconds": float(safe_gap),
+            "input_count": int(len(face_items)),
+            "group_count": int(len(grouped_payload)),
+        }
+        return grouped_payload, grouping_meta
 
     async def suspect_photo_search(
         self,
@@ -456,7 +662,7 @@ class InsightsService:
             else:
                 vehicles.append(hydrated)
 
-        return {
+        response_payload = {
             "case_id": case_paths.case_id,
             "category": category,
             "query": clean_query,
@@ -465,6 +671,18 @@ class InsightsService:
             "vehicles": vehicles,
             "count": len(raw_items),
         }
+        if category == AnalysisCropStore.FACE_PEOPLE:
+            faces_raw = [dict(item) for item in faces]
+            faces_grouped, faces_grouping = self._group_face_items_temporal_track(
+                faces_raw,
+                query_mode=bool(clean_query),
+                gap_seconds=self.FACE_GROUP_GAP_SECONDS,
+            )
+            response_payload["faces"] = faces_grouped
+            response_payload["faces_raw"] = faces_raw
+            response_payload["faces_grouped"] = faces_grouped
+            response_payload["faces_grouping"] = faces_grouping
+        return response_payload
 
     async def triage_timeline(
         self,
@@ -511,6 +729,88 @@ class InsightsService:
                     ),
                 )
 
+            existing_job: dict[str, Any] | None = None
+            active_submission_id = ""
+            active_submission_created_at = ""
+            active_submission_kind = ""
+            if hasattr(queue_store, "list_active_jobs"):
+                try:
+                    active_jobs = await asyncio.to_thread(queue_store.list_active_jobs, 500)
+                except Exception:
+                    active_jobs = []
+                for raw_job in active_jobs:
+                    if not isinstance(raw_job, dict):
+                        continue
+                    if str(raw_job.get("case_id") or "").strip() != selected_case_id:
+                        continue
+                    if str(raw_job.get("job_kind") or "").strip().lower() != self.QUEUE_KIND_TRIAGE_TIMELINE:
+                        continue
+                    raw_payload = raw_job.get("payload") if isinstance(raw_job.get("payload"), dict) else {}
+                    raw_metadata = (
+                        raw_payload.get("metadata")
+                        if isinstance(raw_payload.get("metadata"), dict)
+                        else {}
+                    )
+                    candidate_submission_id = str(raw_metadata.get("submission_id") or "").strip()
+                    if candidate_submission_id and not active_submission_id:
+                        active_submission_id = candidate_submission_id
+                        active_submission_created_at = str(
+                            raw_metadata.get("submission_created_at") or ""
+                        ).strip()
+                        active_submission_kind = str(
+                            raw_metadata.get("submission_kind") or ""
+                        ).strip().lower()
+                    target_filenames = [
+                        str(item or "").strip()
+                        for item in (raw_payload.get("filenames") or [])
+                        if str(item or "").strip()
+                    ]
+                    if safe_filename in target_filenames:
+                        existing_job = raw_job
+                        break
+
+            if isinstance(existing_job, dict):
+                queue_position = max(0, int(existing_job.get("queue_position", 0)))
+                queue_job_id = int(existing_job.get("job_id", 0))
+                queue_status = str(existing_job.get("status") or "queued")
+                queue_payload = {
+                    "case_id": selected_case_id,
+                    "filename": safe_filename,
+                    "bucket_seconds": float(bucket_seconds),
+                    "cache_status": "queued",
+                    "cached": False,
+                    "queued": True,
+                    "queue": {
+                        "job_id": queue_job_id,
+                        "job_kind": str(existing_job.get("job_kind") or self.QUEUE_KIND_TRIAGE_TIMELINE),
+                        "priority": max(
+                            1,
+                            int(existing_job.get("priority", self.QUEUE_PRIORITY_TRIAGE_TIMELINE)),
+                        ),
+                        "status": queue_status,
+                        "position_ahead": queue_position,
+                        "created": False,
+                        "reason": "already_queued_for_filename",
+                    },
+                }
+                if has_stale_timeline:
+                    queue_payload["stale"] = True
+                    queue_payload["message"] = (
+                        "Showing last saved triage timeline while existing queued/running job refreshes."
+                    )
+                    merged_payload = dict(cached_payload)
+                    merged_payload.update(queue_payload)
+                    return merged_payload
+                queue_payload["message"] = "Triage timeline already queued/running."
+                return queue_payload
+
+            if not active_submission_id:
+                active_submission_id = uuid4().hex
+            if not active_submission_created_at:
+                active_submission_created_at = datetime.now(timezone.utc).isoformat()
+            if not active_submission_kind:
+                active_submission_kind = self.QUEUE_KIND_TRIAGE_TIMELINE
+
             queued_job = await asyncio.to_thread(
                 queue_store.enqueue_or_get_active,
                 case_id=selected_case_id,
@@ -523,6 +823,9 @@ class InsightsService:
                 metadata={
                     "bucket_seconds": float(bucket_seconds),
                     "force": bool(force),
+                    "submission_id": active_submission_id,
+                    "submission_created_at": active_submission_created_at,
+                    "submission_kind": active_submission_kind,
                 },
             )
             if not isinstance(queued_job, dict):

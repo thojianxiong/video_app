@@ -7,6 +7,7 @@ from fastapi import APIRouter, HTTPException
 from backend.schemas.analysis_settings import AnalysisSettingsUpdateRequest
 from backend.schemas.embedding_settings import EmbeddingSettingsUpdateRequest
 from backend.schemas.search_settings import SearchSettingsUpdateRequest
+from backend.schemas.triage_settings import TriageSettingsUpdateRequest
 
 
 def build_embedding_settings_router(
@@ -17,6 +18,9 @@ def build_embedding_settings_router(
     read_saved_search_settings_sync: Callable[[], dict],
     write_saved_search_settings_sync: Callable[..., dict],
     build_search_settings_response_sync: Callable[[], dict],
+    read_saved_triage_settings_sync: Callable[[], dict],
+    write_saved_triage_settings_sync: Callable[..., dict],
+    build_triage_settings_response_sync: Callable[[], dict],
     read_saved_analysis_settings_sync: Callable[[], dict],
     write_saved_analysis_settings_sync: Callable[..., dict],
     build_analysis_settings_response_sync: Callable[[], dict],
@@ -98,6 +102,34 @@ def build_embedding_settings_router(
                 result_limit=result_limit,
             )
             return await asyncio.to_thread(build_search_settings_response_sync)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc))
+
+    @router.get("/settings/triage")
+    async def get_triage_settings() -> dict:
+        try:
+            return await asyncio.to_thread(build_triage_settings_response_sync)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc))
+
+    @router.post("/settings/triage")
+    async def update_triage_settings(request: TriageSettingsUpdateRequest) -> dict:
+        try:
+            saved = await asyncio.to_thread(read_saved_triage_settings_sync)
+            checkpoint_mode = (
+                str(request.checkpoint_mode).strip().lower()
+                if request.checkpoint_mode is not None
+                else str(saved.get("checkpoint_mode", "mountain")).strip().lower()
+            )
+            await asyncio.to_thread(
+                write_saved_triage_settings_sync,
+                checkpoint_mode=checkpoint_mode,
+            )
+            return await asyncio.to_thread(build_triage_settings_response_sync)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
         except Exception as exc:

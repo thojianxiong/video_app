@@ -98,6 +98,7 @@ QUEUE_JOB_KIND_ANALYSIS_FACE_IDENTITY = "analysis_face_identity"
 QUEUE_JOB_KIND_ANALYSIS_VEHICLES = "analysis_vehicles"
 QUEUE_WORKER_GPU_KINDS = {
     QUEUE_JOB_KIND_SEMANTIC_INDEX,
+    QUEUE_JOB_KIND_TRIAGE_TIMELINE,
     QUEUE_JOB_KIND_ANALYSIS_FACE_PEOPLE,
     QUEUE_JOB_KIND_ANALYSIS_FACE_IDENTITY,
     QUEUE_JOB_KIND_ANALYSIS_VEHICLES,
@@ -111,6 +112,8 @@ DEFAULT_SEARCH_DEDUPE_AGGRESSIVENESS = 55.0
 DEFAULT_SEARCH_RESULT_LIMIT = 120
 SEARCH_MIN_RESULT_LIMIT = 10
 SEARCH_MAX_RESULT_LIMIT = 500
+DEFAULT_TRIAGE_CHECKPOINT_MODE = "mountain"
+TRIAGE_CHECKPOINT_MODE_OPTIONS = ("mountain", "peaks", "change_point")
 DEFAULT_FACE_IDENTITY_ENABLED = False
 PIPELINE_STAGE_ANALYSIS_FACE_PEOPLE = "analysis_face_people"
 PIPELINE_STAGE_ANALYSIS_FACE_IDENTITY = "analysis_face_identity"
@@ -159,6 +162,38 @@ for path in (FRONTEND_DIR, CASES_DIR):
     path.mkdir(parents=True, exist_ok=True)
 
 
+def _resolve_insightface_model_root() -> str | None:
+    configured_root = str(os.getenv("INSIGHTFACE_HOME") or "").strip()
+    fallback_root = CASES_DIR / ".insightface"
+
+    def _ensure_writable_directory(target: Path, *, label: str) -> str | None:
+        try:
+            resolved = target.expanduser()
+            resolved.mkdir(parents=True, exist_ok=True)
+            if not resolved.exists() or not resolved.is_dir():
+                raise NotADirectoryError(f"{resolved} is not a directory.")
+            return str(resolved)
+        except Exception as exc:
+            print(f"[startup] WARN: FACE-02 model root {label} unavailable: {exc}")
+            return None
+
+    if configured_root:
+        resolved_env_root = _ensure_writable_directory(Path(configured_root), label="INSIGHTFACE_HOME")
+        if resolved_env_root:
+            return resolved_env_root
+        print("[startup] WARN: Falling back to FACE-02 model cache at cases/.insightface.")
+
+    resolved_fallback_root = _ensure_writable_directory(fallback_root, label="fallback")
+    if resolved_fallback_root:
+        return resolved_fallback_root
+
+    print(
+        "[startup] WARN: FACE-02 model root fallback unavailable; "
+        "InsightFace will use its default model directory."
+    )
+    return None
+
+
 async def _startup_application(application: FastAPI) -> None:
     embedding_settings = await asyncio.to_thread(_resolve_effective_embedding_settings_sync)
     embedder = await asyncio.to_thread(
@@ -174,10 +209,37 @@ async def _startup_application(application: FastAPI) -> None:
         _float_from_env("YOLO_CONFIDENCE", 0.3),
         _float_from_env("YOLO_IOU", 0.45),
     )
+    resolved_face_model_root = _resolve_insightface_model_root()
+    configured_face_model_root = str(os.getenv("INSIGHTFACE_HOME") or "").strip()
+    fallback_face_model_root = str((CASES_DIR / ".insightface").expanduser())
+    resolved_face_model_root_source = "default"
+    face_model_root_fallback_used = False
+
+    def _normalize_model_root(value: str) -> str:
+        try:
+            return str(Path(value).expanduser().resolve())
+        except Exception:
+            return str(Path(value).expanduser())
+
+    if resolved_face_model_root:
+        normalized_resolved = _normalize_model_root(resolved_face_model_root)
+        normalized_fallback = _normalize_model_root(fallback_face_model_root)
+        if configured_face_model_root:
+            normalized_env = _normalize_model_root(configured_face_model_root)
+            if normalized_resolved == normalized_env:
+                resolved_face_model_root_source = "env"
+            else:
+                resolved_face_model_root_source = "fallback"
+                face_model_root_fallback_used = True
+        elif normalized_resolved == normalized_fallback:
+            resolved_face_model_root_source = "fallback"
+            face_model_root_fallback_used = True
+
     face_embedder = await asyncio.to_thread(
         InsightFaceArcEmbedder,
         model_name=os.getenv("ARCFACE_MODEL_NAME", "buffalo_l"),
-        model_root=os.getenv("INSIGHTFACE_HOME"),
+        model_root=resolved_face_model_root,
+        model_root_source=resolved_face_model_root_source,
         device_preference=embedding_settings["device_preference"],
     )
     application.state.embedder = embedder
@@ -242,6 +304,12 @@ async def _startup_application(application: FastAPI) -> None:
         f"pretrained={embedder.pretrained} "
         f"device={embedder.device} "
         f"device_preference={embedder.device_preference}"
+    )
+    print(
+        "[startup] FACE-02 model_root="
+        f"{resolved_face_model_root or '<insightface_default>'} "
+        f"source={resolved_face_model_root_source} "
+        f"fallback_used={str(face_model_root_fallback_used).lower()}"
     )
     print(f"[startup] FACE-02 engine={face_embedder.engine_label()}")
     if interrupted_jobs > 0:
@@ -496,6 +564,66 @@ def _build_search_settings_response_sync() -> dict[str, Any]:
         "derived": _derive_search_runtime_settings(
             float(saved.get("dedupe_aggressiveness", DEFAULT_SEARCH_DEDUPE_AGGRESSIVENESS))
         ),
+    }
+
+
+def _normalize_triage_checkpoint_mode(value: Any) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized == "anomaly":
+        normalized = "mountain"
+    elif normalized == "balanced":
+        normalized = "peaks"
+    if normalized in TRIAGE_CHECKPOINT_MODE_OPTIONS:
+        return normalized
+    return DEFAULT_TRIAGE_CHECKPOINT_MODE
+
+
+def _read_saved_triage_settings_sync() -> dict[str, Any]:
+    payload = _read_app_settings_payload_sync()
+    raw_triage = payload.get("triage") if isinstance(payload.get("triage"), dict) else {}
+    return {
+        "checkpoint_mode": _normalize_triage_checkpoint_mode(
+            raw_triage.get("checkpoint_mode", DEFAULT_TRIAGE_CHECKPOINT_MODE)
+        ),
+    }
+
+
+def _write_saved_triage_settings_sync(
+    *,
+    checkpoint_mode: str,
+) -> dict[str, Any]:
+    saved = {
+        "checkpoint_mode": _normalize_triage_checkpoint_mode(checkpoint_mode),
+    }
+    payload = _read_app_settings_payload_sync()
+    payload["triage"] = saved
+    _write_app_settings_payload_sync(payload)
+    return dict(saved)
+
+
+def _build_triage_settings_response_sync() -> dict[str, Any]:
+    saved = _read_saved_triage_settings_sync()
+    recommended = {
+        "checkpoint_mode": DEFAULT_TRIAGE_CHECKPOINT_MODE,
+    }
+    descriptions = {
+        "checkpoint_mode": {
+            "mountain": (
+                "Mountain highlights sustained unusual activity windows versus recent baseline."
+            ),
+            "peaks": (
+                "Peaks highlights high-activity point peaks with stronger spacing."
+            ),
+            "change_point": (
+                "Change Point highlights sharp behavior transitions in visual activity."
+            ),
+        },
+    }
+    return {
+        "saved": dict(saved),
+        "recommended": recommended,
+        "options": list(TRIAGE_CHECKPOINT_MODE_OPTIONS),
+        "descriptions": descriptions,
     }
 
 
@@ -803,6 +931,8 @@ def _new_index_job_record(
     frame_interval_seconds: float,
     batch_size: int,
     force: bool,
+    submission_id: str = "",
+    submission_created_at: str = "",
 ) -> dict:
     now = _utc_now_iso()
     return {
@@ -831,6 +961,8 @@ def _new_index_job_record(
         "force": bool(force),
         "queue_job_kind": QUEUE_JOB_KIND_SEMANTIC_INDEX,
         "queue_priority": QUEUE_PRIORITY_SEMANTIC_INDEX,
+        "submission_id": str(submission_id or "").strip(),
+        "submission_created_at": str(submission_created_at or "").strip(),
         "embedding_engine": _embedding_engine_info(),
         "started_at": now,
         "updated_at": now,
@@ -861,6 +993,8 @@ def _index_job_snapshot(job: dict | None, *, case_id: str) -> dict:
             "force": False,
             "queue_job_kind": QUEUE_JOB_KIND_SEMANTIC_INDEX,
             "queue_priority": QUEUE_PRIORITY_SEMANTIC_INDEX,
+            "submission_id": "",
+            "submission_created_at": "",
             "embedding_engine": _embedding_engine_info(),
             "errors": [],
             "results": [],
@@ -917,6 +1051,8 @@ def _index_job_snapshot(job: dict | None, *, case_id: str) -> dict:
         "force": bool(job.get("force", False)),
         "queue_job_kind": str(job.get("queue_job_kind") or QUEUE_JOB_KIND_SEMANTIC_INDEX),
         "queue_priority": queue_priority,
+        "submission_id": str(job.get("submission_id") or "").strip(),
+        "submission_created_at": str(job.get("submission_created_at") or "").strip(),
         "embedding_engine": dict(job.get("embedding_engine") or _embedding_engine_info()),
         "errors": [str(item) for item in (job.get("errors") or [])],
         "results": [item for item in (job.get("results") or []) if isinstance(item, dict)],
@@ -1353,6 +1489,8 @@ async def _run_analysis_queue_job_async(
 ) -> tuple[str, str]:
     normalized_job_kind = str(job_kind or "").strip().lower()
     metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+    submission_id = str(metadata.get("submission_id") or "").strip()
+    submission_created_at = str(metadata.get("submission_created_at") or "").strip()
 
     if normalized_job_kind == QUEUE_JOB_KIND_ANALYSIS_FACE_PEOPLE:
         analysis_face_people = True
@@ -1405,6 +1543,8 @@ async def _run_analysis_queue_job_async(
                     "source": "queue",
                     "reason": "delete_in_progress",
                     "analysis_job_kind": normalized_job_kind,
+                    "submission_id": submission_id,
+                    "submission_created_at": submission_created_at,
                 },
             )
             continue
@@ -1419,6 +1559,8 @@ async def _run_analysis_queue_job_async(
             details={
                 "source": "queue",
                 "analysis_job_kind": normalized_job_kind,
+                "submission_id": submission_id,
+                "submission_created_at": submission_created_at,
                 "analysis_face_people": bool(analysis_face_people),
                 "analysis_vehicles": bool(analysis_vehicles),
                 "analysis_face_identity": bool(analysis_face_identity),
@@ -1499,6 +1641,8 @@ async def _run_analysis_queue_job_async(
                     details={
                         "source": "queue",
                         "analysis_job_kind": normalized_job_kind,
+                        "submission_id": submission_id,
+                        "submission_created_at": submission_created_at,
                         "analysis_face_people": bool(analysis_face_people),
                         "analysis_vehicles": bool(analysis_vehicles),
                         "analysis_face_identity": bool(analysis_face_identity),
@@ -1581,6 +1725,8 @@ async def _run_analysis_queue_job_async(
             common_details = {
                 "source": "queue",
                 "analysis_job_kind": normalized_job_kind,
+                "submission_id": submission_id,
+                "submission_created_at": submission_created_at,
                 "analysis_status": analysis_status,
                 "analysis_face_people": bool(analysis_face_people),
                 "analysis_vehicles": bool(analysis_vehicles),
@@ -1658,6 +1804,8 @@ async def _run_analysis_queue_job_async(
                 details={
                     "source": "queue",
                     "analysis_job_kind": normalized_job_kind,
+                    "submission_id": submission_id,
+                    "submission_created_at": submission_created_at,
                     "analysis_face_people": bool(analysis_face_people),
                     "analysis_vehicles": bool(analysis_vehicles),
                     "analysis_face_identity": bool(analysis_face_identity),
@@ -1682,6 +1830,8 @@ async def _run_analysis_queue_job_async(
                 details={
                     "source": "queue",
                     "analysis_job_kind": normalized_job_kind,
+                    "submission_id": submission_id,
+                    "submission_created_at": submission_created_at,
                     "analysis_face_people": bool(analysis_face_people),
                     "analysis_vehicles": bool(analysis_vehicles),
                     "analysis_face_identity": bool(analysis_face_identity),
@@ -1733,6 +1883,9 @@ async def _run_face_identity_topup_queue_job_async(
     payload: dict[str, Any],
     filenames: list[str],
 ) -> tuple[str, str]:
+    metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+    submission_id = str(metadata.get("submission_id") or "").strip()
+    submission_created_at = str(metadata.get("submission_created_at") or "").strip()
     try:
         _case_paths, vector_store = await asyncio.to_thread(_get_vector_store_for_case, case_id)
         _, analysis_store = await asyncio.to_thread(_get_analysis_store_for_case, case_id)
@@ -1772,6 +1925,8 @@ async def _run_face_identity_topup_queue_job_async(
                 details={
                     "source": "queue",
                     "analysis_job_kind": QUEUE_JOB_KIND_ANALYSIS_FACE_IDENTITY,
+                    "submission_id": submission_id,
+                    "submission_created_at": submission_created_at,
                     "analysis_face_people": False,
                     "analysis_vehicles": False,
                     "analysis_face_identity": True,
@@ -1791,6 +1946,8 @@ async def _run_face_identity_topup_queue_job_async(
             details={
                 "source": "queue",
                 "analysis_job_kind": QUEUE_JOB_KIND_ANALYSIS_FACE_IDENTITY,
+                "submission_id": submission_id,
+                "submission_created_at": submission_created_at,
                 "analysis_face_people": False,
                 "analysis_vehicles": False,
                 "analysis_face_identity": True,
@@ -1828,6 +1985,8 @@ async def _run_face_identity_topup_queue_job_async(
                     details={
                         "source": "queue",
                         "analysis_job_kind": QUEUE_JOB_KIND_ANALYSIS_FACE_IDENTITY,
+                        "submission_id": submission_id,
+                        "submission_created_at": submission_created_at,
                         "analysis_face_people": False,
                         "analysis_vehicles": False,
                         "analysis_face_identity": True,
@@ -1854,6 +2013,8 @@ async def _run_face_identity_topup_queue_job_async(
                     details={
                         "source": "queue",
                         "analysis_job_kind": QUEUE_JOB_KIND_ANALYSIS_FACE_IDENTITY,
+                        "submission_id": submission_id,
+                        "submission_created_at": submission_created_at,
                         "analysis_face_people": False,
                         "analysis_vehicles": False,
                         "analysis_face_identity": True,
@@ -1905,6 +2066,8 @@ async def _run_face_identity_topup_queue_job_async(
                     details={
                         "source": "queue",
                         "analysis_job_kind": QUEUE_JOB_KIND_ANALYSIS_FACE_IDENTITY,
+                        "submission_id": submission_id,
+                        "submission_created_at": submission_created_at,
                         "analysis_face_people": False,
                         "analysis_vehicles": False,
                         "analysis_face_identity": True,
@@ -1967,6 +2130,8 @@ async def _run_face_identity_topup_queue_job_async(
                 details={
                     "source": "queue",
                     "analysis_job_kind": QUEUE_JOB_KIND_ANALYSIS_FACE_IDENTITY,
+                    "submission_id": submission_id,
+                    "submission_created_at": submission_created_at,
                     "analysis_face_people": False,
                     "analysis_vehicles": False,
                     "analysis_face_identity": True,
@@ -1991,6 +2156,8 @@ async def _run_face_identity_topup_queue_job_async(
                 details={
                     "source": "queue",
                     "analysis_job_kind": QUEUE_JOB_KIND_ANALYSIS_FACE_IDENTITY,
+                    "submission_id": submission_id,
+                    "submission_created_at": submission_created_at,
                     "analysis_face_people": False,
                     "analysis_vehicles": False,
                     "analysis_face_identity": True,
@@ -2015,6 +2182,8 @@ async def _run_face_identity_topup_queue_job_async(
                 details={
                     "source": "queue",
                     "analysis_job_kind": QUEUE_JOB_KIND_ANALYSIS_FACE_IDENTITY,
+                    "submission_id": submission_id,
+                    "submission_created_at": submission_created_at,
                     "analysis_face_people": False,
                     "analysis_vehicles": False,
                     "analysis_face_identity": True,
@@ -2205,6 +2374,21 @@ async def _index_queue_worker_loop(
                         return 0, 0
                     if _is_case_delete_in_progress(case_id):
                         return 0, 0
+                    requeue_metadata = (
+                        dict(effective_payload.get("metadata"))
+                        if isinstance(effective_payload.get("metadata"), dict)
+                        else {}
+                    )
+                    if job_kind == QUEUE_JOB_KIND_TRIAGE_TIMELINE:
+                        if not str(requeue_metadata.get("submission_id") or "").strip():
+                            seed = f"{case_id}:{job_id}:{current_filename}:{time.time_ns()}"
+                            requeue_metadata["submission_id"] = hashlib.sha256(
+                                seed.encode("utf-8")
+                            ).hexdigest()
+                        if not str(requeue_metadata.get("submission_created_at") or "").strip():
+                            requeue_metadata["submission_created_at"] = _utc_now_iso()
+                        if not str(requeue_metadata.get("submission_kind") or "").strip():
+                            requeue_metadata["submission_kind"] = QUEUE_JOB_KIND_TRIAGE_TIMELINE
                     try:
                         requeued = await asyncio.to_thread(
                             queue_store.enqueue_or_get_active,
@@ -2215,11 +2399,7 @@ async def _index_queue_worker_loop(
                             force=bool(effective_payload.get("force", False)),
                             job_kind=job_kind,
                             priority=queue_priority,
-                            metadata=(
-                                effective_payload.get("metadata")
-                                if isinstance(effective_payload.get("metadata"), dict)
-                                else {}
-                            ),
+                            metadata=requeue_metadata,
                             append_to_case_queued=False,
                         )
                         if not isinstance(requeued, dict):
@@ -2290,6 +2470,11 @@ async def _index_queue_worker_loop(
                         filenames=[current_filename],
                     )
                 elif job_kind == QUEUE_JOB_KIND_SEMANTIC_INDEX:
+                    queue_metadata = (
+                        current_payload.get("metadata")
+                        if isinstance(current_payload.get("metadata"), dict)
+                        else {}
+                    )
                     with app.state.index_jobs_lock:
                         job = _new_index_job_record(
                             case_id=case_id,
@@ -2297,6 +2482,10 @@ async def _index_queue_worker_loop(
                             frame_interval_seconds=frame_interval_seconds,
                             batch_size=batch_size,
                             force=force,
+                            submission_id=str(queue_metadata.get("submission_id") or "").strip(),
+                            submission_created_at=str(
+                                queue_metadata.get("submission_created_at") or ""
+                            ).strip(),
                         )
                         job["running"] = False
                         job["status"] = "queued"
@@ -2371,6 +2560,12 @@ async def _run_index_job_async(case_id: str) -> None:
         batch_size = int(initial.get("batch_size", 32))
         force = bool(initial.get("force", False))
         queue_single_file_mode = bool(initial.get("queue_single_file_mode", False))
+        queue_job_kind = (
+            str(initial.get("queue_job_kind") or QUEUE_JOB_KIND_SEMANTIC_INDEX).strip().lower()
+            or QUEUE_JOB_KIND_SEMANTIC_INDEX
+        )
+        submission_id = str(initial.get("submission_id") or "").strip()
+        submission_created_at = str(initial.get("submission_created_at") or "").strip()
         initial_filenames: list[str] = []
         initial_seen: set[str] = set()
         for item in (initial.get("filenames") or []):
@@ -2384,6 +2579,13 @@ async def _run_index_job_async(case_id: str) -> None:
         initial["status"] = "running"
         initial["running"] = True
         initial["updated_at"] = _utc_now_iso()
+
+    stage_details_base = {
+        "source": "background_index",
+        "queue_job_kind": queue_job_kind,
+        "submission_id": submission_id,
+        "submission_created_at": submission_created_at,
+    }
 
     await _persist_index_job_snapshot(normalized_case_id)
 
@@ -2446,7 +2648,7 @@ async def _run_index_job_async(case_id: str) -> None:
                     stage="base_index",
                     status="skipped",
                     event="background_index_skipped_delete_in_progress",
-                    details={"source": "background_index", "reason": "delete_in_progress"},
+                    details=dict(stage_details_base, reason="delete_in_progress"),
                 )
                 await _persist_index_job_snapshot(normalized_case_id)
                 continue
@@ -2458,14 +2660,14 @@ async def _run_index_job_async(case_id: str) -> None:
                 status="running",
                 increment_attempt=True,
                 event="background_index_started",
-                details={
-                    "source": "background_index",
-                    "frame_interval_seconds": frame_interval_seconds,
-                    "batch_size": batch_size,
-                    "force": force,
-                    "phase": "frame_scan",
-                    "phase_label": _base_index_phase_label("frame_scan"),
-                },
+                details=dict(
+                    stage_details_base,
+                    frame_interval_seconds=frame_interval_seconds,
+                    batch_size=batch_size,
+                    force=force,
+                    phase="frame_scan",
+                    phase_label=_base_index_phase_label("frame_scan"),
+                ),
             )
             await _persist_index_job_snapshot(normalized_case_id)
 
@@ -2555,14 +2757,14 @@ async def _run_index_job_async(case_id: str) -> None:
                             stage="base_index",
                             status="running",
                             event="background_index_progress",
-                            details={
-                                "source": "background_index",
-                                "processed_frames": processed,
-                                "estimated_total_frames": estimated,
-                                "progress_percent": float(progress_percent),
-                                "phase": phase_value,
-                                "phase_label": _base_index_phase_label(phase_value),
-                            },
+                            details=dict(
+                                stage_details_base,
+                                processed_frames=processed,
+                                estimated_total_frames=estimated,
+                                progress_percent=float(progress_percent),
+                                phase=phase_value,
+                                phase_label=_base_index_phase_label(phase_value),
+                            ),
                         )
                     except Exception as exc:
                         print(
@@ -2633,16 +2835,16 @@ async def _run_index_job_async(case_id: str) -> None:
                     stage="base_index",
                     status=pipeline_status,
                     event=f"background_index_{pipeline_status}",
-                    details={
-                        "source": "background_index",
-                        "status": status,
-                        "indexed_frames": indexed_frames,
-                        "indexed_windows": indexed_windows,
-                        "processed_frames": processed_frames,
-                        "estimated_total_frames": estimated_total_frames,
-                        "phase": "finalizing",
-                        "phase_label": _base_index_phase_label("finalizing"),
-                    },
+                    details=dict(
+                        stage_details_base,
+                        status=status,
+                        indexed_frames=indexed_frames,
+                        indexed_windows=indexed_windows,
+                        processed_frames=processed_frames,
+                        estimated_total_frames=estimated_total_frames,
+                        phase="finalizing",
+                        phase_label=_base_index_phase_label("finalizing"),
+                    ),
                 )
                 await _persist_index_job_snapshot(normalized_case_id)
             except _IndexCancellationRequested as exc:
@@ -2653,10 +2855,7 @@ async def _run_index_job_async(case_id: str) -> None:
                     status="interrupted",
                     event="background_index_cancelled",
                     error="Background indexing cancelled.",
-                    details={
-                        "source": "background_index",
-                        "message": _truncate_error(str(exc)),
-                    },
+                    details=dict(stage_details_base, message=_truncate_error(str(exc))),
                 )
                 raise asyncio.CancelledError()
             except asyncio.CancelledError:
@@ -2667,7 +2866,7 @@ async def _run_index_job_async(case_id: str) -> None:
                     status="interrupted",
                     event="background_index_cancelled",
                     error="Background indexing cancelled.",
-                    details={"source": "background_index"},
+                    details=dict(stage_details_base),
                 )
                 raise
             except Exception as exc:
@@ -2689,7 +2888,7 @@ async def _run_index_job_async(case_id: str) -> None:
                     status="failed",
                     event="background_index_failed",
                     error=_truncate_error(str(exc)),
-                    details={"source": "background_index"},
+                    details=dict(stage_details_base),
                 )
                 await _persist_index_job_snapshot(normalized_case_id)
     except asyncio.CancelledError:
@@ -2709,7 +2908,7 @@ async def _run_index_job_async(case_id: str) -> None:
                 status="interrupted",
                 event="background_index_interrupted",
                 error="Background indexing cancelled.",
-                details={"source": "background_index"},
+                details=dict(stage_details_base),
             )
         await _persist_index_job_snapshot(normalized_case_id)
     except Exception as exc:
@@ -4213,6 +4412,9 @@ app.include_router(
         read_saved_search_settings_sync=_read_saved_search_settings_sync,
         write_saved_search_settings_sync=_write_saved_search_settings_sync,
         build_search_settings_response_sync=_build_search_settings_response_sync,
+        read_saved_triage_settings_sync=_read_saved_triage_settings_sync,
+        write_saved_triage_settings_sync=_write_saved_triage_settings_sync,
+        build_triage_settings_response_sync=_build_triage_settings_response_sync,
         read_saved_analysis_settings_sync=_read_saved_analysis_settings_sync,
         write_saved_analysis_settings_sync=_write_saved_analysis_settings_sync,
         build_analysis_settings_response_sync=_build_analysis_settings_response_sync,

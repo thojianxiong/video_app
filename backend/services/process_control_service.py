@@ -192,6 +192,8 @@ class ProcessControlService:
         current_processed_frames: int = 0,
         current_total_frames: int = 0,
         current_progress_percent: float = 0.0,
+        expected_job_kind: str = "",
+        expected_submission_id: str = "",
     ) -> list[dict]:
         safe_filenames = self._normalize_filenames(filenames)
         if not safe_filenames:
@@ -203,6 +205,8 @@ class ProcessControlService:
         safe_current_processed = max(0, self._safe_int(current_processed_frames))
         safe_current_total = max(0, self._safe_int(current_total_frames))
         safe_current_percent = min(100.0, max(0.0, self._safe_float(current_progress_percent)))
+        safe_expected_job_kind = str(expected_job_kind or "").strip().lower()
+        safe_expected_submission_id = str(expected_submission_id or "").strip()
         snapshots_by_filename = self._load_case_pipeline_snapshots_map(
             case_id=case_id,
             cache=snapshot_cache,
@@ -229,6 +233,35 @@ class ProcessControlService:
                 if isinstance(stage_payload, dict) and isinstance(stage_payload.get("details"), dict)
                 else {}
             )
+            details_job_kind = str(
+                details.get("analysis_job_kind")
+                or details.get("queue_job_kind")
+                or details.get("job_kind")
+                or ""
+            ).strip().lower()
+            if not details_job_kind:
+                source = str(details.get("source") or "").strip().lower()
+                if source == "background_index":
+                    details_job_kind = "semantic_index"
+            details_submission_id = str(details.get("submission_id") or "").strip()
+
+            kind_matches = (
+                (not safe_expected_job_kind)
+                or (
+                    bool(details_job_kind)
+                    and details_job_kind == safe_expected_job_kind
+                )
+            )
+            submission_matches = (
+                (not safe_expected_submission_id)
+                or (
+                    bool(details_submission_id)
+                    and details_submission_id == safe_expected_submission_id
+                )
+            )
+            if not kind_matches or not submission_matches:
+                status = "pending"
+                details = {}
 
             processed = max(0, self._safe_int(details.get("processed_frames", 0)))
             total = max(
@@ -269,6 +302,10 @@ class ProcessControlService:
                 # Keep running rows below 100% so users can distinguish "still working" from done.
                 if percent >= 100.0:
                     percent = 99.0
+            elif status in {"queued", "pending", "starting"}:
+                processed = 0
+                total = 0
+                percent = 0.0
 
             rows.append(
                 {
@@ -280,10 +317,11 @@ class ProcessControlService:
                     "is_current": bool(is_current),
                 }
             )
-            if isinstance(details.get("phase"), str) and str(details.get("phase")).strip():
-                rows[-1]["phase"] = str(details.get("phase")).strip()
-            if isinstance(details.get("phase_label"), str) and str(details.get("phase_label")).strip():
-                rows[-1]["phase_label"] = str(details.get("phase_label")).strip()
+            if status not in {"queued", "pending", "starting"}:
+                if isinstance(details.get("phase"), str) and str(details.get("phase")).strip():
+                    rows[-1]["phase"] = str(details.get("phase")).strip()
+                if isinstance(details.get("phase_label"), str) and str(details.get("phase_label")).strip():
+                    rows[-1]["phase_label"] = str(details.get("phase_label")).strip()
         return rows
 
     def list_active_processes_sync(self, case_id: str | None = None) -> dict:
@@ -293,6 +331,148 @@ class ProcessControlService:
         processes_all: list[dict] = []
         completed_processes_all: list[dict] = []
         pipeline_snapshot_cache: dict[str, dict[str, dict]] = {}
+        pending_row_statuses = {"queued", "pending", "starting"}
+        running_row_statuses = {"running", "cancelling"}
+        terminal_row_statuses = {
+            "completed",
+            "processed",
+            "success",
+            "succeeded",
+            "skipped",
+            "failed",
+            "error",
+            "cancelled",
+            "canceled",
+            "interrupted",
+            "aborted",
+            "completed_with_errors",
+        }
+
+        def _normalize_status_token(value: Any) -> str:
+            return str(value or "").strip().lower().replace(" ", "_")
+
+        def _terminal_status_from_job_status(value: Any) -> str:
+            normalized = _normalize_status_token(value)
+            if normalized in terminal_row_statuses:
+                return normalized
+            if normalized in running_row_statuses:
+                return "interrupted"
+            if normalized in pending_row_statuses:
+                return "completed"
+            return "completed"
+
+        def _is_terminal_row_status(value: Any) -> bool:
+            normalized = _normalize_status_token(value)
+            return normalized in terminal_row_statuses
+
+        def _completed_fallback_filenames(
+            *,
+            item: dict[str, Any] | None,
+            metadata: dict[str, Any] | None,
+            filenames: list[str] | None,
+        ) -> list[str]:
+            candidates: list[str] = []
+            seen: set[str] = set()
+
+            def _push(value: Any) -> None:
+                safe = str(value or "").strip()
+                if not safe or safe in seen:
+                    return
+                seen.add(safe)
+                candidates.append(safe)
+
+            safe_metadata = metadata if isinstance(metadata, dict) else {}
+            safe_item = item if isinstance(item, dict) else {}
+            for key in (
+                "processed_filename",
+                "current_filename",
+                "head_filename",
+                "target_filename",
+            ):
+                _push(safe_item.get(key))
+                _push(safe_metadata.get(key))
+
+            safe_filenames = self._normalize_filenames(filenames)
+            if not candidates and safe_filenames:
+                # Queue worker runs one file per queue job; first filename is the processed head.
+                _push(safe_filenames[0])
+            return candidates
+
+        def _canonicalize_terminal_row(
+            row: dict[str, Any],
+            *,
+            fallback_status: str,
+            fallback_filename: str = "",
+        ) -> dict[str, Any]:
+            normalized_row = dict(row)
+            safe_filename = str(
+                normalized_row.get("filename")
+                or fallback_filename
+                or ""
+            ).strip()
+            if safe_filename:
+                normalized_row["filename"] = safe_filename
+            normalized_row["status"] = _terminal_status_from_job_status(
+                normalized_row.get("status") or fallback_status
+            )
+            normalized_row["progress_percent"] = 100.0
+            normalized_row["is_current"] = False
+            processed = max(0, self._safe_int(normalized_row.get("processed_frames", 0)))
+            total = max(
+                processed,
+                self._safe_int(
+                    normalized_row.get("estimated_total_frames", normalized_row.get("total_frames", 0)),
+                ),
+            )
+            normalized_row["processed_frames"] = int(processed)
+            normalized_row["estimated_total_frames"] = int(total)
+            if not str(normalized_row.get("phase") or "").strip():
+                normalized_row.pop("phase", None)
+            if not str(normalized_row.get("phase_label") or "").strip():
+                normalized_row.pop("phase_label", None)
+            return normalized_row
+
+        def _build_terminal_rows_for_completed_item(
+            *,
+            file_progress: list[dict[str, Any]] | Any,
+            filenames: list[str],
+            fallback_status: str,
+            fallback_filenames: list[str] | None = None,
+        ) -> list[dict[str, Any]]:
+            safe_filenames = self._normalize_filenames(filenames)
+            safe_fallback_filenames = self._normalize_filenames(fallback_filenames)
+            terminal_rows: list[dict[str, Any]] = []
+            seen: set[str] = set()
+            raw_rows = file_progress if isinstance(file_progress, list) else []
+            for raw_row in raw_rows:
+                if not isinstance(raw_row, dict):
+                    continue
+                if not _is_terminal_row_status(raw_row.get("status")):
+                    continue
+                normalized_row = _canonicalize_terminal_row(raw_row, fallback_status=fallback_status)
+                filename = str(normalized_row.get("filename") or "").strip()
+                if not filename or filename in seen:
+                    continue
+                if safe_filenames and filename not in safe_filenames:
+                    continue
+                seen.add(filename)
+                terminal_rows.append(normalized_row)
+
+            if terminal_rows:
+                return terminal_rows
+
+            fallback_targets = safe_fallback_filenames or safe_filenames[:1]
+            for filename in fallback_targets:
+                if filename in seen:
+                    continue
+                seen.add(filename)
+                terminal_rows.append(
+                    _canonicalize_terminal_row(
+                        {"filename": filename},
+                        fallback_status=fallback_status,
+                    )
+                )
+            return terminal_rows
 
         with lock:
             for raw_case_id, job in jobs.items():
@@ -385,16 +565,36 @@ class ProcessControlService:
             queue_case_id = str(item.get("case_id") or "")
             status = str(item.get("status") or "")
             job_kind = str(item.get("job_kind") or "")
+            completed_fallback_filenames = _completed_fallback_filenames(
+                item=item,
+                metadata=metadata,
+                filenames=filenames,
+            )
             file_progress = self._build_file_progress_rows(
                 case_id=queue_case_id,
                 filenames=filenames,
                 stage_name=self._stage_name_for_job_kind(job_kind),
-                fallback_status=status,
+                fallback_status="pending" if process_type == "queue_job_completed" else status,
                 snapshot_cache=pipeline_snapshot_cache,
+                expected_job_kind=job_kind,
+                expected_submission_id=submission_id,
             )
+            if process_type == "queue_job_completed":
+                file_progress = _build_terminal_rows_for_completed_item(
+                    file_progress=file_progress,
+                    filenames=filenames,
+                    fallback_status=status,
+                    fallback_filenames=completed_fallback_filenames,
+                )
+                filenames = [
+                    str(row.get("filename") or "").strip()
+                    for row in file_progress
+                    if isinstance(row, dict) and str(row.get("filename") or "").strip()
+                ]
             return {
                 "type": process_type,
                 "queue_job_id": int(item.get("job_id", 0)),
+                "queue_job_ids": [int(item.get("job_id", 0))] if int(item.get("job_id", 0)) > 0 else [],
                 "job_kind": job_kind,
                 "priority": int(item.get("priority", 0)),
                 "case_id": queue_case_id,
@@ -427,7 +627,7 @@ class ProcessControlService:
                 "updated_at": str(item.get("updated_at") or ""),
             }
 
-        def _collapse_completed_by_submission(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        def _collapse_queue_items_by_submission(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
             def _merge_unique(left: list[str], right: list[str]) -> list[str]:
                 merged: list[str] = []
                 seen: set[str] = set()
@@ -457,9 +657,16 @@ class ProcessControlService:
                     return safe_left
                 return safe_left if safe_left >= safe_right else safe_right
 
-            def _merge_status(current: str, incoming: str) -> str:
+            def _merge_status(current: str, incoming: str, *, process_type: str) -> str:
                 current_norm = str(current or "").strip().lower()
                 incoming_norm = str(incoming or "").strip().lower()
+                if process_type == "queue_job":
+                    running_statuses = {"running", "cancelling"}
+                    queued_statuses = {"queued", "pending", "starting"}
+                    if current_norm in running_statuses or incoming_norm in running_statuses:
+                        return "running"
+                    if current_norm in queued_statuses or incoming_norm in queued_statuses:
+                        return "queued"
                 error_statuses = {
                     "completed_with_errors",
                     "failed",
@@ -481,22 +688,88 @@ class ProcessControlService:
                 incoming_rows: list[dict[str, Any]],
                 *,
                 filenames_order: list[str],
+                process_type: str,
             ) -> list[dict[str, Any]]:
+                def _normalize_row_status(value: Any) -> str:
+                    return _normalize_status_token(value)
+
+                def _canonicalize_pending_row(row: dict[str, Any]) -> dict[str, Any]:
+                    normalized_row = dict(row)
+                    normalized_row["status"] = "pending"
+                    normalized_row["processed_frames"] = 0
+                    normalized_row["estimated_total_frames"] = 0
+                    normalized_row["progress_percent"] = 0.0
+                    normalized_row["is_current"] = False
+                    normalized_row.pop("phase", None)
+                    normalized_row.pop("phase_label", None)
+                    return normalized_row
+
+                def _canonicalize_progress_row(
+                    row: dict[str, Any],
+                    *,
+                    row_process_type: str,
+                ) -> dict[str, Any]:
+                    normalized_row = dict(row)
+                    status_value = _normalize_row_status(normalized_row.get("status"))
+                    if row_process_type == "queue_job" and status_value in pending_row_statuses:
+                        normalized_row = _canonicalize_pending_row(normalized_row)
+                    return normalized_row
+
+                def _row_priority(row: dict[str, Any], *, row_process_type: str) -> int:
+                    status_value = _normalize_row_status(row.get("status"))
+                    if row_process_type == "queue_job":
+                        if status_value in running_row_statuses:
+                            return 3
+                        if status_value in pending_row_statuses:
+                            return 2
+                        if status_value in terminal_row_statuses:
+                            return 1
+                        return 0
+                    if row_process_type == "queue_job_completed":
+                        if status_value in terminal_row_statuses:
+                            return 3
+                        if status_value in running_row_statuses:
+                            return 2
+                        if status_value in pending_row_statuses:
+                            return 1
+                        return 0
+                    return 0
+
                 rows_by_filename: dict[str, dict[str, Any]] = {}
                 for row in [*existing_rows, *incoming_rows]:
                     if not isinstance(row, dict):
                         continue
-                    filename = str(row.get("filename") or "").strip()
+                    normalized_row = _canonicalize_progress_row(row, row_process_type=process_type)
+                    if (
+                        process_type == "queue_job_completed"
+                        and not _is_terminal_row_status(normalized_row.get("status"))
+                    ):
+                        continue
+                    filename = str(normalized_row.get("filename") or "").strip()
                     if not filename:
                         continue
                     current = rows_by_filename.get(filename)
                     if not isinstance(current, dict):
-                        rows_by_filename[filename] = dict(row)
+                        rows_by_filename[filename] = dict(normalized_row)
+                        continue
+                    current_priority = _row_priority(current, row_process_type=process_type)
+                    incoming_priority = _row_priority(normalized_row, row_process_type=process_type)
+                    if incoming_priority > current_priority:
+                        rows_by_filename[filename] = dict(normalized_row)
+                        continue
+                    if incoming_priority < current_priority:
+                        continue
+                    if process_type == "queue_job" and incoming_priority <= 2:
+                        # For active queue cards, avoid replacing clean pending/terminal rows with stale
+                        # historical values on equal-priority ties.
                         continue
                     current_percent = self._safe_float(current.get("progress_percent", 0.0), fallback=0.0)
-                    incoming_percent = self._safe_float(row.get("progress_percent", 0.0), fallback=0.0)
+                    incoming_percent = self._safe_float(
+                        normalized_row.get("progress_percent", 0.0),
+                        fallback=0.0,
+                    )
                     if incoming_percent >= current_percent:
-                        rows_by_filename[filename] = dict(row)
+                        rows_by_filename[filename] = dict(normalized_row)
                 ordered_rows: list[dict[str, Any]] = []
                 for filename in filenames_order:
                     row = rows_by_filename.pop(filename, None)
@@ -504,7 +777,44 @@ class ProcessControlService:
                         ordered_rows.append(row)
                 for row in rows_by_filename.values():
                     ordered_rows.append(row)
+                if process_type == "queue_job":
+                    ordered_rows = [
+                        _canonicalize_progress_row(row, row_process_type=process_type)
+                        for row in ordered_rows
+                        if isinstance(row, dict)
+                    ]
                 return ordered_rows
+
+            def _sanitize_active_queue_rows(item: dict[str, Any]) -> None:
+                if str(item.get("type") or "").strip().lower() != "queue_job":
+                    return
+                item_status = _normalize_status_token(item.get("status"))
+                raw_rows = item.get("file_progress")
+                if not isinstance(raw_rows, list):
+                    item["file_progress"] = []
+                    return
+                sanitized_rows: list[dict[str, Any]] = []
+                for raw_row in raw_rows:
+                    if not isinstance(raw_row, dict):
+                        continue
+                    row = dict(raw_row)
+                    row_status = _normalize_status_token(row.get("status"))
+                    should_force_pending = False
+                    if item_status in pending_row_statuses:
+                        # Queued/pending cards should always render as clean queued state.
+                        should_force_pending = row_status not in running_row_statuses
+                    elif row_status in pending_row_statuses:
+                        should_force_pending = True
+                    if should_force_pending:
+                        row["status"] = "pending"
+                        row["processed_frames"] = 0
+                        row["estimated_total_frames"] = 0
+                        row["progress_percent"] = 0.0
+                        row["is_current"] = False
+                        row.pop("phase", None)
+                        row.pop("phase_label", None)
+                    sanitized_rows.append(row)
+                item["file_progress"] = sanitized_rows
 
             grouped: dict[tuple[str, str, str], dict[str, Any]] = {}
             ordered_refs: list[tuple[str, Any]] = []
@@ -519,7 +829,7 @@ class ProcessControlService:
                     or metadata.get("submission_id")
                     or "",
                 ).strip()
-                if process_type != "queue_job_completed" or not submission_id:
+                if process_type not in {"queue_job", "queue_job_completed"} or not submission_id:
                     ordered_refs.append(("item", raw_item))
                     continue
 
@@ -541,6 +851,32 @@ class ProcessControlService:
                         or clone_metadata.get("submission_kind")
                         or job_kind_value,
                     ).strip().lower()
+                    clone["queue_job_ids"] = sorted(
+                        {
+                            int(value)
+                            for value in [
+                                raw_item.get("queue_job_id"),
+                                *(
+                                    raw_item.get("queue_job_ids")
+                                    if isinstance(raw_item.get("queue_job_ids"), list)
+                                    else []
+                                ),
+                            ]
+                            if self._safe_int(value, 0) > 0
+                        }
+                    )
+                    if process_type == "queue_job":
+                        clone_progress = (
+                            clone.get("file_progress")
+                            if isinstance(clone.get("file_progress"), list)
+                            else []
+                        )
+                        clone["file_progress"] = _merge_file_progress(
+                            [],
+                            [row for row in clone_progress if isinstance(row, dict)],
+                            filenames_order=self._normalize_filenames(clone.get("filenames")),
+                            process_type=process_type,
+                        )
                     grouped[group_key] = clone
                     ordered_refs.append(("group", group_key))
                     continue
@@ -564,6 +900,26 @@ class ProcessControlService:
                     self._safe_int(aggregate.get("queue_job_id", 0)),
                     self._safe_int(raw_item.get("queue_job_id", 0)),
                 )
+                aggregate["queue_job_ids"] = sorted(
+                    {
+                        int(value)
+                        for value in [
+                            aggregate.get("queue_job_id"),
+                            raw_item.get("queue_job_id"),
+                            *(
+                                aggregate.get("queue_job_ids")
+                                if isinstance(aggregate.get("queue_job_ids"), list)
+                                else []
+                            ),
+                            *(
+                                raw_item.get("queue_job_ids")
+                                if isinstance(raw_item.get("queue_job_ids"), list)
+                                else []
+                            ),
+                        ]
+                        if self._safe_int(value, 0) > 0
+                    }
+                )
                 aggregate["priority"] = min(
                     max(0, self._safe_int(aggregate.get("priority", 0))),
                     max(0, self._safe_int(raw_item.get("priority", 0))),
@@ -579,6 +935,7 @@ class ProcessControlService:
                 aggregate["status"] = _merge_status(
                     str(aggregate.get("status") or ""),
                     str(raw_item.get("status") or ""),
+                    process_type=process_type,
                 )
                 aggregate["enqueued_at"] = _pick_earliest(
                     str(aggregate.get("enqueued_at") or ""),
@@ -663,6 +1020,7 @@ class ProcessControlService:
                     [row for row in existing_progress if isinstance(row, dict)],
                     [row for row in incoming_progress if isinstance(row, dict)],
                     filenames_order=merged_filenames,
+                    process_type=process_type,
                 )
 
             collapsed: list[dict[str, Any]] = []
@@ -676,6 +1034,47 @@ class ProcessControlService:
                 grouped_item = grouped.get(ref_value)
                 if isinstance(grouped_item, dict):
                     collapsed.append(grouped_item)
+            for item in collapsed:
+                item_type = str(item.get("type") or "").strip().lower()
+                if item_type == "queue_job":
+                    item_progress = (
+                        item.get("file_progress")
+                        if isinstance(item.get("file_progress"), list)
+                        else []
+                    )
+                    item["file_progress"] = _merge_file_progress(
+                        [],
+                        [row for row in item_progress if isinstance(row, dict)],
+                        filenames_order=self._normalize_filenames(item.get("filenames")),
+                        process_type="queue_job",
+                    )
+                    _sanitize_active_queue_rows(item)
+                    continue
+                if item_type != "queue_job_completed":
+                    continue
+                terminal_rows = _build_terminal_rows_for_completed_item(
+                    file_progress=item.get("file_progress"),
+                    filenames=self._normalize_filenames(item.get("filenames")),
+                    fallback_status=str(item.get("status") or ""),
+                    fallback_filenames=_completed_fallback_filenames(
+                        item=item,
+                        metadata=(
+                            item.get("metadata")
+                            if isinstance(item.get("metadata"), dict)
+                            else {}
+                        ),
+                        filenames=self._normalize_filenames(item.get("filenames")),
+                    ),
+                )
+                item["file_progress"] = terminal_rows
+                terminal_filenames = [
+                    str(row.get("filename") or "").strip()
+                    for row in terminal_rows
+                    if isinstance(row, dict) and str(row.get("filename") or "").strip()
+                ]
+                item["filenames"] = terminal_filenames
+                item["filenames_count"] = len(terminal_filenames)
+                item["filenames_preview"] = terminal_filenames[:5]
             return collapsed
 
         if queue_store is not None and hasattr(queue_store, "list_active_jobs"):
@@ -714,7 +1113,8 @@ class ProcessControlService:
         else:
             processes = list(processes_all)
             completed_processes = list(completed_processes_all)
-        completed_processes = _collapse_completed_by_submission(completed_processes)
+        processes = _collapse_queue_items_by_submission(processes)
+        completed_processes = _collapse_queue_items_by_submission(completed_processes)
 
         blocked_by_other_case = False
         blocking_case_id = ""

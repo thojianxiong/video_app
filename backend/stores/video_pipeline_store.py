@@ -22,6 +22,18 @@ class VideoPipelineStore:
         "analysis",
     )
     STAGE_TERMINAL = {"completed", "failed", "skipped", "interrupted"}
+    STAGE_RUNTIME_DETAIL_KEYS = {
+        "processed_frames",
+        "estimated_total_frames",
+        "total_frames",
+        "progress_percent",
+        "phase",
+        "phase_label",
+        "analysis_status",
+        "face_identity_status",
+        "face_identity_indexed",
+        "face_identity_reason",
+    }
 
     def __init__(self, db_path: Path) -> None:
         self.db_path = Path(db_path)
@@ -277,11 +289,28 @@ class VideoPipelineStore:
                 existing_details = stage_payload.get("details")
                 if not isinstance(existing_details, dict):
                     existing_details = {}
-                existing_details.update(detail_payload)
-                stage_payload["details"] = existing_details
+                if next_status == "pending":
+                    # Queueing a fresh run must not inherit stale runtime/progress fields.
+                    clean_details = {
+                        key: value
+                        for key, value in existing_details.items()
+                        if key not in self.STAGE_RUNTIME_DETAIL_KEYS
+                    }
+                    clean_details.update(detail_payload)
+                    stage_payload["details"] = clean_details
+                else:
+                    existing_details.update(detail_payload)
+                    stage_payload["details"] = existing_details
             else:
                 existing_details = stage_payload.get("details")
-                stage_payload["details"] = dict(existing_details) if isinstance(existing_details, dict) else {}
+                details_payload = dict(existing_details) if isinstance(existing_details, dict) else {}
+                if next_status == "pending":
+                    details_payload = {
+                        key: value
+                        for key, value in details_payload.items()
+                        if key not in self.STAGE_RUNTIME_DETAIL_KEYS
+                    }
+                stage_payload["details"] = details_payload
 
             if next_status == "running":
                 stage_payload["started_at"] = now

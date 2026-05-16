@@ -1310,12 +1310,38 @@ class MediaService:
         filenames: list[str],
         snapshots_by_filename: dict[str, dict],
         stage_name: str,
+        expected_job_kind: str = "",
+        expected_submission_id: str = "",
     ) -> dict:
+        safe_expected_job_kind = str(expected_job_kind or "").strip().lower()
+        safe_expected_submission_id = str(expected_submission_id or "").strip()
         processed = 0
         failed = 0
         for filename in filenames:
             snapshot = snapshots_by_filename.get(filename)
-            stage_status = cls._stage_status(snapshot or {}, stage_name)
+            stage_payload = cls._stage_payload(snapshot or {}, stage_name)
+            details = (
+                stage_payload.get("details")
+                if isinstance(stage_payload.get("details"), dict)
+                else {}
+            )
+            details_job_kind = str(
+                details.get("analysis_job_kind")
+                or details.get("queue_job_kind")
+                or details.get("job_kind")
+                or ""
+            ).strip().lower()
+            details_submission_id = str(details.get("submission_id") or "").strip()
+            if safe_expected_job_kind:
+                if not details_job_kind or details_job_kind != safe_expected_job_kind:
+                    stage_status = "pending"
+                else:
+                    stage_status = cls._stage_status(snapshot or {}, stage_name)
+            else:
+                stage_status = cls._stage_status(snapshot or {}, stage_name)
+            if safe_expected_submission_id:
+                if not details_submission_id or details_submission_id != safe_expected_submission_id:
+                    stage_status = "pending"
             if stage_status in {"completed", "skipped", "failed"}:
                 processed += 1
             if stage_status == "failed":
@@ -1436,6 +1462,8 @@ class MediaService:
         current_processed_frames: int = 0,
         current_total_frames: int = 0,
         current_progress_percent: float = 0.0,
+        expected_job_kind: str = "",
+        expected_submission_id: str = "",
     ) -> list[dict]:
         safe_stage_name = str(stage_name or "").strip().lower()
         safe_fallback_status = str(fallback_status or "pending").strip().lower() or "pending"
@@ -1443,6 +1471,8 @@ class MediaService:
         safe_current_processed = max(0, int(current_processed_frames or 0))
         safe_current_total = max(0, int(current_total_frames or 0))
         safe_current_percent = min(100.0, max(0.0, float(current_progress_percent or 0.0)))
+        safe_expected_job_kind = str(expected_job_kind or "").strip().lower()
+        safe_expected_submission_id = str(expected_submission_id or "").strip()
 
         rows: list[dict] = []
         for filename in cls._unique_filenames(filenames):
@@ -1455,6 +1485,30 @@ class MediaService:
             stage_status = str(stage_payload.get("status") or "").strip().lower()
             status = stage_status or safe_fallback_status
             details = stage_payload.get("details") if isinstance(stage_payload.get("details"), dict) else {}
+            details_job_kind = str(
+                details.get("analysis_job_kind")
+                or details.get("queue_job_kind")
+                or details.get("job_kind")
+                or ""
+            ).strip().lower()
+            details_submission_id = str(details.get("submission_id") or "").strip()
+            kind_matches = (
+                (not safe_expected_job_kind)
+                or (
+                    bool(details_job_kind)
+                    and details_job_kind == safe_expected_job_kind
+                )
+            )
+            submission_matches = (
+                (not safe_expected_submission_id)
+                or (
+                    bool(details_submission_id)
+                    and details_submission_id == safe_expected_submission_id
+                )
+            )
+            if not kind_matches or not submission_matches:
+                status = "pending"
+                details = {}
 
             processed = max(0, int(details.get("processed_frames", 0)))
             total = max(
@@ -1498,6 +1552,10 @@ class MediaService:
                 # Keep running rows below 100% so users can distinguish "still working" from done.
                 if progress_percent >= 100.0:
                     progress_percent = 99.0
+            elif status in {"queued", "pending", "starting"}:
+                processed = 0
+                total = 0
+                progress_percent = 0.0
 
             rows.append(
                 {
@@ -1509,10 +1567,11 @@ class MediaService:
                     "is_current": bool(is_current),
                 }
             )
-            if isinstance(details.get("phase"), str) and str(details.get("phase")).strip():
-                rows[-1]["phase"] = str(details.get("phase")).strip()
-            if isinstance(details.get("phase_label"), str) and str(details.get("phase_label")).strip():
-                rows[-1]["phase_label"] = str(details.get("phase_label")).strip()
+            if status not in {"queued", "pending", "starting"}:
+                if isinstance(details.get("phase"), str) and str(details.get("phase")).strip():
+                    rows[-1]["phase"] = str(details.get("phase")).strip()
+                if isinstance(details.get("phase_label"), str) and str(details.get("phase_label")).strip():
+                    rows[-1]["phase_label"] = str(details.get("phase_label")).strip()
         return rows
 
     @staticmethod
@@ -1570,6 +1629,8 @@ class MediaService:
                 "enqueued_at": "",
                 "started_at": "",
                 "finished_at": "",
+                "submission_id": "",
+                "submission_created_at": "",
             },
             "progress": {
                 "completed": 0,
@@ -1586,6 +1647,8 @@ class MediaService:
                 "vehicles": False,
                 "face_identity": False,
             },
+            "submission_id": "",
+            "submission_created_at": "",
             "message": "No analysis job found for this case.",
         }
 
@@ -1716,6 +1779,8 @@ class MediaService:
         except Exception:
             safe_bucket_seconds = 1.0
         safe_submission_id = str(submission_id or "").strip()
+        if not safe_submission_id:
+            safe_submission_id = uuid4().hex
         safe_submission_created_at = str(submission_created_at or "").strip()
         if not safe_submission_created_at:
             safe_submission_created_at = datetime.now(timezone.utc).isoformat()
@@ -1755,11 +1820,10 @@ class MediaService:
             "bucket_seconds": float(safe_bucket_seconds),
             "force": bool(force),
             "auto_trigger": str(source or "upload_auto"),
+            "submission_id": safe_submission_id,
+            "submission_created_at": safe_submission_created_at,
+            "submission_kind": self.QUEUE_KIND_TRIAGE_TIMELINE,
         }
-        if safe_submission_id:
-            metadata["submission_id"] = safe_submission_id
-            metadata["submission_created_at"] = safe_submission_created_at
-            metadata["submission_kind"] = self.QUEUE_KIND_TRIAGE_TIMELINE
 
         try:
             queued_job = await asyncio.to_thread(
@@ -3692,6 +3756,7 @@ class MediaService:
                     "frame_interval_seconds": float(frame_interval_seconds),
                     "batch_size": int(batch_size),
                     "force": bool(force),
+                    "queue_job_kind": self.QUEUE_KIND_SEMANTIC_INDEX,
                     "submission_id": submission_id,
                     "submission_created_at": submission_created_at,
                 },
@@ -4118,6 +4183,7 @@ class MediaService:
             *,
             target_filenames: list[str],
             stage_name: str,
+            job_kind: str,
             face_people: bool,
             vehicles: bool,
             face_identity: bool,
@@ -4138,6 +4204,7 @@ class MediaService:
                         "frame_interval_seconds": float(frame_interval_seconds),
                         "batch_size": int(batch_size),
                         "force": bool(force),
+                        "analysis_job_kind": str(job_kind or "").strip().lower(),
                         "analysis_face_people": bool(face_people),
                         "analysis_vehicles": bool(vehicles),
                         "analysis_face_identity": bool(face_identity),
@@ -4149,6 +4216,7 @@ class MediaService:
         await _mark_queued_stage(
             target_filenames=queue_face_people_filenames,
             stage_name=self.ANALYSIS_STAGE_FACE_PEOPLE,
+            job_kind=self.QUEUE_KIND_ANALYSIS_FACE_PEOPLE,
             face_people=True,
             vehicles=False,
             face_identity=bool(effective_face_identity),
@@ -4157,6 +4225,7 @@ class MediaService:
         await _mark_queued_stage(
             target_filenames=queue_face_identity_filenames,
             stage_name=self.ANALYSIS_STAGE_FACE_IDENTITY,
+            job_kind=self.QUEUE_KIND_ANALYSIS_FACE_IDENTITY,
             face_people=False,
             vehicles=False,
             face_identity=True,
@@ -4165,6 +4234,7 @@ class MediaService:
         await _mark_queued_stage(
             target_filenames=queue_vehicle_filenames,
             stage_name=self.ANALYSIS_STAGE_VEHICLES,
+            job_kind=self.QUEUE_KIND_ANALYSIS_VEHICLES,
             face_people=False,
             vehicles=True,
             face_identity=False,
@@ -4464,6 +4534,8 @@ class MediaService:
             current_processed_frames=int(snapshot.get("current_video_processed_frames", 0) or 0),
             current_total_frames=int(snapshot.get("current_video_total_frames", 0) or 0),
             current_progress_percent=float(snapshot.get("current_video_progress_percent", 0.0) or 0.0),
+            expected_job_kind=str(snapshot.get("queue_job_kind") or self.QUEUE_KIND_SEMANTIC_INDEX),
+            expected_submission_id=str(snapshot.get("submission_id") or ""),
         )
         snapshot["file_progress"] = file_progress
 
@@ -4675,6 +4747,16 @@ class MediaService:
             selected_job_kind,
             category=selected_category or "",
         )
+        submission_id = str(
+            metadata.get("submission_id")
+            or selected_job.get("submission_id")
+            or "",
+        ).strip()
+        submission_created_at = str(
+            metadata.get("submission_created_at")
+            or selected_job.get("submission_created_at")
+            or "",
+        ).strip()
 
         if selected_category and not filenames:
             payload["analysis"] = {
@@ -4719,6 +4801,8 @@ class MediaService:
             filenames=filenames,
             snapshots_by_filename=snapshots_by_filename,
             stage_name=stage_name,
+            expected_job_kind=selected_job_kind,
+            expected_submission_id=submission_id,
         )
         final_status = self._analysis_status_from_queue(
             queue_status,
@@ -4760,7 +4844,11 @@ class MediaService:
             "enqueued_at": str(selected_job.get("enqueued_at") or ""),
             "started_at": str(selected_job.get("started_at") or ""),
             "finished_at": str(selected_job.get("finished_at") or ""),
+            "submission_id": submission_id,
+            "submission_created_at": submission_created_at,
         }
+        payload["submission_id"] = submission_id
+        payload["submission_created_at"] = submission_created_at
         payload["progress"] = {
             "completed": progress_completed,
             "total": progress_total,
@@ -4772,6 +4860,8 @@ class MediaService:
             snapshots_by_filename=snapshots_by_filename,
             stage_name=stage_name,
             fallback_status=queue_status or "pending",
+            expected_job_kind=selected_job_kind,
+            expected_submission_id=submission_id,
         )
         payload["analysis_face_people_filenames"] = self._unique_filenames(face_people_filenames)
         payload["analysis_vehicles_filenames"] = self._unique_filenames(vehicle_filenames)

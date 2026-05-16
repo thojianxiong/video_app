@@ -8,6 +8,7 @@ let indexQueueSummaryBtn = null;
 let existingIndexPanel = null;
 let existingIndexSelectAll = null;
 let existingIndexList = null;
+let existingIndexSelectionMeta = null;
 let runExistingIndexBtn = null;
 let taskProgress = null;
 let taskProgressLabel = null;
@@ -22,6 +23,12 @@ let videoSelectionMeta = null;
 let triageStatus = null;
 let triageList = null;
 let triageDetail = null;
+let triageSettingsModeMountainBtn = null;
+let triageSettingsModePeaksBtn = null;
+let triageSettingsModeChangePointBtn = null;
+let saveTriageSettingsBtn = null;
+let triageSettingsPendingBadge = null;
+let triageSettingsMeta = null;
 let videoList = null;
 let embeddingProfileSelect = null;
 let embeddingDeviceSelect = null;
@@ -78,6 +85,14 @@ let vehicleSearchBtn = null;
 let faceWall = null;
 let peopleWall = null;
 let vehicleWall = null;
+let faceWallModeGroupedBtn = null;
+let faceWallModeRawBtn = null;
+let semanticPlayerPanel = null;
+let facePeoplePlayerPanel = null;
+let vehiclePlayerPanel = null;
+let semanticPlayerToggleBtn = null;
+let facePeoplePlayerToggleBtn = null;
+let vehiclePlayerToggleBtn = null;
 let facePeoplePlayer = null;
 let facePeoplePlayerMeta = null;
 let vehiclePlayer = null;
@@ -146,6 +161,7 @@ const state = {
   embeddingSettings: null,
   analysisSettings: null,
   searchSettings: null,
+  triageSettings: null,
 };
 let caseSwitchVersion = 0;
 let caseStateVersion = 0;
@@ -159,16 +175,37 @@ const triageLoading = new Set();
 const triageErrors = new Map();
 const triageSelection = new Map();
 const videoSelectionByCase = new Map();
+const pendingCaseDeletionIds = new Set();
 let triageRefreshToken = 0;
+const TRIAGE_CHECKPOINT_MODE_MOUNTAIN = "mountain";
+const TRIAGE_CHECKPOINT_MODE_PEAKS = "peaks";
+const TRIAGE_CHECKPOINT_MODE_CHANGE_POINT = "change_point";
+const TRIAGE_NAV_LEAD_SECONDS = 1.5;
+const TRIAGE_ACTIVITY_REGION_SKIP_SECONDS = 6.0;
+let triageCheckpointMode = TRIAGE_CHECKPOINT_MODE_MOUNTAIN;
+let triageShowJumpMarkers = true;
 let indexStatusPollToken = 0;
 let indexStatusPollCaseId = "";
 const ANALYSIS_CATEGORIES = ["face_people", "vehicles"];
 const SEARCH_SCOPE_CATEGORIES = ["semantic", "face_people", "vehicles"];
+const INLINE_PLAYER_TAB_KEYS = ["semantic", "face_people", "vehicles"];
+const inlinePlayerPanelVisibility = {
+  semantic: true,
+  face_people: true,
+  vehicles: true,
+};
 const analysisStatusPollStateByCategory = {
   face_people: { token: 0, caseId: "", jobId: 0 },
   vehicles: { token: 0, caseId: "", jobId: 0 },
 };
 let uploadFlowActive = false;
+let uploadFlowCaseId = "";
+let uploadUiSnapshot = {
+  caseId: "",
+  statusMessage: "",
+  statusKind: "",
+  progress: null,
+};
 let stopBackgroundIndexInFlight = false;
 let taskProgressStopCaseId = "";
 const backgroundIndexTerminalSeen = new Map();
@@ -190,6 +227,8 @@ const searchScopeSelectionByCase = {
   face_people: new Map(),
   vehicles: new Map(),
 };
+const facePeopleGalleryPayloadByCase = new Map();
+const faceWallDisplayModeByCase = new Map();
 const SIDEBAR_MIN_WIDTH = 220;
 const SIDEBAR_MAX_WIDTH = 560;
 const RESUMABLE_UPLOAD_STATE_KEY = "visiox_resumable_upload_v1";
@@ -211,6 +250,7 @@ function bindDomElements() {
   existingIndexPanel = document.getElementById("existingIndexPanel");
   existingIndexSelectAll = document.getElementById("existingIndexSelectAll");
   existingIndexList = document.getElementById("existingIndexList");
+  existingIndexSelectionMeta = document.getElementById("existingIndexSelectionMeta");
   runExistingIndexBtn = document.getElementById("runExistingIndexBtn");
   taskProgress = document.getElementById("taskProgress");
   taskProgressLabel = document.getElementById("taskProgressLabel");
@@ -225,6 +265,12 @@ function bindDomElements() {
   triageStatus = document.getElementById("triageStatus");
   triageList = document.getElementById("triageList");
   triageDetail = document.getElementById("triageDetail");
+  triageSettingsModeMountainBtn = document.getElementById("triageSettingsModeMountainBtn");
+  triageSettingsModePeaksBtn = document.getElementById("triageSettingsModePeaksBtn");
+  triageSettingsModeChangePointBtn = document.getElementById("triageSettingsModeChangePointBtn");
+  saveTriageSettingsBtn = document.getElementById("saveTriageSettingsBtn");
+  triageSettingsPendingBadge = document.getElementById("triageSettingsPendingBadge");
+  triageSettingsMeta = document.getElementById("triageSettingsMeta");
   videoList = document.getElementById("videoList");
   embeddingProfileSelect = document.getElementById("embeddingProfileSelect");
   embeddingDeviceSelect = document.getElementById("embeddingDeviceSelect");
@@ -281,6 +327,14 @@ function bindDomElements() {
   faceWall = document.getElementById("faceWall");
   peopleWall = document.getElementById("peopleWall");
   vehicleWall = document.getElementById("vehicleWall");
+  faceWallModeGroupedBtn = document.getElementById("faceWallModeGroupedBtn");
+  faceWallModeRawBtn = document.getElementById("faceWallModeRawBtn");
+  semanticPlayerPanel = document.getElementById("semanticPlayerPanel");
+  facePeoplePlayerPanel = document.getElementById("facePeoplePlayerPanel");
+  vehiclePlayerPanel = document.getElementById("vehiclePlayerPanel");
+  semanticPlayerToggleBtn = document.getElementById("semanticPlayerToggleBtn");
+  facePeoplePlayerToggleBtn = document.getElementById("facePeoplePlayerToggleBtn");
+  vehiclePlayerToggleBtn = document.getElementById("vehiclePlayerToggleBtn");
   facePeoplePlayer = document.getElementById("facePeoplePlayer");
   facePeoplePlayerMeta = document.getElementById("facePeoplePlayerMeta");
   vehiclePlayer = document.getElementById("vehiclePlayer");
@@ -346,6 +400,194 @@ function setStatus(message, kind = "") {
   }
   uploadStatus.textContent = message;
   uploadStatus.className = `status ${kind}`.trim();
+}
+
+function normalizeInlinePlayerTabKey(tabKey) {
+  const normalized = String(tabKey || "").trim().toLowerCase();
+  return INLINE_PLAYER_TAB_KEYS.includes(normalized) ? normalized : "";
+}
+
+function getInlinePlayerPanelEntry(tabKey) {
+  const normalized = normalizeInlinePlayerTabKey(tabKey);
+  if (!normalized) {
+    return null;
+  }
+  if (normalized === "semantic") {
+    return {
+      key: normalized,
+      panel: semanticPlayerPanel,
+      toggle: semanticPlayerToggleBtn,
+      player: videoPlayer,
+    };
+  }
+  if (normalized === "face_people") {
+    return {
+      key: normalized,
+      panel: facePeoplePlayerPanel,
+      toggle: facePeoplePlayerToggleBtn,
+      player: facePeoplePlayer,
+    };
+  }
+  return {
+    key: normalized,
+    panel: vehiclePlayerPanel,
+    toggle: vehiclePlayerToggleBtn,
+    player: vehiclePlayer,
+  };
+}
+
+function applyInlinePlayerPanelVisibility(tabKey) {
+  const entry = getInlinePlayerPanelEntry(tabKey);
+  if (!entry || !entry.panel) {
+    return;
+  }
+  const isOpen = inlinePlayerPanelVisibility[entry.key] !== false;
+  entry.panel.classList.toggle("collapsed", !isOpen);
+  if (entry.toggle) {
+    entry.toggle.textContent = isOpen ? "Hide Player" : "Show Player";
+    entry.toggle.setAttribute("aria-expanded", isOpen ? "true" : "false");
+  }
+}
+
+function applyAllInlinePlayerPanelVisibility() {
+  INLINE_PLAYER_TAB_KEYS.forEach((key) => {
+    applyInlinePlayerPanelVisibility(key);
+  });
+}
+
+function toggleInlinePlayerPanel(tabKey) {
+  const entry = getInlinePlayerPanelEntry(tabKey);
+  if (!entry) {
+    return;
+  }
+  const currentOpen = inlinePlayerPanelVisibility[entry.key] !== false;
+  inlinePlayerPanelVisibility[entry.key] = !currentOpen;
+  applyInlinePlayerPanelVisibility(entry.key);
+  if (currentOpen && entry.player) {
+    pauseMediaPlayer(entry.player);
+  }
+}
+
+function inlinePlayerTabKeyForPlayer(player) {
+  if (player === videoPlayer) {
+    return "semantic";
+  }
+  if (player === facePeoplePlayer) {
+    return "face_people";
+  }
+  if (player === vehiclePlayer) {
+    return "vehicles";
+  }
+  return "";
+}
+
+function ensureInlinePlayerVisibleForPlayer(player) {
+  const key = normalizeInlinePlayerTabKey(inlinePlayerTabKeyForPlayer(player));
+  if (!key) {
+    return;
+  }
+  if (inlinePlayerPanelVisibility[key] !== false) {
+    return;
+  }
+  inlinePlayerPanelVisibility[key] = true;
+  applyInlinePlayerPanelVisibility(key);
+}
+
+function clearUploadUiContext() {
+  uploadFlowCaseId = "";
+  uploadUiSnapshot = {
+    caseId: "",
+    statusMessage: "",
+    statusKind: "",
+    progress: null,
+  };
+}
+
+function isUploadCaseVisible(caseId) {
+  const normalizedCaseId = String(caseId || "").trim();
+  const activeCaseId = String(state.activeCaseId || "").trim();
+  return Boolean(normalizedCaseId) && normalizedCaseId === activeCaseId;
+}
+
+function setUploadStatusScoped(caseId, message, kind = "") {
+  const normalizedCaseId = String(caseId || "").trim();
+  if (normalizedCaseId) {
+    uploadUiSnapshot.caseId = normalizedCaseId;
+    uploadUiSnapshot.statusMessage = String(message || "");
+    uploadUiSnapshot.statusKind = String(kind || "");
+  }
+  if (isUploadCaseVisible(normalizedCaseId)) {
+    setStatus(message, kind);
+  }
+}
+
+function setUploadProgressScoped(caseId, label, percent, meta, options = null) {
+  const normalizedCaseId = String(caseId || "").trim();
+  if (normalizedCaseId) {
+    const stopCaseId = options && typeof options === "object"
+      ? String(options.stopCaseId || "").trim()
+      : "";
+    uploadUiSnapshot.caseId = normalizedCaseId;
+    uploadUiSnapshot.progress = {
+      label: String(label || "Working..."),
+      percent: clampPercent(percent),
+      meta: String(meta || ""),
+      options: stopCaseId ? { stopCaseId } : null,
+      completed: false,
+    };
+  }
+  if (isUploadCaseVisible(normalizedCaseId)) {
+    setTaskProgressUi(label, percent, meta, options);
+  }
+}
+
+function completeUploadProgressScoped(caseId, label, meta) {
+  const normalizedCaseId = String(caseId || "").trim();
+  if (normalizedCaseId) {
+    uploadUiSnapshot.caseId = normalizedCaseId;
+    uploadUiSnapshot.progress = {
+      label: String(label || "Completed"),
+      percent: 100,
+      meta: String(meta || ""),
+      options: null,
+      completed: true,
+    };
+  }
+  if (isUploadCaseVisible(normalizedCaseId)) {
+    completeTaskProgressUi(label, meta);
+  }
+}
+
+function restoreUploadUiIfVisible() {
+  const normalizedUploadCaseId = String(uploadFlowCaseId || "").trim();
+  if (!uploadFlowActive || !normalizedUploadCaseId) {
+    return;
+  }
+  if (!isUploadCaseVisible(normalizedUploadCaseId)) {
+    return;
+  }
+  const snapshot = uploadUiSnapshot && typeof uploadUiSnapshot === "object"
+    ? uploadUiSnapshot
+    : null;
+  if (!snapshot || String(snapshot.caseId || "").trim() !== normalizedUploadCaseId) {
+    return;
+  }
+  const statusMessage = String(snapshot.statusMessage || "");
+  const statusKind = String(snapshot.statusKind || "");
+  if (statusMessage) {
+    setStatus(statusMessage, statusKind);
+  }
+  const progress = snapshot.progress && typeof snapshot.progress === "object"
+    ? snapshot.progress
+    : null;
+  if (!progress) {
+    return;
+  }
+  if (Boolean(progress.completed)) {
+    completeTaskProgressUi(progress.label, progress.meta);
+    return;
+  }
+  setTaskProgressUi(progress.label, progress.percent, progress.meta, progress.options);
 }
 
 function setEmbeddingStatus(message, kind = "") {
@@ -419,6 +661,105 @@ function setTriageStatus(message, kind = "") {
   triageStatus.className = `status ${kind}`.trim();
 }
 
+function normalizeTriageCheckpointMode(mode) {
+  const normalized = String(mode || "").trim().toLowerCase();
+  if (normalized === "anomaly") {
+    return TRIAGE_CHECKPOINT_MODE_MOUNTAIN;
+  }
+  if (normalized === "balanced") {
+    return TRIAGE_CHECKPOINT_MODE_PEAKS;
+  }
+  if (normalized === TRIAGE_CHECKPOINT_MODE_PEAKS) {
+    return TRIAGE_CHECKPOINT_MODE_PEAKS;
+  }
+  if (normalized === "change-point") {
+    return TRIAGE_CHECKPOINT_MODE_CHANGE_POINT;
+  }
+  if (normalized === TRIAGE_CHECKPOINT_MODE_CHANGE_POINT) {
+    return TRIAGE_CHECKPOINT_MODE_CHANGE_POINT;
+  }
+  return TRIAGE_CHECKPOINT_MODE_MOUNTAIN;
+}
+
+function getSavedTriageCheckpointMode() {
+  const savedMode = state?.triageSettings?.saved?.checkpoint_mode;
+  return normalizeTriageCheckpointMode(savedMode);
+}
+
+function hasPendingTriageSettingsChange() {
+  const currentMode = normalizeTriageCheckpointMode(triageCheckpointMode);
+  const savedMode = getSavedTriageCheckpointMode();
+  return currentMode !== savedMode;
+}
+
+function syncTriageSettingsPendingUi() {
+  const pending = hasPendingTriageSettingsChange();
+  if (saveTriageSettingsBtn) {
+    saveTriageSettingsBtn.disabled = !pending;
+  }
+  if (triageSettingsPendingBadge) {
+    if (pending) {
+      triageSettingsPendingBadge.removeAttribute("hidden");
+    } else {
+      triageSettingsPendingBadge.setAttribute("hidden", "");
+    }
+  }
+}
+
+function applyTriageCheckpointModeControls() {
+  const normalizedMode = normalizeTriageCheckpointMode(triageCheckpointMode);
+  triageCheckpointMode = normalizedMode;
+  const mountainActive = normalizedMode === TRIAGE_CHECKPOINT_MODE_MOUNTAIN;
+  const peaksActive = normalizedMode === TRIAGE_CHECKPOINT_MODE_PEAKS;
+  const changePointActive = normalizedMode === TRIAGE_CHECKPOINT_MODE_CHANGE_POINT;
+  triageSettingsModeMountainBtn?.classList.toggle("active", mountainActive);
+  triageSettingsModePeaksBtn?.classList.toggle("active", peaksActive);
+  triageSettingsModeChangePointBtn?.classList.toggle("active", changePointActive);
+  triageSettingsModeMountainBtn?.setAttribute("aria-pressed", mountainActive ? "true" : "false");
+  triageSettingsModePeaksBtn?.setAttribute("aria-pressed", peaksActive ? "true" : "false");
+  triageSettingsModeChangePointBtn?.setAttribute("aria-pressed", changePointActive ? "true" : "false");
+  syncTriageSettingsPendingUi();
+}
+
+function setTriageCheckpointMode(mode, options = {}) {
+  const normalizedMode = normalizeTriageCheckpointMode(mode);
+  const rerender = options && typeof options === "object"
+    ? options.rerender !== false
+    : true;
+  if (normalizedMode === triageCheckpointMode) {
+    applyTriageCheckpointModeControls();
+    return;
+  }
+  triageCheckpointMode = normalizedMode;
+  applyTriageCheckpointModeControls();
+  if (rerender) {
+    renderTriageDetail();
+  }
+}
+
+function triageJumpMarkerToggleLabel() {
+  return triageShowJumpMarkers ? "Hide Jump Markers" : "Show Jump Markers";
+}
+
+function setTriageShowJumpMarkers(value, options = {}) {
+  const nextValue = Boolean(value);
+  const rerender = options && typeof options === "object"
+    ? options.rerender !== false
+    : true;
+  triageShowJumpMarkers = nextValue;
+  if (rerender) {
+    renderTriageDetail();
+  }
+}
+
+function setTriageSettingsStatus(message, kind = "") {
+  if (!triageSettingsMeta) {
+    return;
+  }
+  triageSettingsMeta.textContent = String(message || "");
+  triageSettingsMeta.className = `status ${kind}`.trim();
+}
+
 function setSemanticSearchMeta(message, kind = "") {
   if (!semanticSearchMeta) {
     return;
@@ -433,6 +774,17 @@ function setSearchSettingsStatus(message, kind = "") {
   }
   searchSettingsMeta.textContent = String(message || "");
   searchSettingsMeta.className = `status ${kind}`.trim();
+}
+
+function triageCheckpointModeLabel(mode) {
+  const normalized = normalizeTriageCheckpointMode(mode);
+  if (normalized === TRIAGE_CHECKPOINT_MODE_CHANGE_POINT) {
+    return "Change Point";
+  }
+  if (normalized === TRIAGE_CHECKPOINT_MODE_PEAKS) {
+    return "Peaks";
+  }
+  return "Mountain";
 }
 
 function setReportQueueStatus(message, kind = "") {
@@ -902,29 +1254,46 @@ function getExistingIndexCheckboxes() {
   );
 }
 
+function getExistingIndexSelectableCheckboxes() {
+  return getExistingIndexCheckboxes().filter((input) => !Boolean(input.disabled));
+}
+
 function syncExistingIndexSelectAllControl() {
   if (!existingIndexSelectAll) {
     return;
   }
   const checkboxes = getExistingIndexCheckboxes();
-  if (!checkboxes.length) {
+  const selectable = getExistingIndexSelectableCheckboxes();
+  if (!selectable.length) {
     existingIndexSelectAll.checked = false;
     existingIndexSelectAll.indeterminate = false;
     existingIndexSelectAll.disabled = true;
+    if (existingIndexSelectionMeta) {
+      existingIndexSelectionMeta.textContent = "0 selected";
+    }
+    if (runExistingIndexBtn) {
+      runExistingIndexBtn.disabled = true;
+    }
     return;
   }
 
-  const selectedCount = checkboxes.reduce(
+  const selectedCount = selectable.reduce(
     (count, input) => count + (input.checked ? 1 : 0),
     0,
   );
   existingIndexSelectAll.disabled = false;
-  existingIndexSelectAll.checked = selectedCount === checkboxes.length;
-  existingIndexSelectAll.indeterminate = selectedCount > 0 && selectedCount < checkboxes.length;
+  existingIndexSelectAll.checked = selectedCount === selectable.length;
+  existingIndexSelectAll.indeterminate = selectedCount > 0 && selectedCount < selectable.length;
+  if (existingIndexSelectionMeta) {
+    existingIndexSelectionMeta.textContent = `${selectedCount} selected`;
+  }
+  if (runExistingIndexBtn) {
+    runExistingIndexBtn.disabled = selectedCount <= 0;
+  }
 }
 
 function setAllExistingIndexSelection(checked) {
-  const checkboxes = getExistingIndexCheckboxes();
+  const checkboxes = getExistingIndexSelectableCheckboxes();
   checkboxes.forEach((input) => {
     input.checked = Boolean(checked);
   });
@@ -932,7 +1301,7 @@ function setAllExistingIndexSelection(checked) {
 }
 
 function getSelectedExistingIndexFilenames() {
-  const checkboxes = getExistingIndexCheckboxes();
+  const checkboxes = getExistingIndexSelectableCheckboxes();
   return checkboxes
     .filter((input) => input.checked)
     .map((input) => String(input.dataset.filename || "").trim())
@@ -1019,13 +1388,11 @@ function renderExistingIndexSelectionList(videos) {
   }
 
   const activeCaseId = String(state.activeCaseId || "").trim();
+  const persistedSelection = new Set(getSelectedExistingIndexFilenames());
   existingIndexList.innerHTML = "";
 
   if (!activeCaseId) {
     existingIndexPanel.hidden = true;
-    if (runExistingIndexBtn) {
-      runExistingIndexBtn.disabled = true;
-    }
     syncExistingIndexSelectAllControl();
     return;
   }
@@ -1034,70 +1401,53 @@ function renderExistingIndexSelectionList(videos) {
   const list = Array.isArray(videos) ? videos : [];
   if (!list.length) {
     existingIndexList.appendChild(createInsightEmptyElement("No uploaded videos yet."));
-    if (runExistingIndexBtn) {
-      runExistingIndexBtn.disabled = true;
-    }
     syncExistingIndexSelectAllControl();
     return;
   }
 
-  const unindexedVideos = list
-    .filter((video) => !isVideoSemanticallyIndexed(video))
-    .sort((a, b) => String(a.filename).localeCompare(String(b.filename)));
+  const sortedVideos = [...list].sort((a, b) => String(a.filename).localeCompare(String(b.filename)));
   const queuedOrRunningFilenames = getActiveQueuedOrRunningIndexFilenames(activeCaseId);
-  const selectableUnindexedVideos = unindexedVideos.filter((video) => (
-    !queuedOrRunningFilenames.has(String(video?.filename || "").trim())
-  ));
 
-  if (!selectableUnindexedVideos.length) {
-    const message = unindexedVideos.length && queuedOrRunningFilenames.size
-      ? "All unindexed videos are already queued/running for semantic indexing."
-      : "All uploaded videos are already semantically indexed.";
-    existingIndexList.appendChild(
-      createInsightEmptyElement(message),
-    );
-    if (runExistingIndexBtn) {
-      runExistingIndexBtn.disabled = true;
-    }
-    syncExistingIndexSelectAllControl();
-    return;
-  }
+  sortedVideos.forEach((video) => {
+    const safeFilename = String(video?.filename || "").trim();
+    const indexed = isVideoSemanticallyIndexed(video);
+    const queuedOrRunning = safeFilename && queuedOrRunningFilenames.has(safeFilename);
+    const selectable = Boolean(safeFilename) && !indexed && !queuedOrRunning;
 
-  selectableUnindexedVideos.forEach((video) => {
     const row = document.createElement("div");
     row.className = "analysis-video-item";
 
-    const label = document.createElement("label");
-    label.className = "analysis-video-label";
-
-    const checkbox = document.createElement("input");
-    checkbox.type = "checkbox";
-    checkbox.checked = true;
-    checkbox.className = "analysis-select-checkbox existing-index-checkbox";
-    checkbox.dataset.filename = String(video.filename || "");
-    checkbox.addEventListener("change", () => {
-      syncExistingIndexSelectAllControl();
-    });
-
-    const text = document.createElement("span");
-    text.className = "analysis-video-name";
-    text.textContent = String(video.filename || "");
-
-    label.appendChild(checkbox);
-    label.appendChild(text);
+    const label = buildSelectionLabel(video, "semantic_index");
+    const checkbox = label.querySelector("input.analysis-select-checkbox");
+    if (checkbox) {
+      checkbox.classList.add("existing-index-checkbox");
+      checkbox.checked = selectable && (
+        persistedSelection.size > 0
+          ? persistedSelection.has(safeFilename)
+          : true
+      );
+      checkbox.disabled = !selectable;
+      if (queuedOrRunning) {
+        checkbox.title = "Already queued/running for semantic indexing.";
+      } else if (indexed) {
+        checkbox.title = "Already semantically indexed.";
+      } else {
+        checkbox.title = "";
+      }
+      checkbox.addEventListener("change", () => {
+        syncExistingIndexSelectAllControl();
+      });
+    }
 
     const status = document.createElement("div");
-    status.className = "analysis-video-status";
-    status.textContent = `${formatBytes(video.size_bytes)} | not indexed`;
+    status.className = "analysis-video-status analysis-video-status-chips";
+    appendSemanticStatusChips(status, video, { indexed });
 
     row.appendChild(label);
     row.appendChild(status);
     existingIndexList.appendChild(row);
   });
 
-  if (runExistingIndexBtn) {
-    runExistingIndexBtn.disabled = false;
-  }
   syncExistingIndexSelectAllControl();
 }
 
@@ -1528,8 +1878,8 @@ function updateAnalysisQueueSummaryButton(category, caseId, statusPayload) {
   const count = filenames.length;
   const label = analysisCategoryLabel(normalizedCategory);
   button.textContent = interrupted
-    ? `${count} interrupted file${count === 1 ? "" : "s"} for ${label} analysis`
-    : `${count} file${count === 1 ? "" : "s"} queued for ${label} analysis`;
+    ? `${count} interrupted file${count === 1 ? "" : "s"} for ${label} indexing`
+    : `${count} file${count === 1 ? "" : "s"} queued for ${label} indexing`;
   button.hidden = false;
 }
 
@@ -1588,12 +1938,12 @@ function openAnalysisQueueSummaryPopup(category) {
   }
   const payload = getAnalysisQueueStatusCache(normalizedCategory, caseId);
   if (!payload || typeof payload !== "object") {
-    setCategoryAnalysisStatus(normalizedCategory, "No active analysis queue for this case.", "error");
+    setCategoryAnalysisStatus(normalizedCategory, "No active indexing queue for this case.", "error");
     return;
   }
   const filenames = activeCaseFilenamesFromPayload(payload);
   if (!filenames.length) {
-    setCategoryAnalysisStatus(normalizedCategory, "No queued files found for analysis.", "error");
+    setCategoryAnalysisStatus(normalizedCategory, "No queued files found for indexing.", "error");
     return;
   }
   const queue = payload.queue && typeof payload.queue === "object" ? payload.queue : {};
@@ -1603,6 +1953,12 @@ function openAnalysisQueueSummaryPopup(category) {
   ).trim().toLowerCase();
   const analysis = payload.analysis && typeof payload.analysis === "object" ? payload.analysis : {};
   const analysisFaceIdentity = Boolean(analysis.face_identity);
+  const submissionId = String(
+    queue.submission_id
+    || payload.submission_id
+    || payload?.metadata?.submission_id
+    || "",
+  ).trim();
   const facePeopleFilenames = Array.isArray(payload.analysis_face_people_filenames)
     ? payload.analysis_face_people_filenames
     : [];
@@ -1630,7 +1986,9 @@ function openAnalysisQueueSummaryPopup(category) {
       analysis_face_people_filenames: facePeopleFilenames,
       analysis_vehicles_filenames: vehiclesFilenames,
       analysis_face_identity_filenames: faceIdentityFilenames,
+      submission_id: submissionId,
     },
+    submission_id: submissionId,
     file_progress: Array.isArray(payload.file_progress) ? payload.file_progress : [],
     recovery_category: normalizedCategory,
     message: String(payload.message || ""),
@@ -1650,7 +2008,7 @@ function normalizeAnalysisRunMode(mode) {
 }
 
 function analysisCategoryLabel(category) {
-  return normalizeAnalysisCategory(category) === "vehicles" ? "Vehicles" : "Face & People";
+  return normalizeAnalysisCategory(category) === "vehicles" ? "Vehicle" : "Face & People";
 }
 
 function isFaceIdentityReadyStatus(status) {
@@ -1931,7 +2289,7 @@ function formatAnalysisQueueStatusMessage(category, statusPayload, options = {})
   const progress = getAnalysisQueueProgress(snapshot.payload);
   const currentFilename = String(snapshot.payload.current_filename || "").trim();
   const payloadMessage = String(snapshot.payload.message || "").trim();
-  const parts = [`${analysisCategoryLabel(normalizedCategory)} analysis ${statusWord}.`];
+  const parts = [`${analysisCategoryLabel(normalizedCategory)} indexing ${statusWord}.`];
 
   if (snapshot.jobId > 0) {
     parts.push(`Job #${snapshot.jobId}.`);
@@ -1962,7 +2320,7 @@ function formatAnalysisQueueStatusMessage(category, statusPayload, options = {})
     )
       ? " (shared job)"
       : "";
-    parts.push(`Modes: ${analysisModes}${sharedLabel}.`);
+    parts.push(`Indexes: ${analysisModes}${sharedLabel}.`);
   }
   if (payloadMessage) {
     parts.push(payloadMessage);
@@ -2062,13 +2420,13 @@ async function syncAnalysisQueueStatus(caseId, category, options = {}) {
     if (statusCode === 404) {
       setCategoryAnalysisStatus(
         normalizedCategory,
-        `${analysisCategoryLabel(normalizedCategory)} analysis status endpoint unavailable: ${formatError(error)}`,
+        `${analysisCategoryLabel(normalizedCategory)} indexing status endpoint unavailable: ${formatError(error)}`,
         "error",
       );
     } else {
       setCategoryAnalysisStatus(
         normalizedCategory,
-        `Failed to load ${analysisCategoryLabel(normalizedCategory)} analysis queue status: ${formatError(error)}`,
+        `Failed to load ${analysisCategoryLabel(normalizedCategory)} indexing queue status: ${formatError(error)}`,
         "error",
       );
     }
@@ -2144,7 +2502,7 @@ function startAnalysisStatusPolling(caseId, category, options = {}) {
       if (statusCode === 404) {
         setCategoryAnalysisStatus(
           normalizedCategory,
-          `${analysisCategoryLabel(normalizedCategory)} analysis status endpoint unavailable: ${formatError(error)}`,
+          `${analysisCategoryLabel(normalizedCategory)} indexing status endpoint unavailable: ${formatError(error)}`,
           "error",
         );
         if (pollToken === latestState.token && latestState.caseId === normalizedCaseId) {
@@ -2156,7 +2514,7 @@ function startAnalysisStatusPolling(caseId, category, options = {}) {
       if (consecutiveFailures >= 4) {
         setCategoryAnalysisStatus(
           normalizedCategory,
-          `${analysisCategoryLabel(normalizedCategory)} analysis status polling failed: ${formatError(error)}`,
+          `${analysisCategoryLabel(normalizedCategory)} indexing status polling failed: ${formatError(error)}`,
           "error",
         );
         if (pollToken === latestState.token && latestState.caseId === normalizedCaseId) {
@@ -2385,6 +2743,67 @@ function formatFace02SelectionStatus(video) {
   return "FACE-02 off";
 }
 
+function createAnalysisStatusChip(variant, text) {
+  const safeText = String(text || "").trim();
+  if (!safeText) {
+    return null;
+  }
+  const safeVariant = String(variant || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  const chip = document.createElement("span");
+  chip.className = "analysis-status-chip";
+  if (safeVariant) {
+    chip.classList.add(`chip-${safeVariant}`);
+  }
+  chip.textContent = safeText;
+  return chip;
+}
+
+function appendAnalysisStatusChip(container, variant, text) {
+  if (!container) {
+    return;
+  }
+  const chip = createAnalysisStatusChip(variant, text);
+  if (chip) {
+    container.appendChild(chip);
+  }
+}
+
+function appendSemanticStatusChips(container, video, options = {}) {
+  if (!container) {
+    return;
+  }
+  const indexed = Boolean(options.indexed);
+  const indexedFrames = Math.max(0, Number(video?.indexed_frames || 0));
+  const indexedWindows = Math.max(0, Number(video?.indexed_windows || 0));
+  if (indexed) {
+    appendAnalysisStatusChip(container, "ready", "Semantic ready");
+  } else {
+    appendAnalysisStatusChip(container, "not-ready", "Semantic not run");
+  }
+  if (indexed) {
+    appendAnalysisStatusChip(container, "metric", `frames ${indexedFrames}`);
+    appendAnalysisStatusChip(container, "metric", `windows ${indexedWindows}`);
+  }
+}
+
+function appendVehicleStatusChips(container, video, options = {}) {
+  if (!container) {
+    return;
+  }
+  const ready = Boolean(options.ready);
+  const analysis = normalizedVideoAnalysis(video).vehicles;
+  if (ready) {
+    appendAnalysisStatusChip(container, "ready", "Vehicle ready");
+  } else {
+    appendAnalysisStatusChip(container, "not-ready", "Vehicle not run");
+  }
+  appendAnalysisStatusChip(container, "metric", `vehicles ${Math.max(0, Number(analysis.vehicle_count || 0))}`);
+}
+
 function formatFirstHit(firstHitSeconds) {
   if (firstHitSeconds === null || firstHitSeconds === undefined) {
     return "n/a";
@@ -2474,14 +2893,14 @@ function queueJobKindLabel(jobKind, processItem = null) {
   if (kind === "analysis_face_people") {
     const faceIdentityEnabled = Boolean(metadata.analysis_face_identity);
     return faceIdentityEnabled
-      ? "Analysis (Face & People + Face Identity)"
-      : "Analysis (Face & People)";
+      ? "Index (Face & People + Face Identity)"
+      : "Index (Face & People)";
   }
   if (kind === "analysis_face_identity") {
-    return "Analysis (Face Identity Top-up)";
+    return "Index (Face Identity Top-up)";
   }
   if (kind === "analysis_vehicles") {
-    return "Analysis (Vehicles)";
+    return "Index (Vehicle)";
   }
   if (kind === "analysis") {
     const modesLabel = analysisModesLabelFromFlags(
@@ -2490,14 +2909,57 @@ function queueJobKindLabel(jobKind, processItem = null) {
       Boolean(metadata.analysis_face_identity),
     );
     if (modesLabel) {
-      return `Analysis (${modesLabel})`;
+      return `Index (${modesLabel})`;
     }
-    return "Analysis";
+    return "Index";
   }
   if (!kind) {
     return "Queue Job";
   }
   return kind;
+}
+
+function queueTaskSubmissionId(item) {
+  const metadata = item?.metadata && typeof item.metadata === "object" ? item.metadata : {};
+  return String(item?.submission_id || metadata.submission_id || "").trim();
+}
+
+function queueTaskSubmissionDisplayToken(item) {
+  const submissionId = queueTaskSubmissionId(item);
+  if (submissionId) {
+    const compact = submissionId.replace(/[^a-zA-Z0-9]/g, "");
+    const token = String(compact || submissionId).slice(0, 8).trim();
+    if (token) {
+      return token.toUpperCase();
+    }
+  }
+  if (queueTaskNormalizedJobKind(item) === "triage_timeline") {
+    // Never show numeric queue-job fallback IDs for triage cards.
+    return "";
+  }
+  const fallbackJobId = Math.max(0, Number(item?.queue_job_id || item?.job_id || 0));
+  if (fallbackJobId > 0) {
+    return String(fallbackJobId);
+  }
+  return "";
+}
+
+function queueTaskTerminalStatusFromValue(status, fallback = "completed") {
+  const normalized = String(status || "").trim().toLowerCase().replaceAll(" ", "_");
+  if (["completed", "processed", "success", "succeeded", "skipped"].includes(normalized)) {
+    return "completed";
+  }
+  if (["failed", "error", "completed_with_errors"].includes(normalized)) {
+    return "failed";
+  }
+  if (["cancelled", "canceled", "interrupted", "aborted"].includes(normalized)) {
+    return "interrupted";
+  }
+  const fallbackNormalized = String(fallback || "").trim().toLowerCase().replaceAll(" ", "_");
+  if (fallbackNormalized && fallbackNormalized !== normalized) {
+    return queueTaskTerminalStatusFromValue(fallbackNormalized, "completed");
+  }
+  return "completed";
 }
 
 function analysisModesLabelFromFlags(facePeople, vehicles, faceIdentity = false) {
@@ -2509,7 +2971,7 @@ function analysisModesLabelFromFlags(facePeople, vehicles, faceIdentity = false)
     labels.push("Face & People");
   }
   if (hasVehicles) {
-    labels.push("Vehicles");
+    labels.push("Vehicle");
   }
   if (hasFaceIdentity) {
     labels.push("Face Identity");
@@ -2631,7 +3093,7 @@ function queueTaskAnalysisModesForFilename(item, filename) {
       modes.push({ label: "Face & People", key: "face_people" });
     }
     if (includeVehicles) {
-      modes.push({ label: "Vehicles", key: "vehicles" });
+      modes.push({ label: "Vehicle", key: "vehicles" });
     }
     if (includeFaceIdentity) {
       modes.push({ label: "Face Identity", key: "face_identity" });
@@ -2640,7 +3102,7 @@ function queueTaskAnalysisModesForFilename(item, filename) {
       return modes;
     }
     // Unknown membership for this filename even though lists exist; keep one row.
-    return [{ label: "Analysis", key: "analysis" }];
+    return [{ label: "Indexing", key: "analysis" }];
   }
 
   // No per-file mapping available; show all enabled analysis modes as separate chips.
@@ -2649,7 +3111,7 @@ function queueTaskAnalysisModesForFilename(item, filename) {
     sharedModes.push({ label: "Face & People", key: "face_people" });
   }
   if (hasVehicles) {
-    sharedModes.push({ label: "Vehicles", key: "vehicles" });
+    sharedModes.push({ label: "Vehicle", key: "vehicles" });
   }
   if (hasFaceIdentity) {
     sharedModes.push({ label: "Face Identity", key: "face_identity" });
@@ -2688,7 +3150,7 @@ function expandQueueRowsByAnalysisModes(item, rows) {
     if (jobKind === "analysis_vehicles") {
       return {
         ...row,
-        analysisModes: [{ label: "Vehicles", key: "vehicles" }],
+        analysisModes: [{ label: "Vehicle", key: "vehicles" }],
       };
     }
     if (jobKind !== "analysis") {
@@ -2713,7 +3175,23 @@ function queueTaskStageStatusLabel(status) {
   return normalized.replaceAll("_", " ");
 }
 
-function queueTaskPhaseLabel(phase, phaseLabel) {
+function isQueueTaskPendingLikeStatus(status) {
+  const normalized = String(status || "")
+    .trim()
+    .toLowerCase()
+    .replaceAll(" ", "_");
+  return (
+    normalized === "queued"
+    || normalized === "pending"
+    || normalized === "starting"
+    || normalized === "loading"
+  );
+}
+
+function queueTaskPhaseLabel(phase, phaseLabel, status = "") {
+  if (isQueueTaskPendingLikeStatus(status)) {
+    return "";
+  }
   const explicit = String(phaseLabel || "").trim();
   if (explicit) {
     return explicit;
@@ -2801,8 +3279,8 @@ function isQueueTaskFileRemovalAvailable(item) {
   if (!["queued", "running"].includes(status)) {
     return false;
   }
-  const jobId = queueTaskPopupResolveJobId(item);
-  if (!jobId) {
+  const jobIds = queueTaskPopupResolveJobIds(item);
+  if (jobIds.length !== 1 || !jobIds[0]) {
     return false;
   }
   return queueTaskFilenames(item).length > 0;
@@ -2874,19 +3352,35 @@ function queueTaskPopupResetRecovery() {
   queueTaskPopupSetRecoveryStatus("", "");
 }
 
-function queueTaskPopupResolveJobId(item) {
-  const candidates = [
+function queueTaskPopupResolveJobIds(item) {
+  const output = [];
+  const seen = new Set();
+  const addCandidate = (candidate) => {
+    const parsed = Number(candidate);
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+      return;
+    }
+    const safe = Math.floor(parsed);
+    if (seen.has(safe)) {
+      return;
+    }
+    seen.add(safe);
+    output.push(safe);
+  };
+
+  const grouped = Array.isArray(item?.queue_job_ids) ? item.queue_job_ids : [];
+  grouped.forEach(addCandidate);
+  [
     item?.queue_job_id,
     item?.job_id,
     item?.queue?.job_id,
-  ];
-  for (const candidate of candidates) {
-    const parsed = Number(candidate);
-    if (Number.isFinite(parsed) && parsed > 0) {
-      return Math.floor(parsed);
-    }
-  }
-  return 0;
+  ].forEach(addCandidate);
+  return output;
+}
+
+function queueTaskPopupResolveJobId(item) {
+  const jobIds = queueTaskPopupResolveJobIds(item);
+  return jobIds.length ? jobIds[0] : 0;
 }
 
 function queueTaskPopupHasCurrentCaseContext(item) {
@@ -2939,11 +3433,12 @@ function queueTaskPopupConfigurePrimaryActions(item) {
 
 async function deleteQueueItemFromPopup() {
   const item = queueTaskPopupCurrentItem;
-  const jobId = queueTaskPopupResolveJobId(item);
-  if (!jobId) {
+  const jobIds = queueTaskPopupResolveJobIds(item);
+  if (!jobIds.length) {
     setStatus("No queue job selected to delete.", "error");
     return;
   }
+  const primaryJobId = jobIds[0];
   if (!queueTaskPopupHasCurrentCaseContext(item)) {
     setStatus("Queue actions are only available for the active case.", "error");
     return;
@@ -2956,7 +3451,11 @@ async function deleteQueueItemFromPopup() {
     return;
   }
 
-  const confirmed = window.confirm(`Delete queue item #${jobId} from queue only?`);
+  const confirmed = window.confirm(
+    jobIds.length > 1
+      ? `Delete ${jobIds.length} grouped queue items from queue only?`
+      : `Delete queue item #${primaryJobId} from queue only?`,
+  );
   if (!confirmed) {
     return;
   }
@@ -2967,7 +3466,7 @@ async function deleteQueueItemFromPopup() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         case_id: caseId,
-        job_ids: [jobId],
+        job_ids: jobIds,
         cancel_running: false,
       }),
     });
@@ -2977,7 +3476,9 @@ async function deleteQueueItemFromPopup() {
     if (removed <= 0 && skippedRunning > 0) {
       throw new Error("Queue item is running. Stop it first, then delete from queue.");
     }
-    const msg = `Queue item #${jobId} deleted from queue (${removed} removed).`;
+    const msg = jobIds.length > 1
+      ? `Grouped queue items deleted from queue (${removed} removed).`
+      : `Queue item #${primaryJobId} deleted from queue (${removed} removed).`;
     setStatus(msg, "ok");
 
     const activeCaseId = String(state.activeCaseId || "").trim();
@@ -3001,18 +3502,21 @@ async function deleteQueueItemFromPopup() {
 
 async function stopQueueItemFromPopup() {
   const item = queueTaskPopupCurrentItem;
-  const jobId = queueTaskPopupResolveJobId(item);
-  if (!jobId) {
+  const jobIds = queueTaskPopupResolveJobIds(item);
+  if (!jobIds.length) {
     setStatus("No queue job selected to stop.", "error");
     return;
   }
+  const primaryJobId = jobIds[0];
   if (!queueTaskPopupHasCurrentCaseContext(item)) {
     setStatus("Queue actions are only available for the active case.", "error");
     return;
   }
   const caseId = String(item?.case_id || "").trim();
   const confirmed = window.confirm(
-    `Stop queue item #${jobId} after the current in-flight step?`,
+    jobIds.length > 1
+      ? `Stop ${jobIds.length} grouped queue items after the current in-flight step?`
+      : `Stop queue item #${primaryJobId} after the current in-flight step?`,
   );
   if (!confirmed) {
     return;
@@ -3024,17 +3528,29 @@ async function stopQueueItemFromPopup() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         case_id: caseId,
-        job_ids: [jobId],
+        job_ids: jobIds,
       }),
     });
     const cancelledCount = Math.max(0, Number(payload?.cancelled_count || 0));
     const terminalCount = Math.max(0, Number(payload?.terminal_count || 0));
     const msg =
       cancelledCount > 0
-        ? `Stop requested for queue item #${jobId}.`
+        ? (
+          jobIds.length > 1
+            ? `Stop requested for ${jobIds.length} grouped queue items.`
+            : `Stop requested for queue item #${primaryJobId}.`
+        )
         : terminalCount > 0
-          ? `Queue item #${jobId} is already in a terminal state.`
-          : `No stoppable queue item found for #${jobId}.`;
+          ? (
+            jobIds.length > 1
+              ? "Grouped queue items are already in terminal states."
+              : `Queue item #${primaryJobId} is already in a terminal state.`
+          )
+          : (
+            jobIds.length > 1
+              ? "No stoppable grouped queue items found."
+              : `No stoppable queue item found for #${primaryJobId}.`
+          );
     setStatus(msg, "ok");
 
     const activeCaseId = String(state.activeCaseId || "").trim();
@@ -3198,7 +3714,7 @@ function queueTaskPopupConfigureRecovery(item, rows) {
   });
   queueTaskPopupRecovery.removeAttribute("hidden");
   queueTaskPopupUpdateRecoverySelectionMeta();
-  const recoveryKindLabel = queueJobKindLabel(item?.job_kind, item) || `${analysisCategoryLabel(category)} Analysis`;
+  const recoveryKindLabel = queueJobKindLabel(item?.job_kind, item) || `${analysisCategoryLabel(category)} Index`;
   queueTaskPopupSetRecoveryStatus(
     `Interrupted ${recoveryKindLabel}: select files to restart or cancel.`,
     "working",
@@ -3244,7 +3760,7 @@ function queueTaskPopupConfigureFileRemoval(item, rows) {
     caseId: String(item?.case_id || "").trim(),
     category: "",
     status: popupStatus,
-    jobId: Math.max(0, Number(item?.queue_job_id || 0)),
+    jobId: queueTaskPopupResolveJobId(item),
     filenames: uniqueFilenames,
     selected: new Set(uniqueFilenames),
   };
@@ -3273,21 +3789,51 @@ function queueTaskProgressRowsFromItem(item) {
     return [];
   }
 
-  const fallbackPhaseLabel = queueTaskPhaseLabel(item?.phase, item?.phase_label);
+  const itemType = String(item?.type || "").trim().toLowerCase();
+  const completedPopupItem = itemType === "queue_job_completed";
+  const fallbackStatus = String(item?.status || "").trim().toLowerCase();
+  const forcePendingByPopupStatus = !completedPopupItem && isQueueTaskPendingLikeStatus(fallbackStatus);
+  const allowedFilenames = new Set(queueTaskFilenames(item));
+  const fallbackPhaseLabel = queueTaskPhaseLabel(item?.phase, item?.phase_label, fallbackStatus);
   const output = [];
   rawRows.forEach((rawRow) => {
     if (!rawRow || typeof rawRow !== "object") {
       return;
     }
     const filename = String(rawRow.filename || "").trim();
-    if (!filename) {
+    if (!filename || (allowedFilenames.size > 0 && !allowedFilenames.has(filename))) {
       return;
     }
-    const status = String(rawRow.status || "").trim().toLowerCase();
-    const processedFrames = Math.max(0, Number(rawRow.processed_frames || 0));
-    const estimatedTotalFrames = Math.max(0, Number(rawRow.estimated_total_frames || 0));
+    let status = String(rawRow.status || "").trim().toLowerCase();
+    if (!status) {
+      status = fallbackStatus || "pending";
+    }
+    if (completedPopupItem) {
+      status = queueTaskTerminalStatusFromValue(status, fallbackStatus || "completed");
+    }
+    if (forcePendingByPopupStatus) {
+      const runningLike = ["running", "cancelling"].includes(status);
+      if (!runningLike) {
+        status = "pending";
+      }
+    }
+
+    const pendingLike = isQueueTaskPendingLikeStatus(status);
+    let processedFrames = Math.max(0, Number(rawRow.processed_frames || 0));
+    let estimatedTotalFrames = Math.max(
+      0,
+      Number(rawRow.estimated_total_frames || rawRow.total_frames || 0),
+    );
+    if (pendingLike) {
+      processedFrames = 0;
+      estimatedTotalFrames = 0;
+    }
     let progressPercent = Number(rawRow.progress_percent);
-    if (!Number.isFinite(progressPercent)) {
+    if (pendingLike) {
+      progressPercent = 0;
+    } else if (completedPopupItem) {
+      progressPercent = 100;
+    } else if (!Number.isFinite(progressPercent)) {
       if (estimatedTotalFrames > 0) {
         progressPercent = (processedFrames / estimatedTotalFrames) * 100;
       } else {
@@ -3297,18 +3843,19 @@ function queueTaskProgressRowsFromItem(item) {
     progressPercent = clampPercent(progressPercent);
 
     let meta = `${Math.round(progressPercent)}%`;
-    if (processedFrames > 0 || estimatedTotalFrames > 0) {
+    if (!pendingLike && (processedFrames > 0 || estimatedTotalFrames > 0)) {
       const totalLabel = estimatedTotalFrames > 0 ? String(estimatedTotalFrames) : "?";
       meta += ` | frames: ${processedFrames}/${totalLabel}`;
     }
     const phaseLabel = queueTaskPhaseLabel(
       rawRow.phase || rawRow.phase_name || rawRow.stage,
       rawRow.phase_label || rawRow.phaseLabel || rawRow.stage_label,
-    ) || fallbackPhaseLabel;
+      status,
+    ) || (pendingLike ? "" : fallbackPhaseLabel);
     if (phaseLabel) {
       meta += ` | phase: ${phaseLabel}`;
     }
-    if (Boolean(rawRow.is_current)) {
+    if (!pendingLike && Boolean(rawRow.is_current)) {
       meta += " | active";
     }
 
@@ -3342,20 +3889,21 @@ function buildPipelineSnapshotMap(pipelinePayload) {
 }
 
 function buildQueueTaskProgressRows(item, pipelinePayload) {
-  const directRows = queueTaskProgressRowsFromItem(item);
-  if (directRows.length) {
-    return directRows;
-  }
-
   const filenames = queueTaskFilenames(item);
   const byFilename = buildPipelineSnapshotMap(pipelinePayload);
   const stageName = queueTaskStageNameFromItem(item);
   const fallbackStatus = String(item?.status || "").trim().toLowerCase();
+  const forcePendingByPopupStatus = isQueueTaskPendingLikeStatus(fallbackStatus);
+  const expectedJobKind = queueTaskNormalizedJobKind(item);
+  const metadata = item?.metadata && typeof item.metadata === "object" ? item.metadata : {};
+  const expectedSubmissionId = String(
+    item?.submission_id || metadata.submission_id || "",
+  ).trim();
   const currentFilename = String(item?.current_filename || "").trim();
   const currentPercent = Number(item?.current_video_progress_percent || 0);
   const currentProcessedFrames = Math.max(0, Number(item?.current_video_processed_frames || 0));
   const currentTotalFrames = Math.max(0, Number(item?.current_video_total_frames || 0));
-  const fallbackPhaseLabel = queueTaskPhaseLabel(item?.phase, item?.phase_label);
+  const fallbackPhaseLabel = queueTaskPhaseLabel(item?.phase, item?.phase_label, fallbackStatus);
 
   const rows = filenames.map((filename) => {
     const snapshot = byFilename.get(filename);
@@ -3375,11 +3923,42 @@ function buildQueueTaskProgressRows(item, pipelinePayload) {
       status = fallbackStatus || "pending";
     }
 
-    const isCurrent = currentFilename && filename === currentFilename;
-    const details = stage && stage.details && typeof stage.details === "object" ? stage.details : {};
+    let details = stage && stage.details && typeof stage.details === "object" ? stage.details : {};
+    const detailsJobKind = String(
+      details.analysis_job_kind || details.queue_job_kind || details.job_kind || "",
+    ).trim().toLowerCase();
+    const detailsSubmissionId = String(details.submission_id || "").trim();
+    const kindMatches = (
+      !expectedJobKind
+      || !detailsJobKind
+      || detailsJobKind === expectedJobKind
+    );
+    const submissionMatches = (
+      !expectedSubmissionId
+      || (Boolean(detailsSubmissionId) && detailsSubmissionId === expectedSubmissionId)
+    );
+    if (!kindMatches || !submissionMatches) {
+      status = "pending";
+      details = {};
+    }
+
+    if (forcePendingByPopupStatus) {
+      const runningLike = ["running", "cancelling"].includes(status);
+      if (!runningLike) {
+        status = "pending";
+      }
+    }
+    const pendingLike = isQueueTaskPendingLikeStatus(status);
+    const isCurrent = !pendingLike && currentFilename && filename === currentFilename;
     let processedFrames = Math.max(0, Number(details.processed_frames || 0));
-    let estimatedTotalFrames = Math.max(0, Number(details.estimated_total_frames || 0));
-    if (isCurrent) {
+    let estimatedTotalFrames = Math.max(
+      0,
+      Number(details.estimated_total_frames || details.total_frames || 0),
+    );
+    if (pendingLike) {
+      processedFrames = 0;
+      estimatedTotalFrames = 0;
+    } else if (isCurrent) {
       processedFrames = Math.max(processedFrames, currentProcessedFrames);
       estimatedTotalFrames = Math.max(estimatedTotalFrames, currentTotalFrames);
     }
@@ -3388,7 +3967,9 @@ function buildQueueTaskProgressRows(item, pipelinePayload) {
     }
 
     let progressPercent = Number(details.progress_percent);
-    if (estimatedTotalFrames > 0) {
+    if (pendingLike) {
+      progressPercent = 0;
+    } else if (estimatedTotalFrames > 0) {
       progressPercent = (processedFrames / estimatedTotalFrames) * 100;
     } else if (!Number.isFinite(progressPercent)) {
       progressPercent = queueTaskProgressFromStageStatus(status, isCurrent ? currentPercent : 0);
@@ -3396,21 +3977,22 @@ function buildQueueTaskProgressRows(item, pipelinePayload) {
     progressPercent = clampPercent(progressPercent);
 
     let meta = `${Math.round(progressPercent)}%`;
-    if (isCurrent && Number.isFinite(currentPercent) && currentPercent > 0) {
+    if (!pendingLike && isCurrent && Number.isFinite(currentPercent) && currentPercent > 0) {
       meta = `${Math.round(clampPercent(currentPercent))}%`;
     }
-    if (processedFrames > 0 || estimatedTotalFrames > 0) {
+    if (!pendingLike && (processedFrames > 0 || estimatedTotalFrames > 0)) {
       const totalLabel = estimatedTotalFrames > 0 ? String(estimatedTotalFrames) : "?";
       meta += ` | frames: ${processedFrames}/${totalLabel}`;
     }
     const phaseLabel = queueTaskPhaseLabel(
       details.phase || item?.phase,
       details.phase_label || item?.phase_label,
-    ) || fallbackPhaseLabel;
+      status,
+    ) || (pendingLike ? "" : fallbackPhaseLabel);
     if (phaseLabel) {
       meta += ` | phase: ${phaseLabel}`;
     }
-    if (isCurrent) {
+    if (!pendingLike && isCurrent) {
       meta += " | active";
     }
     return {
@@ -3446,6 +4028,11 @@ function renderQueueTaskProgressRows(rows, options = {}) {
   list.forEach((rowData) => {
     const li = document.createElement("li");
     li.className = "queue-task-file-row";
+    const normalizedStatus = String(rowData.status || "")
+      .trim()
+      .toLowerCase()
+      .replaceAll(" ", "_");
+    const pendingLike = isQueueTaskPendingLikeStatus(normalizedStatus);
 
     const head = document.createElement("div");
     head.className = "queue-task-file-head";
@@ -3485,7 +4072,9 @@ function renderQueueTaskProgressRows(rows, options = {}) {
       mode.textContent = modeLabel;
       right.appendChild(mode);
     });
-    const phaseLabel = String(rowData.phaseLabel || rowData.phase_label || "").trim();
+    const phaseLabel = pendingLike
+      ? ""
+      : String(rowData.phaseLabel || rowData.phase_label || "").trim();
     if (phaseLabel) {
       const phase = document.createElement("div");
       phase.className = "queue-task-file-phase";
@@ -3529,13 +4118,18 @@ function renderQueueTaskProgressRows(rows, options = {}) {
 
     const bar = document.createElement("div");
     bar.className = "queue-task-file-bar";
-    const safePercent = clampPercent(rowData.progressPercent || 0);
+    const safePercent = pendingLike && normalizedStatus !== "loading"
+      ? 0
+      : clampPercent(rowData.progressPercent || 0);
     bar.style.width = `${safePercent.toFixed(1)}%`;
     track.appendChild(bar);
 
     const meta = document.createElement("div");
     meta.className = "queue-task-file-meta";
-    meta.textContent = String(rowData.meta || `${Math.round(safePercent)}%`);
+    const explicitMeta = String(rowData.meta || "").trim();
+    meta.textContent = (pendingLike && normalizedStatus !== "loading")
+      ? "0%"
+      : (explicitMeta || `${Math.round(safePercent)}%`);
 
     li.appendChild(head);
     li.appendChild(track);
@@ -3545,13 +4139,42 @@ function renderQueueTaskProgressRows(rows, options = {}) {
 }
 
 async function loadQueueTaskProgressRows(item) {
+  const type = String(item?.type || "").trim().toLowerCase();
+  if (type === "queue_job_completed") {
+    const directRows = queueTaskProgressRowsFromItem(item);
+    if (directRows.length) {
+      return directRows;
+    }
+    return queueTaskFilenames(item).map((filename) => ({
+      filename,
+      status: queueTaskStageStatusLabel(
+        queueTaskTerminalStatusFromValue(String(item?.status || "").trim().toLowerCase(), "completed"),
+      ),
+      progressPercent: 100,
+      meta: "100%",
+      phaseLabel: "",
+      analysisModes: [],
+    }));
+  }
+  const caseId = String(item?.case_id || "").trim();
+  const filenames = queueTaskFilenames(item);
+  if (type === "queue_job" && caseId && filenames.length) {
+    try {
+      const pipelinePayload = await fetchJson(withCaseQuery("/pipeline/status", caseId));
+      return buildQueueTaskProgressRows(item, pipelinePayload);
+    } catch (_error) {
+      const fallbackRows = queueTaskProgressRowsFromItem(item);
+      if (fallbackRows.length) {
+        return fallbackRows;
+      }
+      return buildQueueTaskProgressRows(item, { pipelines: [] });
+    }
+  }
+
   const directRows = queueTaskProgressRowsFromItem(item);
   if (directRows.length) {
     return directRows;
   }
-
-  const caseId = String(item?.case_id || "").trim();
-  const filenames = queueTaskFilenames(item);
   if (!caseId || !filenames.length) {
     return buildQueueTaskProgressRows(item, { pipelines: [] });
   }
@@ -3595,17 +4218,28 @@ function openQueueTaskPopup(item) {
     const queueJobId = Math.max(0, Number(item?.queue_job_id || 0));
     const categoryLabel = analysisCategoryLabel(item?.recovery_category);
     queueTaskPopupTitle.textContent = queueJobId > 0
-      ? `Interrupted ${categoryLabel} Analysis #${queueJobId}`
-      : `Interrupted ${categoryLabel} Analysis`;
+      ? `Interrupted ${categoryLabel} Index #${queueJobId}`
+      : `Interrupted ${categoryLabel} Index`;
     const filesCount = Math.max(0, Number(item?.filenames_count || 0));
     const interruptedMessage = String(item?.message || "").trim();
     const addedLabel = formatQueueTimestamp(item?.enqueued_at || "");
     queueTaskPopupMeta.textContent =
       `case: ${caseId} | status: interrupted | files: ${filesCount} | added: ${addedLabel}${interruptedMessage ? ` | ${interruptedMessage}` : ""}`;
   } else {
-    const queueJobId = Math.max(0, Number(item?.queue_job_id || 0));
+    const queueJobIds = queueTaskPopupResolveJobIds(item);
+    const queueJobId = queueJobIds.length ? queueJobIds[0] : 0;
     const jobKindLabel = queueJobKindLabel(item?.job_kind, item);
-    queueTaskPopupTitle.textContent = queueJobId > 0 ? `${jobKindLabel} #${queueJobId}` : jobKindLabel;
+    const submissionToken = queueTaskSubmissionDisplayToken(item);
+    const queueCountSuffix = (
+      !queueTaskSubmissionId(item)
+      && queueJobId > 0
+      && queueJobIds.length > 1
+    )
+      ? ` (+${queueJobIds.length - 1})`
+      : "";
+    queueTaskPopupTitle.textContent = submissionToken
+      ? `${jobKindLabel} #${submissionToken}${queueCountSuffix}`
+      : jobKindLabel;
 
     const queuePosition = Math.max(0, Number(item?.queue_position || 0));
     const priority = Math.max(0, Number(item?.priority || 0));
@@ -3617,7 +4251,7 @@ function openQueueTaskPopup(item) {
       Boolean(metadata.analysis_vehicles),
       Boolean(metadata.analysis_face_identity),
     );
-    const analysisModePart = analysisModes ? ` | modes: ${analysisModes}` : "";
+    const analysisModePart = analysisModes ? ` | indexes: ${analysisModes}` : "";
     const addedLabel = formatQueueTimestamp(item?.enqueued_at || "");
     queueTaskPopupMeta.textContent =
       `case: ${caseId} | status: ${status} | queue ahead: ${queuePosition} | priority: ${priority} | files: ${filesCount} | attempts: ${attempts} | added: ${addedLabel}${analysisModePart}`;
@@ -3658,7 +4292,7 @@ function openQueueTaskPopup(item) {
   queueTaskPopup.classList.add("open");
 
   const loadToken = ++queueTaskPopupLoadToken;
-  void loadQueueTaskProgressRows(item)
+  void loadQueueTaskProgressRows(queueTaskPopupCurrentItem || item)
     .then((rows) => {
       if (
         loadToken !== queueTaskPopupLoadToken
@@ -3853,8 +4487,8 @@ function renderReportQueueList(processesPayload, options = {}) {
       const queueJobId = Math.max(0, Number(item?.queue_job_id || 0));
       const categoryLabel = analysisCategoryLabel(item?.recovery_category);
       title.textContent = queueJobId > 0
-        ? `Interrupted ${categoryLabel} Analysis #${queueJobId}`
-        : `Interrupted ${categoryLabel} Analysis`;
+        ? `Interrupted ${categoryLabel} Index #${queueJobId}`
+        : `Interrupted ${categoryLabel} Index`;
       badge.textContent = "interrupted";
       const filesCount = Math.max(0, Number(item?.filenames_count || 0));
       const interruptedMessage = String(item?.message || "").trim();
@@ -3866,7 +4500,11 @@ function renderReportQueueList(processesPayload, options = {}) {
     } else {
       const queueJobId = Math.max(0, Number(item?.queue_job_id || 0));
       const jobKind = queueJobKindLabel(item?.job_kind, item);
-      title.textContent = queueJobId > 0 ? `${jobKind} #${queueJobId}` : jobKind;
+      const submissionToken = queueTaskSubmissionDisplayToken(item);
+      const isTriageJob = String(item?.job_kind || "").trim().toLowerCase() === "triage_timeline";
+      title.textContent = submissionToken
+        ? `${jobKind} #${submissionToken}`
+        : (isTriageJob ? jobKind : (queueJobId > 0 ? `${jobKind} #${queueJobId}` : jobKind));
       badge.textContent = status;
       const queuePosition = Math.max(0, Number(item?.queue_position || 0));
       const priority = Math.max(0, Number(item?.priority || 0));
@@ -3886,7 +4524,7 @@ function renderReportQueueList(processesPayload, options = {}) {
         Boolean(metadata.analysis_vehicles),
         Boolean(metadata.analysis_face_identity),
       );
-      const analysisModePart = analysisModes ? ` | modes: ${analysisModes}` : "";
+      const analysisModePart = analysisModes ? ` | indexes: ${analysisModes}` : "";
       meta.textContent =
         `case: ${caseId} | queue ahead: ${queuePosition} | priority: ${priority} | files: ${filesCount} | attempts: ${attempts}${analysisModePart}${previewSuffix}`;
       row.appendChild(meta);
@@ -3944,6 +4582,19 @@ function dedupeReportQueueItems(processItems) {
     // A semantic queue job card already carries the same runtime progress context.
     return !semanticQueueCaseIds.has(caseId);
   });
+}
+
+function shouldDisplayQueueReportItem(item) {
+  const type = String(item?.type || "").trim().toLowerCase();
+  const jobKind = String(item?.job_kind || "").trim().toLowerCase();
+  if (!["queue_job", "queue_job_completed"].includes(type)) {
+    return true;
+  }
+  if (jobKind !== "triage_timeline") {
+    return true;
+  }
+  // Suppress legacy triage rows without submission token so queue UI stays single-card per upload.
+  return Boolean(queueTaskSubmissionId(item));
 }
 
 function collapseCompletedQueueItemsBySubmission(processItems) {
@@ -4069,7 +4720,8 @@ async function refreshReportQueue(options = {}) {
     activeCaseId ? withCaseQuery("/processes", activeCaseId) : "/processes",
   );
   const processItemsRaw = Array.isArray(payload?.processes) ? payload.processes : [];
-  const processItems = dedupeReportQueueItems(processItemsRaw);
+  const processItems = dedupeReportQueueItems(processItemsRaw)
+    .filter(shouldDisplayQueueReportItem);
   let interruptedItems = [];
   if (activeCaseId) {
     interruptedItems = await listInterruptedAnalysisQueueItems(activeCaseId);
@@ -4079,7 +4731,7 @@ async function refreshReportQueue(options = {}) {
     ? payload.completed_processes
     : [];
   const completedItems = collapseCompletedQueueItemsBySubmission(
-    dedupeReportQueueItems(completedItemsRaw),
+    dedupeReportQueueItems(completedItemsRaw).filter(shouldDisplayQueueReportItem),
   );
   const count = mergedItems.length;
   renderReportQueueList({
@@ -4148,7 +4800,7 @@ async function restartInterruptedAnalysisFromPopup() {
   }
   const label = isFaceIdentityTopupRecovery
     ? "FACE-02 top-up"
-    : `${analysisCategoryLabel(category)} analysis`;
+    : `${analysisCategoryLabel(category)} indexing`;
   const confirmed = window.confirm(`Restart ${label} for ${filenames.length} selected interrupted file(s)?`);
   if (!confirmed) {
     return;
@@ -4210,7 +4862,7 @@ async function cancelInterruptedAnalysisFromPopup() {
     return;
   }
   const label = analysisCategoryLabel(category);
-  const confirmed = window.confirm(`Cancel interrupted ${label} analysis for ${filenames.length} selected file(s)?`);
+  const confirmed = window.confirm(`Cancel interrupted ${label} indexing for ${filenames.length} selected file(s)?`);
   if (!confirmed) {
     return;
   }
@@ -4386,6 +5038,7 @@ function renderMainTabs() {
   tabSemantic?.classList.toggle("active", semanticActive);
   tabFacePeople?.classList.toggle("active", faceActive);
   tabVehicles?.classList.toggle("active", vehicleActive);
+  syncFaceWallDisplayModeControls();
 }
 
 function applyWorkspaceView() {
@@ -5090,7 +5743,7 @@ function renderAnalysisSettings(payload) {
     ? "Recommended default: on."
     : "Recommended default: off.";
   const message = [
-    `FACE-02 is ${savedEnabled ? "enabled" : "disabled"} for new Face & People analysis jobs.`,
+    `FACE-02 is ${savedEnabled ? "enabled" : "disabled"} for new Face & People indexing jobs.`,
     description || recommendation,
   ].filter(Boolean).join(" ");
   setFaceIdentitySettingsStatus(message, "ok");
@@ -5270,6 +5923,96 @@ async function saveSearchSettings() {
   }
 }
 
+function renderTriageSettings(payload) {
+  const settingsPayload = payload && typeof payload === "object" ? payload : {};
+  const savedRaw = settingsPayload.saved && typeof settingsPayload.saved === "object"
+    ? settingsPayload.saved
+    : {};
+  const recommendedRaw = settingsPayload.recommended && typeof settingsPayload.recommended === "object"
+    ? settingsPayload.recommended
+    : {};
+  const descriptionsRaw = settingsPayload.descriptions && typeof settingsPayload.descriptions === "object"
+    ? settingsPayload.descriptions
+    : {};
+  const modeDescriptions = descriptionsRaw.checkpoint_mode && typeof descriptionsRaw.checkpoint_mode === "object"
+    ? descriptionsRaw.checkpoint_mode
+    : {};
+
+  const savedMode = normalizeTriageCheckpointMode(savedRaw.checkpoint_mode);
+  const recommendedMode = normalizeTriageCheckpointMode(recommendedRaw.checkpoint_mode);
+
+  state.triageSettings = {
+    saved: {
+      checkpoint_mode: savedMode,
+    },
+    recommended: {
+      checkpoint_mode: recommendedMode,
+    },
+    descriptions: {
+      checkpoint_mode: {
+        mountain: String(modeDescriptions.mountain || modeDescriptions.anomaly || "").trim(),
+        peaks: String(modeDescriptions.peaks || modeDescriptions.balanced || "").trim(),
+        change_point: String(modeDescriptions.change_point || "").trim(),
+      },
+    },
+  };
+
+  setTriageCheckpointMode(savedMode, { rerender: true });
+  const modeLabel = triageCheckpointModeLabel(savedMode);
+  setTriageSettingsStatus(`Video triage checkpoint mode saved: ${modeLabel}.`, "ok");
+}
+
+async function loadTriageSettings() {
+  try {
+    const payload = await fetchJson("/settings/triage");
+    renderTriageSettings(payload);
+  } catch (error) {
+    state.triageSettings = {
+      saved: { checkpoint_mode: TRIAGE_CHECKPOINT_MODE_MOUNTAIN },
+      recommended: { checkpoint_mode: TRIAGE_CHECKPOINT_MODE_MOUNTAIN },
+      descriptions: {
+        checkpoint_mode: {
+          mountain: "",
+          peaks: "",
+          change_point: "",
+        },
+      },
+    };
+    setTriageCheckpointMode(TRIAGE_CHECKPOINT_MODE_MOUNTAIN, { rerender: true });
+    setTriageSettingsStatus(`Video triage settings unavailable: ${formatError(error)}. Using Mountain.`, "error");
+  }
+}
+
+async function saveTriageSettings() {
+  if (!hasPendingTriageSettingsChange()) {
+    const modeLabel = triageCheckpointModeLabel(triageCheckpointMode);
+    setTriageSettingsStatus(`No changes to save. Using ${modeLabel}.`, "ok");
+    syncTriageSettingsPendingUi();
+    return;
+  }
+  const selectedMode = normalizeTriageCheckpointMode(triageCheckpointMode);
+  if (saveTriageSettingsBtn) {
+    saveTriageSettingsBtn.disabled = true;
+  }
+  try {
+    setTriageSettingsStatus("Saving video triage setting...", "working");
+    const payload = await fetchJson("/settings/triage", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        checkpoint_mode: selectedMode,
+      }),
+    });
+    renderTriageSettings(payload);
+    const modeLabel = triageCheckpointModeLabel(selectedMode);
+    setTriageSettingsStatus(`Video triage setting saved: ${modeLabel}.`, "ok");
+  } catch (error) {
+    setTriageSettingsStatus(`Video triage save failed: ${formatError(error)}`, "error");
+  } finally {
+    syncTriageSettingsPendingUi();
+  }
+}
+
 function normalizeCases(rawCases) {
   const list = Array.isArray(rawCases) ? rawCases : [];
   const normalized = [];
@@ -5289,6 +6032,22 @@ function normalizeCases(rawCases) {
     normalized.push({ case_id: caseId, name, created_at: createdAt });
   }
   return normalized;
+}
+
+function isCasePendingDeletion(caseId) {
+  const normalizedCaseId = String(caseId || "").trim();
+  if (!normalizedCaseId) {
+    return false;
+  }
+  return pendingCaseDeletionIds.has(normalizedCaseId);
+}
+
+function filterPendingCaseDeletions(cases) {
+  const list = Array.isArray(cases) ? cases : [];
+  if (!pendingCaseDeletionIds.size) {
+    return list;
+  }
+  return list.filter((item) => !isCasePendingDeletion(item?.case_id));
 }
 
 function clearResults() {
@@ -5793,7 +6552,8 @@ function renderCaseList() {
   }
   caseList.innerHTML = "";
 
-  if (!state.cases.length) {
+  const visibleCases = filterPendingCaseDeletions(state.cases);
+  if (!visibleCases.length) {
     const empty = document.createElement("div");
     empty.className = "empty";
     empty.textContent = "No cases yet. Click + New Case to begin.";
@@ -5801,7 +6561,7 @@ function renderCaseList() {
     return;
   }
 
-  state.cases.forEach((item) => {
+  visibleCases.forEach((item) => {
     const row = document.createElement("div");
     row.className = "case-row";
 
@@ -5863,7 +6623,7 @@ async function loadCases() {
     : Array.isArray(payload?.cases)
       ? payload.cases
       : [];
-  const backendCases = normalizeCases(rawCases);
+  const backendCases = filterPendingCaseDeletions(normalizeCases(rawCases));
   const stateChangedDuringRequest = requestVersion !== caseStateVersion;
   console.log("RAW /cases response:", payload);
   console.log("NORMALIZED cases:", backendCases);
@@ -5881,7 +6641,7 @@ async function loadCases() {
           merged.push(item);
         }
       });
-      state.cases = merged;
+      state.cases = filterPendingCaseDeletions(merged);
     }
   } else if (!state.cases.length) {
     state.cases = [];
@@ -5906,6 +6666,16 @@ async function loadCases() {
   for (const cachedCaseId of searchCache.keys()) {
     if (!validCaseIds.has(cachedCaseId)) {
       searchCache.delete(cachedCaseId);
+    }
+  }
+  for (const cachedCaseId of facePeopleGalleryPayloadByCase.keys()) {
+    if (!validCaseIds.has(cachedCaseId)) {
+      facePeopleGalleryPayloadByCase.delete(cachedCaseId);
+    }
+  }
+  for (const cachedCaseId of faceWallDisplayModeByCase.keys()) {
+    if (!validCaseIds.has(cachedCaseId)) {
+      faceWallDisplayModeByCase.delete(cachedCaseId);
     }
   }
   for (const cachedCaseId of state.caseVideos.keys()) {
@@ -6269,18 +7039,28 @@ function isVideoTriageReady(video) {
   return status === "completed" || status === "skipped";
 }
 
-function triageIntensityColor(intensity, kind = "activity") {
+function triageIntensityColor(intensity, _kind = "activity") {
   const value = Math.max(0, Math.min(1, Number(intensity) || 0));
-  if (kind === "audio") {
-    const hue = 210 - (value * 55);
-    const sat = 72;
-    const light = 84 - (value * 38);
-    return `hsl(${hue} ${sat}% ${light}%)`;
+  const low = { r: 220, g: 235, b: 255 }; // #DCEBFF
+  const medium = { r: 121, g: 161, b: 232 }; // #79A1E8
+  const high = { r: 31, g: 78, b: 163 }; // #1F4EA3
+
+  const lerp = (start, end, t) => Math.round(start + ((end - start) * t));
+  const clampedT = Math.max(0, Math.min(1, Number(value) || 0));
+
+  let from = low;
+  let to = medium;
+  let t = clampedT / 0.5;
+  if (clampedT > 0.5) {
+    from = medium;
+    to = high;
+    t = (clampedT - 0.5) / 0.5;
   }
-  const hue = 130 - (value * 118);
-  const sat = 72;
-  const light = 80 - (value * 35);
-  return `hsl(${hue} ${sat}% ${light}%)`;
+  const safeT = Math.max(0, Math.min(1, t));
+  const r = lerp(from.r, to.r, safeT);
+  const g = lerp(from.g, to.g, safeT);
+  const b = lerp(from.b, to.b, safeT);
+  return `rgb(${r}, ${g}, ${b})`;
 }
 
 function updateTriageTimelinePlayheads(forcedTimestampSeconds = null) {
@@ -6332,11 +7112,85 @@ function updateTriageTimelinePlayheads(forcedTimestampSeconds = null) {
   });
 }
 
+function triageNormalizeValuesForDisplay(
+  values,
+  {
+    lowQuantile = 0.15,
+    highQuantile = 0.95,
+    gamma = 0.82,
+    normalizedWeight = 0.75,
+    rawWeight = 0.25,
+    minPositiveFloor = 0.03,
+  } = {},
+) {
+  const safeValues = Array.isArray(values)
+    ? values.map((value) => Math.max(0, Math.min(1, Number(value) || 0)))
+    : [];
+  if (!safeValues.length) {
+    return [];
+  }
+
+  const positiveValues = safeValues.filter((value) => value > 0);
+  if (!positiveValues.length) {
+    return safeValues;
+  }
+
+  const safeLowQuantile = Math.max(0, Math.min(1, Number(lowQuantile) || 0.15));
+  const safeHighQuantile = Math.max(safeLowQuantile, Math.min(1, Number(highQuantile) || 0.95));
+  let lowAnchor = Math.max(0, Math.min(1, triageQuantile(positiveValues, safeLowQuantile)));
+  let highAnchor = Math.max(0, Math.min(1, triageQuantile(positiveValues, safeHighQuantile)));
+  const minPositive = Math.max(0, Math.min(1, Math.min(...positiveValues)));
+  const maxPositive = Math.max(0, Math.min(1, Math.max(...positiveValues)));
+
+  if (!Number.isFinite(lowAnchor)) {
+    lowAnchor = minPositive;
+  }
+  if (!Number.isFinite(highAnchor)) {
+    highAnchor = maxPositive;
+  }
+  if (highAnchor <= lowAnchor + 1e-6) {
+    highAnchor = Math.max(maxPositive, lowAnchor + 1e-3);
+  }
+  const range = highAnchor - lowAnchor;
+  if (!Number.isFinite(range) || range <= 1e-6) {
+    return safeValues;
+  }
+
+  const safeGamma = Math.max(0.01, Number(gamma) || 0.82);
+  const safeNormalizedWeight = Math.max(0, Number(normalizedWeight) || 0.75);
+  const safeRawWeight = Math.max(0, Number(rawWeight) || 0.25);
+  const totalWeight = safeNormalizedWeight + safeRawWeight;
+  const normalizedRatio = totalWeight > 0 ? safeNormalizedWeight / totalWeight : 0.75;
+  const rawRatio = totalWeight > 0 ? safeRawWeight / totalWeight : 0.25;
+  const safeFloor = Math.max(0, Math.min(1, Number(minPositiveFloor) || 0.03));
+
+  return safeValues.map((rawValue) => {
+    if (!(rawValue > 0)) {
+      return 0;
+    }
+    const stretched = Math.max(0, Math.min(1, (rawValue - lowAnchor) / range));
+    const lifted = Math.pow(stretched, safeGamma);
+    let displayValue = (lifted * normalizedRatio) + (rawValue * rawRatio);
+    if (displayValue > 0) {
+      displayValue = Math.max(safeFloor, displayValue);
+    }
+    return Math.max(0, Math.min(1, displayValue));
+  });
+}
+
 function drawTriageTimeline(canvas, values, peaks, kind = "activity", options = {}) {
   if (!canvas) {
     return;
   }
   const safeValues = Array.isArray(values) ? values : [];
+  const displayValues = triageNormalizeValuesForDisplay(safeValues, {
+    lowQuantile: 0.15,
+    highQuantile: 0.95,
+    gamma: 0.82,
+    normalizedWeight: 0.75,
+    rawWeight: 0.25,
+    minPositiveFloor: 0.03,
+  });
   const safeLineTimestamps = Array.isArray(options?.lineTimestamps) ? options.lineTimestamps : [];
   const safeTotalSeconds = Math.max(0, Number(options?.totalSeconds || 0));
   const width = 820;
@@ -6354,14 +7208,14 @@ function drawTriageTimeline(canvas, values, peaks, kind = "activity", options = 
   ctx.fillStyle = "#d3dfe9";
   ctx.fillRect(0, height - 1, width, 1);
 
-  if (!safeValues.length) {
+  if (!displayValues.length) {
     return;
   }
 
-  for (let i = 0; i < safeValues.length; i += 1) {
-    const intensity = Math.max(0, Math.min(1, Number(safeValues[i]) || 0));
-    const x1 = Math.floor((i / safeValues.length) * width);
-    const x2 = Math.floor(((i + 1) / safeValues.length) * width);
+  for (let i = 0; i < displayValues.length; i += 1) {
+    const intensity = Math.max(0, Math.min(1, Number(displayValues[i]) || 0));
+    const x1 = Math.floor((i / displayValues.length) * width);
+    const x2 = Math.floor(((i + 1) / displayValues.length) * width);
     const barWidth = Math.max(1, x2 - x1);
     const barHeight = Math.max(1, Math.round(intensity * (height - 6)));
     ctx.fillStyle = triageIntensityColor(intensity, kind);
@@ -6459,7 +7313,167 @@ function triageLocalPeakTimestamps(
   return out.sort((a, b) => a - b);
 }
 
-function triagePeakTimestamps(
+function triageQuantile(values, quantile) {
+  const safeValues = Array.isArray(values)
+    ? values
+      .map((value) => Number(value))
+      .filter((value) => Number.isFinite(value))
+    : [];
+  if (!safeValues.length) {
+    return 0;
+  }
+  const sorted = [...safeValues].sort((a, b) => a - b);
+  const safeQuantile = Math.max(0, Math.min(1, Number(quantile) || 0));
+  const position = (sorted.length - 1) * safeQuantile;
+  const lower = Math.floor(position);
+  const upper = Math.ceil(position);
+  if (lower === upper) {
+    return sorted[lower];
+  }
+  const weight = position - lower;
+  return sorted[lower] + ((sorted[upper] - sorted[lower]) * weight);
+}
+
+function triageBackendPeakCandidates(peaks, { durationSeconds = 0 } = {}) {
+  const safeDurationSeconds = Math.max(0, Number(durationSeconds || 0));
+  const candidates = [];
+  if (!Array.isArray(peaks)) {
+    return candidates;
+  }
+  for (const peak of peaks) {
+    const rawTimestamp = Number(peak?.timestamp_seconds);
+    if (!Number.isFinite(rawTimestamp) || rawTimestamp < 0) {
+      continue;
+    }
+    const timestamp = safeDurationSeconds > 0
+      ? Math.min(safeDurationSeconds, rawTimestamp)
+      : rawTimestamp;
+    const rawIntensity = Number(peak?.intensity);
+    const rawProminence = Number(peak?.prominence);
+    const intensity = Number.isFinite(rawIntensity)
+      ? Math.max(0, Math.min(1, rawIntensity))
+      : 0;
+    const prominence = Number.isFinite(rawProminence)
+      ? Math.max(0, rawProminence)
+      : 0;
+    let score = intensity + (prominence * 0.65);
+    if (!Number.isFinite(score) || score <= 0) {
+      score = Math.max(0.0001, intensity);
+    }
+    candidates.push({
+      timestamp: Math.max(0, timestamp),
+      score,
+    });
+  }
+  return candidates;
+}
+
+function triageSelectSpacedTimestamps(
+  candidates,
+  {
+    minGapSeconds = 1.2,
+    maxCount = 24,
+    durationSeconds = 0,
+  } = {},
+) {
+  const safeMinGapSeconds = Math.max(0.001, Number(minGapSeconds || 0));
+  const safeMaxCount = Math.max(1, Number(maxCount || 1));
+  const safeDurationSeconds = Math.max(0, Number(durationSeconds || 0));
+  const byTimestamp = new Map();
+  const source = Array.isArray(candidates) ? candidates : [];
+  for (const item of source) {
+    const rawTimestamp = Number(item?.timestamp);
+    if (!Number.isFinite(rawTimestamp) || rawTimestamp < 0) {
+      continue;
+    }
+    const timestamp = safeDurationSeconds > 0
+      ? Math.min(safeDurationSeconds, rawTimestamp)
+      : rawTimestamp;
+    const roundedTimestamp = Math.round(timestamp * 1000) / 1000;
+    const score = Number(item?.score);
+    const safeScore = Number.isFinite(score) ? score : 0;
+    const key = String(roundedTimestamp);
+    const existing = byTimestamp.get(key);
+    if (!existing || safeScore > existing.score) {
+      byTimestamp.set(key, { timestamp: roundedTimestamp, score: safeScore });
+    }
+  }
+
+  const ranked = Array.from(byTimestamp.values())
+    .sort((a, b) => {
+      if (b.score !== a.score) {
+        return b.score - a.score;
+      }
+      return a.timestamp - b.timestamp;
+    });
+  if (!ranked.length) {
+    return [];
+  }
+
+  const selected = [];
+  for (const candidate of ranked) {
+    if (selected.some((timestamp) => Math.abs(timestamp - candidate.timestamp) < safeMinGapSeconds)) {
+      continue;
+    }
+    selected.push(candidate.timestamp);
+    if (selected.length >= safeMaxCount) {
+      break;
+    }
+  }
+  return selected.sort((a, b) => a - b);
+}
+
+function triageCoalesceFirstInRegionTimestamps(
+  timestamps,
+  {
+    regionSeconds = TRIAGE_ACTIVITY_REGION_SKIP_SECONDS,
+    durationSeconds = 0,
+  } = {},
+) {
+  const safeRegionSeconds = Math.max(0, Number(regionSeconds || 0));
+  const safeDurationSeconds = Math.max(0, Number(durationSeconds || 0));
+  const normalized = [];
+  const source = Array.isArray(timestamps) ? timestamps : [];
+  for (const value of source) {
+    const rawTimestamp = Number(value);
+    if (!Number.isFinite(rawTimestamp) || rawTimestamp < 0) {
+      continue;
+    }
+    const clampedTimestamp = safeDurationSeconds > 0
+      ? Math.min(safeDurationSeconds, rawTimestamp)
+      : rawTimestamp;
+    normalized.push(Math.round(clampedTimestamp * 1000) / 1000);
+  }
+  if (!normalized.length) {
+    return [];
+  }
+  normalized.sort((a, b) => a - b);
+  if (!(safeRegionSeconds > 0)) {
+    const deduped = [];
+    for (const ts of normalized) {
+      if (!deduped.length || Math.abs(ts - deduped[deduped.length - 1]) > 0.0005) {
+        deduped.push(ts);
+      }
+    }
+    return deduped;
+  }
+
+  const out = [];
+  for (const ts of normalized) {
+    if (!out.length) {
+      out.push(ts);
+      continue;
+    }
+    const previousKept = out[out.length - 1];
+    if ((ts - previousKept) <= safeRegionSeconds) {
+      continue;
+    }
+    out.push(ts);
+  }
+  return out;
+}
+
+function triageClassicPeakTimestamps(
   peaks,
   {
     values = [],
@@ -6503,6 +7517,411 @@ function triagePeakTimestamps(
   return timestamps.sort((a, b) => a - b);
 }
 
+function triageSmoothSeries(values) {
+  const safeValues = Array.isArray(values)
+    ? values.map((value) => Math.max(0, Math.min(1, Number(value) || 0)))
+    : [];
+  if (!safeValues.length) {
+    return [];
+  }
+  if (safeValues.length < 3) {
+    return safeValues;
+  }
+  const smoothed = new Array(safeValues.length).fill(0);
+  for (let i = 0; i < safeValues.length; i += 1) {
+    const left = i > 0 ? safeValues[i - 1] : safeValues[i];
+    const center = safeValues[i];
+    const right = i < (safeValues.length - 1) ? safeValues[i + 1] : safeValues[i];
+    smoothed[i] = (left * 0.25) + (center * 0.5) + (right * 0.25);
+  }
+  return smoothed;
+}
+
+function triagePeaksActivityCheckpointTimestamps(
+  peaks,
+  {
+    values = [],
+    bucketSeconds = 1,
+    durationSeconds = 0,
+  } = {},
+) {
+  const backendCandidates = triageBackendPeakCandidates(peaks, { durationSeconds });
+  if (backendCandidates.length) {
+    return triageSelectSpacedTimestamps(backendCandidates, {
+      minGapSeconds: 4.0,
+      maxCount: 10,
+      durationSeconds,
+    });
+  }
+  return triageLocalPeakTimestamps(values, {
+    bucketSeconds,
+    durationSeconds,
+    maxCount: 10,
+    minGapSeconds: 4.0,
+    minIntensity: 0.18,
+    minProminence: 0.03,
+  });
+}
+
+function triageChangePointActivityCheckpointTimestamps(
+  values,
+  {
+    peaks = [],
+    bucketSeconds = 1,
+    durationSeconds = 0,
+    maxCount = 8,
+    windowSeconds = 10,
+  } = {},
+) {
+  const safeValues = triageSmoothSeries(values);
+  if (!safeValues.length) {
+    return triageClassicPeakTimestamps(peaks, {
+      values,
+      bucketSeconds,
+      durationSeconds,
+    });
+  }
+
+  const safeBucketSeconds = Math.max(0.001, Number(bucketSeconds || 1));
+  const safeDurationSeconds = Math.max(0, Number(durationSeconds || 0));
+  const windowBuckets = Math.max(3, Math.round(Math.max(4, Number(windowSeconds || 10)) / safeBucketSeconds));
+  if (safeValues.length < (windowBuckets * 2) + 1) {
+    return triageClassicPeakTimestamps(peaks, {
+      values: safeValues,
+      bucketSeconds: safeBucketSeconds,
+      durationSeconds: safeDurationSeconds,
+    });
+  }
+
+  const prefix = new Array(safeValues.length + 1).fill(0);
+  const prefixSquare = new Array(safeValues.length + 1).fill(0);
+  for (let i = 0; i < safeValues.length; i += 1) {
+    const value = Number(safeValues[i]) || 0;
+    prefix[i + 1] = prefix[i] + value;
+    prefixSquare[i + 1] = prefixSquare[i] + (value * value);
+  }
+
+  const rangeMean = (start, end) => {
+    const count = Math.max(1, end - start);
+    return (prefix[end] - prefix[start]) / count;
+  };
+  const rangeStd = (start, end) => {
+    const count = Math.max(1, end - start);
+    const mean = rangeMean(start, end);
+    const meanSquare = (prefixSquare[end] - prefixSquare[start]) / count;
+    return Math.sqrt(Math.max(0, meanSquare - (mean * mean)));
+  };
+
+  const rawCandidates = [];
+  for (let split = windowBuckets; split <= (safeValues.length - windowBuckets); split += 1) {
+    const leftStart = split - windowBuckets;
+    const leftEnd = split;
+    const rightStart = split;
+    const rightEnd = split + windowBuckets;
+    const leftMean = rangeMean(leftStart, leftEnd);
+    const rightMean = rangeMean(rightStart, rightEnd);
+    const leftStd = rangeStd(leftStart, leftEnd);
+    const rightStd = rangeStd(rightStart, rightEnd);
+    const meanDelta = Math.abs(rightMean - leftMean);
+    const varianceDelta = Math.abs(rightStd - leftStd);
+    const score = meanDelta + (varianceDelta * 0.35);
+    const rawTimestamp = split * safeBucketSeconds;
+    const timestamp = safeDurationSeconds > 0 ? Math.min(safeDurationSeconds, rawTimestamp) : rawTimestamp;
+    rawCandidates.push({
+      timestamp: Math.max(0, timestamp),
+      score,
+      intensity: Math.max(leftMean, rightMean),
+    });
+  }
+
+  const scoreValues = rawCandidates
+    .map((item) => Number(item.score) || 0)
+    .filter((value) => value > 0);
+  if (!scoreValues.length) {
+    return triageClassicPeakTimestamps(peaks, {
+      values: safeValues,
+      bucketSeconds: safeBucketSeconds,
+      durationSeconds: safeDurationSeconds,
+    });
+  }
+
+  const threshold = Math.max(
+    0.06,
+    triageQuantile(scoreValues, 0.75) * 0.85,
+    triageQuantile(scoreValues, 0.9) * 0.6,
+  );
+  const minIntensity = Math.max(0.08, triageQuantile(safeValues, 0.3));
+  const candidates = rawCandidates.filter(
+    (item) => item.score >= threshold && item.intensity >= minIntensity,
+  );
+  if (!candidates.length) {
+    return triageClassicPeakTimestamps(peaks, {
+      values: safeValues,
+      bucketSeconds: safeBucketSeconds,
+      durationSeconds: safeDurationSeconds,
+    });
+  }
+
+  const selected = triageSelectSpacedTimestamps(candidates, {
+    minGapSeconds: 5.0,
+    maxCount: Math.max(1, Number(maxCount || 1)),
+    durationSeconds: safeDurationSeconds,
+  });
+  if (selected.length) {
+    return selected;
+  }
+
+  return triageClassicPeakTimestamps(peaks, {
+    values: safeValues,
+    bucketSeconds: safeBucketSeconds,
+    durationSeconds: safeDurationSeconds,
+  });
+}
+
+function triageMountainActivityCheckpointTimestamps(
+  values,
+  {
+    peaks = [],
+    bucketSeconds = 1,
+    durationSeconds = 0,
+    maxCount = 10,
+    mergeGapSeconds = 2.5,
+  } = {},
+) {
+  const safeValues = triageSmoothSeries(values);
+  if (!safeValues.length) {
+    return triageChangePointActivityCheckpointTimestamps(values, {
+      peaks,
+      bucketSeconds,
+      durationSeconds,
+      maxCount,
+    });
+  }
+
+  const safeBucketSeconds = Math.max(0.001, Number(bucketSeconds || 1));
+  const safeDurationSeconds = Math.max(0, Number(durationSeconds || 0));
+  const baselineLookbackBuckets = Math.max(4, Math.round(20 / safeBucketSeconds));
+  const baselineFallback = triageQuantile(safeValues, 0.5);
+  const deviations = new Array(safeValues.length).fill(0);
+
+  for (let i = 0; i < safeValues.length; i += 1) {
+    const start = Math.max(0, i - baselineLookbackBuckets);
+    const sampleCount = i - start;
+    let baseline = baselineFallback;
+    if (sampleCount >= 3) {
+      let sum = 0;
+      for (let j = start; j < i; j += 1) {
+        sum += safeValues[j];
+      }
+      baseline = sum / sampleCount;
+    }
+    deviations[i] = Math.max(0, safeValues[i] - baseline);
+  }
+
+  const positiveDeviations = deviations.filter((value) => value > 0);
+  if (!positiveDeviations.length) {
+    return triageChangePointActivityCheckpointTimestamps(safeValues, {
+      peaks,
+      bucketSeconds: safeBucketSeconds,
+      durationSeconds: safeDurationSeconds,
+      maxCount: Math.max(1, Number(maxCount || 1)),
+    });
+  }
+
+  const openThreshold = Math.max(
+    0.07,
+    triageQuantile(positiveDeviations, 0.75) * 0.72,
+    triageQuantile(positiveDeviations, 0.9) * 0.45,
+  );
+  const closeThreshold = Math.max(0.035, openThreshold * 0.55);
+  const minEventIntensity = Math.max(0.1, triageQuantile(safeValues, 0.35));
+
+  const windows = [];
+  let activeWindow = null;
+  let openCount = 0;
+  let closeCount = 0;
+  for (let i = 0; i < safeValues.length; i += 1) {
+    const deviation = deviations[i];
+    const intensity = safeValues[i];
+    const aboveOpenThreshold = deviation >= openThreshold && intensity >= minEventIntensity;
+    if (!activeWindow) {
+      if (aboveOpenThreshold) {
+        openCount += 1;
+        if (openCount >= 2) {
+          const startIndex = Math.max(0, i - openCount + 1);
+          activeWindow = {
+            start: startIndex,
+            end: i,
+            peakDeviation: deviation,
+            peakIntensity: intensity,
+            area: 0,
+          };
+          for (let k = startIndex; k <= i; k += 1) {
+            activeWindow.area += Math.max(0, deviations[k]);
+          }
+          closeCount = 0;
+        }
+      } else {
+        openCount = 0;
+      }
+      continue;
+    }
+
+    activeWindow.end = i;
+    activeWindow.area += Math.max(0, deviation);
+    if (
+      deviation > activeWindow.peakDeviation
+      || (Math.abs(deviation - activeWindow.peakDeviation) < 1e-6 && intensity > activeWindow.peakIntensity)
+    ) {
+      activeWindow.peakDeviation = deviation;
+      activeWindow.peakIntensity = intensity;
+    }
+
+    if (deviation <= closeThreshold) {
+      closeCount += 1;
+      if (closeCount >= 2) {
+        activeWindow.end = Math.max(activeWindow.start, i - closeCount);
+        windows.push(activeWindow);
+        activeWindow = null;
+        openCount = 0;
+        closeCount = 0;
+      }
+    } else {
+      closeCount = 0;
+    }
+  }
+  if (activeWindow) {
+    windows.push(activeWindow);
+  }
+  if (!windows.length) {
+    return triageChangePointActivityCheckpointTimestamps(safeValues, {
+      peaks,
+      bucketSeconds: safeBucketSeconds,
+      durationSeconds: safeDurationSeconds,
+      maxCount: Math.max(1, Number(maxCount || 1)),
+    });
+  }
+
+  const mergeGapBuckets = Math.max(1, Math.round(Math.max(0, Number(mergeGapSeconds || 0)) / safeBucketSeconds));
+  const mergedWindows = [];
+  for (const windowItem of windows) {
+    const lastWindow = mergedWindows.length ? mergedWindows[mergedWindows.length - 1] : null;
+    if (!lastWindow) {
+      mergedWindows.push({ ...windowItem });
+      continue;
+    }
+    if (windowItem.start - lastWindow.end <= mergeGapBuckets) {
+      lastWindow.end = Math.max(lastWindow.end, windowItem.end);
+      lastWindow.area += Number(windowItem.area || 0);
+      if (
+        windowItem.peakDeviation > lastWindow.peakDeviation
+        || (
+          Math.abs(windowItem.peakDeviation - lastWindow.peakDeviation) < 1e-6
+          && windowItem.peakIntensity > lastWindow.peakIntensity
+        )
+      ) {
+        lastWindow.peakDeviation = windowItem.peakDeviation;
+        lastWindow.peakIntensity = windowItem.peakIntensity;
+      }
+      continue;
+    }
+    mergedWindows.push({ ...windowItem });
+  }
+
+  const candidates = [];
+  for (const windowItem of mergedWindows) {
+    const windowDurationSeconds = (windowItem.end - windowItem.start + 1) * safeBucketSeconds;
+    const areaSeconds = Math.max(0, Number(windowItem.area || 0)) * safeBucketSeconds;
+    const peakDeviation = Math.max(0, Number(windowItem.peakDeviation || 0));
+    if (windowDurationSeconds < 2.5 || areaSeconds < 0.25 || peakDeviation < 0.1) {
+      continue;
+    }
+    const rawTimestamp = Number(windowItem.start || 0) * safeBucketSeconds;
+    const timestamp = safeDurationSeconds > 0 ? Math.min(safeDurationSeconds, rawTimestamp) : rawTimestamp;
+    const score = peakDeviation + Math.min(0.9, areaSeconds * 0.55) + Math.min(0.45, windowDurationSeconds * 0.05);
+    candidates.push({
+      timestamp: Math.max(0, timestamp),
+      score,
+    });
+  }
+
+  const effectiveCandidates = candidates.length
+    ? candidates
+    : mergedWindows.map((windowItem) => {
+      const rawTimestamp = Number(windowItem.start || 0) * safeBucketSeconds;
+      const timestamp = safeDurationSeconds > 0 ? Math.min(safeDurationSeconds, rawTimestamp) : rawTimestamp;
+      const score = Math.max(0, Number(windowItem.peakDeviation || 0)) + Math.max(0, Number(windowItem.area || 0)) * 0.35;
+      return {
+        timestamp: Math.max(0, timestamp),
+        score: Number.isFinite(score) ? score : 0,
+      };
+    });
+
+  const selected = triageSelectSpacedTimestamps(effectiveCandidates, {
+    minGapSeconds: 3.0,
+    maxCount: Math.max(1, Number(maxCount || 1)),
+    durationSeconds: safeDurationSeconds,
+  });
+  if (selected.length) {
+    return selected;
+  }
+
+  return triageChangePointActivityCheckpointTimestamps(safeValues, {
+    peaks,
+    bucketSeconds: safeBucketSeconds,
+    durationSeconds: safeDurationSeconds,
+    maxCount: Math.max(1, Number(maxCount || 1)),
+  });
+}
+
+function triagePeakTimestamps(
+  peaks,
+  {
+    values = [],
+    bucketSeconds = 1,
+    durationSeconds = 0,
+    kind = "activity",
+    mode = TRIAGE_CHECKPOINT_MODE_MOUNTAIN,
+  } = {},
+) {
+  const normalizedKind = String(kind || "").trim().toLowerCase();
+  if (normalizedKind !== "activity") {
+    return triageClassicPeakTimestamps(peaks, {
+      values,
+      bucketSeconds,
+      durationSeconds,
+    });
+  }
+  let extracted = [];
+  const normalizedMode = normalizeTriageCheckpointMode(mode);
+  if (normalizedMode === TRIAGE_CHECKPOINT_MODE_CHANGE_POINT) {
+    extracted = triageChangePointActivityCheckpointTimestamps(values, {
+      peaks,
+      bucketSeconds,
+      durationSeconds,
+      maxCount: 8,
+    });
+  } else if (normalizedMode === TRIAGE_CHECKPOINT_MODE_PEAKS) {
+    extracted = triagePeaksActivityCheckpointTimestamps(peaks, {
+      values,
+      bucketSeconds,
+      durationSeconds,
+    });
+  } else {
+    extracted = triageMountainActivityCheckpointTimestamps(values, {
+      peaks,
+      bucketSeconds,
+      durationSeconds,
+      maxCount: 10,
+      mergeGapSeconds: 2.5,
+    });
+  }
+  return triageCoalesceFirstInRegionTimestamps(extracted, {
+    regionSeconds: TRIAGE_ACTIVITY_REGION_SKIP_SECONDS,
+    durationSeconds,
+  });
+}
+
 function isMediaPlayerPlaying(player) {
   return Boolean(
     player
@@ -6543,6 +7962,8 @@ function createTriageTimelineRow({
   video,
   bucketSeconds,
   durationSeconds,
+  checkpointMode = TRIAGE_CHECKPOINT_MODE_MOUNTAIN,
+  showJumpMarkers = true,
 }) {
   const row = document.createElement("div");
   row.className = "timeline-row";
@@ -6550,23 +7971,25 @@ function createTriageTimelineRow({
   label.className = "timeline-label";
   const titleEl = document.createElement("span");
   titleEl.textContent = title;
-  const detailEl = document.createElement("span");
-  detailEl.className = "timeline-label-detail";
-  const primaryPeak = Array.isArray(peaks) && peaks.length ? peaks[0] : null;
-  detailEl.textContent = primaryPeak && Number.isFinite(Number(primaryPeak.timestamp_seconds))
-    ? `Peak @ ${formatTime(Number(primaryPeak.timestamp_seconds))}`
-    : "No peak detected";
   const safeValues = Array.isArray(values) ? values : [];
   const safeBucketSeconds = Math.max(0.001, Number(bucketSeconds || 1));
   const safeDurationSeconds = Math.max(0, Number(durationSeconds || 0));
   const totalSeconds = safeDurationSeconds > 0
     ? safeDurationSeconds
     : (safeValues.length * safeBucketSeconds);
-  const peakTimestamps = triagePeakTimestamps(peaks, {
+  const checkpointTimestamps = triagePeakTimestamps(peaks, {
     values: safeValues,
     bucketSeconds: safeBucketSeconds,
     durationSeconds: safeDurationSeconds,
+    kind,
+    mode: checkpointMode,
   });
+  const detailEl = document.createElement("span");
+  detailEl.className = "timeline-label-detail";
+  const primaryPeakTimestamp = checkpointTimestamps.length ? Number(checkpointTimestamps[0]) : Number.NaN;
+  detailEl.textContent = Number.isFinite(primaryPeakTimestamp)
+    ? `Jump @ ${formatTime(primaryPeakTimestamp)}`
+    : "No checkpoint detected";
 
   const rightMeta = document.createElement("div");
   rightMeta.className = "timeline-label-right";
@@ -6577,16 +8000,16 @@ function createTriageTimelineRow({
   prevBtn.type = "button";
   prevBtn.className = "timeline-peak-nav-btn";
   prevBtn.textContent = "<";
-  prevBtn.title = "Previous high occurrence";
-  prevBtn.setAttribute("aria-label", `Previous high ${title.toLowerCase()} occurrence`);
+  prevBtn.title = "Previous checkpoint";
+  prevBtn.setAttribute("aria-label", `Previous ${title.toLowerCase()} checkpoint`);
   const nextBtn = document.createElement("button");
   nextBtn.type = "button";
   nextBtn.className = "timeline-peak-nav-btn";
   nextBtn.textContent = ">";
-  nextBtn.title = "Next high occurrence";
-  nextBtn.setAttribute("aria-label", `Next high ${title.toLowerCase()} occurrence`);
-  prevBtn.disabled = peakTimestamps.length === 0;
-  nextBtn.disabled = peakTimestamps.length === 0;
+  nextBtn.title = "Next checkpoint";
+  nextBtn.setAttribute("aria-label", `Next ${title.toLowerCase()} checkpoint`);
+  prevBtn.disabled = checkpointTimestamps.length === 0;
+  nextBtn.disabled = checkpointTimestamps.length === 0;
   nav.appendChild(prevBtn);
   nav.appendChild(nextBtn);
   rightMeta.appendChild(nav);
@@ -6597,7 +8020,7 @@ function createTriageTimelineRow({
   canvas.className = "timeline-canvas";
   canvas.style.touchAction = "none";
   drawTriageTimeline(canvas, values, peaks, kind, {
-    lineTimestamps: peakTimestamps,
+    lineTimestamps: showJumpMarkers ? checkpointTimestamps : [],
     totalSeconds,
   });
   const canvasWrap = document.createElement("div");
@@ -6641,11 +8064,11 @@ function createTriageTimelineRow({
       return;
     }
     lastSeekSeconds = clampedSeconds;
-    if (peakTimestamps.length) {
+    if (checkpointTimestamps.length) {
       let nearestIndex = 0;
       let nearestDelta = Number.POSITIVE_INFINITY;
-      for (let i = 0; i < peakTimestamps.length; i += 1) {
-        const delta = Math.abs(Number(peakTimestamps[i]) - clampedSeconds);
+      for (let i = 0; i < checkpointTimestamps.length; i += 1) {
+        const delta = Math.abs(Number(checkpointTimestamps[i]) - clampedSeconds);
         if (delta < nearestDelta) {
           nearestDelta = delta;
           nearestIndex = i;
@@ -6675,51 +8098,56 @@ function createTriageTimelineRow({
   };
 
   const seekToPeak = (direction) => {
-    if (!peakTimestamps.length) {
+    if (!checkpointTimestamps.length) {
       return;
     }
     const epsilon = 0.05;
     const now = getCurrentReferenceTime();
+    const useLeadReference = lastRequestedPeakIndex >= 0 || now > TRIAGE_NAV_LEAD_SECONDS;
+    const referenceNow = useLeadReference
+      ? Math.max(0, now + TRIAGE_NAV_LEAD_SECONDS)
+      : now;
     let targetIndex = -1;
     if (direction < 0) {
-      for (let i = peakTimestamps.length - 1; i >= 0; i -= 1) {
-        if (peakTimestamps[i] < (now - epsilon)) {
+      for (let i = checkpointTimestamps.length - 1; i >= 0; i -= 1) {
+        if (checkpointTimestamps[i] < (referenceNow - epsilon)) {
           targetIndex = i;
           break;
         }
       }
     } else {
-      for (let i = 0; i < peakTimestamps.length; i += 1) {
-        if (peakTimestamps[i] > (now + epsilon)) {
+      for (let i = 0; i < checkpointTimestamps.length; i += 1) {
+        if (checkpointTimestamps[i] > (referenceNow + epsilon)) {
           targetIndex = i;
           break;
         }
       }
     }
-    if (targetIndex < 0 || targetIndex >= peakTimestamps.length) {
+    if (targetIndex < 0 || targetIndex >= checkpointTimestamps.length) {
       return;
     }
 
     // If the player hasn't caught up from the previous jump yet, force a true step.
     const lastTargetStillCurrent = (
       lastRequestedPeakIndex >= 0
-      && lastRequestedPeakIndex < peakTimestamps.length
-      && Math.abs(now - Number(peakTimestamps[lastRequestedPeakIndex])) <= 0.45
+      && lastRequestedPeakIndex < checkpointTimestamps.length
+      && Math.abs(referenceNow - Number(checkpointTimestamps[lastRequestedPeakIndex])) <= 0.45
     );
     if (lastTargetStillCurrent && targetIndex === lastRequestedPeakIndex) {
       const candidate = targetIndex + (direction < 0 ? -1 : 1);
-      if (candidate >= 0 && candidate < peakTimestamps.length) {
+      if (candidate >= 0 && candidate < checkpointTimestamps.length) {
         targetIndex = candidate;
       }
     }
 
-    const target = Number(peakTimestamps[targetIndex]);
+    const target = Number(checkpointTimestamps[targetIndex]);
     if (!Number.isFinite(target)) {
       return;
     }
+    const seekTimestamp = Math.max(0, target - TRIAGE_NAV_LEAD_SECONDS);
     const keepPlaying = isMediaPlayerPlaying(triagePlayer);
     lastRequestedPeakIndex = targetIndex;
-    playTriageAt(video, target, { autoPlay: keepPlaying });
+    playTriageAt(video, seekTimestamp, { autoPlay: keepPlaying });
   };
 
   prevBtn.addEventListener("click", () => {
@@ -6914,6 +8342,20 @@ function renderTriageDetail() {
     void loadTriageForVideo(state.activeCaseId, selectedVideo.filename, true);
   });
   actions.appendChild(loadBtn);
+  const jumpMarkerToggleBtn = document.createElement("button");
+  jumpMarkerToggleBtn.type = "button";
+  jumpMarkerToggleBtn.className = "ghost";
+  jumpMarkerToggleBtn.textContent = triageJumpMarkerToggleLabel();
+  jumpMarkerToggleBtn.setAttribute("aria-pressed", triageShowJumpMarkers ? "true" : "false");
+  jumpMarkerToggleBtn.addEventListener("click", () => {
+    const nextValue = !triageShowJumpMarkers;
+    setTriageShowJumpMarkers(nextValue, { rerender: true });
+    setTriageStatus(
+      nextValue ? "Jump markers shown." : "Jump markers hidden. Prev/Next still works.",
+      "ok",
+    );
+  });
+  actions.appendChild(jumpMarkerToggleBtn);
   triageDetail.appendChild(actions);
 
   if (!cached) {
@@ -6923,7 +8365,7 @@ function renderTriageDetail() {
       err.textContent = `Failed: ${error}`;
       triageDetail.appendChild(err);
     } else if (!loading) {
-      triageDetail.appendChild(createInsightEmptyElement("Generate timelines to view activity and audio intensity."));
+      triageDetail.appendChild(createInsightEmptyElement("Generate timelines to view visual and audio activity."));
     }
     return;
   }
@@ -6941,25 +8383,29 @@ function renderTriageDetail() {
 
   triageDetail.appendChild(
     createTriageTimelineRow({
-      title: "Activity Intensity",
+      title: "Visual Activity",
       values: activityValues,
       peaks: activityPeaks,
       kind: "activity",
       video: selectedVideo,
       bucketSeconds,
       durationSeconds,
+      checkpointMode: triageCheckpointMode,
+      showJumpMarkers: triageShowJumpMarkers,
     }),
   );
 
   triageDetail.appendChild(
     createTriageTimelineRow({
-      title: "Audio Intensity",
+      title: "Audio Activity",
       values: audioValues,
       peaks: audioPeaks,
       kind: "audio",
       video: selectedVideo,
       bucketSeconds,
       durationSeconds,
+      checkpointMode: triageCheckpointMode,
+      showJumpMarkers: triageShowJumpMarkers,
     }),
   );
 
@@ -6973,7 +8419,7 @@ function renderTriageDetail() {
   if (!cached?.analysis_available?.face_people || !cached?.analysis_available?.vehicles) {
     const note = document.createElement("div");
     note.className = "triage-muted";
-    note.textContent = "Tip: run Face & People / Vehicle analysis to improve activity timeline signal.";
+    note.textContent = "Tip: run Face & People / Vehicle indexing to improve activity timeline signal.";
     triageDetail.appendChild(note);
   }
   updateTriageTimelinePlayheads();
@@ -7511,6 +8957,7 @@ function buildFirstDetectionButton(video, firstHitSeconds, player, meta) {
     return button;
   }
   button.addEventListener("click", () => {
+    ensureInlinePlayerVisibleForPlayer(player);
     const fallbackVideoUrl = state.activeCaseId
       ? `/media/cases/${encodeURIComponent(state.activeCaseId)}/videos/${encodeURIComponent(video.filename)}`
       : "";
@@ -7602,15 +9049,15 @@ function renderAnalysisSelectionList(container, category) {
       }
       checkbox.checked = selectable && persistedSelection.has(safeFilename);
       if (queuedOrRunning) {
-        checkbox.title = "Already queued/running for this analysis mode.";
+        checkbox.title = "Already queued/running for this indexing mode.";
       } else if (safeCategory === "face_people" && faceFullyReady) {
         checkbox.title = "Already FACE-01 + FACE-02 ready.";
       } else if (safeCategory === "face_people" && analysis.processed && !faceIdentityReady) {
         checkbox.title = "Eligible for FACE-02 top-up.";
       } else if (analysis.processed) {
-        checkbox.title = "Already analyzed for this mode.";
+        checkbox.title = "Already indexed for this mode.";
       } else if (safeCategory === "face_people") {
-        checkbox.title = "Eligible for FACE-01 analysis.";
+        checkbox.title = "Eligible for FACE-01 indexing.";
       } else {
         checkbox.title = "";
       }
@@ -7641,13 +9088,10 @@ function renderAnalysisSelectionList(container, category) {
         status.appendChild(queued);
       }
     } else {
-      if (queuedOrRunning) {
-        status.textContent = "Queued/running";
-      } else if (analysis.processed) {
-        status.textContent = `Done | vehicles ${analysis.vehicle_count} | first ${formatFirstHit(analysis.first_hit_seconds)}`;
-      } else {
-        status.textContent = "Not analyzed";
-      }
+      status.classList.add("analysis-video-status-chips");
+      appendVehicleStatusChips(status, video, {
+        ready: Boolean(analysis.processed),
+      });
     }
     row.appendChild(label);
     row.appendChild(status);
@@ -7664,6 +9108,120 @@ function renderAnalysisSelectionList(container, category) {
 function renderAnalysisSelectionLists() {
   renderAnalysisSelectionList(facePeopleVideoSelectList, "face_people");
   renderAnalysisSelectionList(vehicleVideoSelectList, "vehicles");
+}
+
+function normalizeFaceWallDisplayMode(mode) {
+  const normalized = String(mode || "").trim().toLowerCase();
+  return normalized === "raw" ? "raw" : "grouped";
+}
+
+function getFaceWallDisplayMode(caseId = null, create = true) {
+  const safeCaseId = String(caseId || state.activeCaseId || "").trim();
+  if (!safeCaseId) {
+    return "grouped";
+  }
+  const existing = faceWallDisplayModeByCase.get(safeCaseId);
+  if (existing === "raw" || existing === "grouped") {
+    return existing;
+  }
+  if (!create) {
+    return "grouped";
+  }
+  faceWallDisplayModeByCase.set(safeCaseId, "grouped");
+  return "grouped";
+}
+
+function setFaceWallDisplayMode(mode, caseId = null) {
+  const safeMode = normalizeFaceWallDisplayMode(mode);
+  const safeCaseId = String(caseId || state.activeCaseId || "").trim();
+  if (!safeCaseId) {
+    syncFaceWallDisplayModeControls();
+    return;
+  }
+  faceWallDisplayModeByCase.set(safeCaseId, safeMode);
+  syncFaceWallDisplayModeControls();
+}
+
+function syncFaceWallDisplayModeControls() {
+  const activeCaseId = String(state.activeCaseId || "").trim();
+  const mode = getFaceWallDisplayMode(activeCaseId, true);
+  const hasCase = Boolean(activeCaseId);
+  if (faceWallModeGroupedBtn) {
+    const active = hasCase && mode === "grouped";
+    faceWallModeGroupedBtn.classList.toggle("active", active);
+    faceWallModeGroupedBtn.setAttribute("aria-pressed", active ? "true" : "false");
+    faceWallModeGroupedBtn.disabled = !hasCase;
+  }
+  if (faceWallModeRawBtn) {
+    const active = hasCase && mode === "raw";
+    faceWallModeRawBtn.classList.toggle("active", active);
+    faceWallModeRawBtn.setAttribute("aria-pressed", active ? "true" : "false");
+    faceWallModeRawBtn.disabled = !hasCase;
+  }
+}
+
+function getFacePeopleGalleryPayload(caseId = null) {
+  const safeCaseId = String(caseId || state.activeCaseId || "").trim();
+  if (!safeCaseId) {
+    return null;
+  }
+  const payload = facePeopleGalleryPayloadByCase.get(safeCaseId);
+  return payload && typeof payload === "object" ? payload : null;
+}
+
+function setFacePeopleGalleryPayload(payload, caseId = null) {
+  const safeCaseId = String(caseId || state.activeCaseId || "").trim();
+  if (!safeCaseId) {
+    return;
+  }
+  if (!payload || typeof payload !== "object") {
+    facePeopleGalleryPayloadByCase.delete(safeCaseId);
+    return;
+  }
+  facePeopleGalleryPayloadByCase.set(safeCaseId, payload);
+}
+
+function faceItemsForDisplayMode(payload, mode) {
+  const safeMode = normalizeFaceWallDisplayMode(mode);
+  const grouped = Array.isArray(payload?.faces_grouped)
+    ? payload.faces_grouped
+    : (Array.isArray(payload?.faces) ? payload.faces : []);
+  const raw = Array.isArray(payload?.faces_raw)
+    ? payload.faces_raw
+    : (Array.isArray(payload?.faces) ? payload.faces : []);
+  return safeMode === "raw" ? raw : grouped;
+}
+
+function renderFacePeopleWallsFromPayload(payload, query) {
+  const safePayload = payload && typeof payload === "object" ? payload : {};
+  const cleanQuery = String(query || "").trim();
+  const mode = getFaceWallDisplayMode(state.activeCaseId, true);
+  const faces = faceItemsForDisplayMode(safePayload, mode);
+  const people = Array.isArray(safePayload.people) ? safePayload.people : [];
+  renderWall(
+    faceWall,
+    faces,
+    cleanQuery ? "No matching face crops." : "No face detections yet. Run Face & People indexing.",
+    facePeoplePlayer,
+    facePeoplePlayerMeta,
+  );
+  renderWall(
+    peopleWall,
+    people,
+    cleanQuery ? "No matching people crops." : "No people detections yet. Run Face & People indexing.",
+    facePeoplePlayer,
+    facePeoplePlayerMeta,
+  );
+}
+
+function rerenderFacePeopleWallsFromCacheOrRefresh() {
+  const payload = getFacePeopleGalleryPayload(state.activeCaseId);
+  if (payload) {
+    const query = String(facePeopleQueryInput?.value || "").trim();
+    renderFacePeopleWallsFromPayload(payload, query);
+    return;
+  }
+  void refreshFacePeopleWall();
 }
 
 function renderWall(
@@ -7702,6 +9260,7 @@ function renderWall(
       `Load ${item.video_filename} at ${formatTime(item.timestamp_seconds)} in player`,
     );
     thumbButton.addEventListener("click", () => {
+      ensureInlinePlayerVisibleForPlayer(player);
       playInPlayer(
         player,
         playerMetaElement,
@@ -7729,17 +9288,38 @@ function renderWall(
 
     const info = document.createElement("div");
     info.className = "wall-card-info";
+    const titleRow = document.createElement("div");
+    titleRow.className = "wall-card-title-row";
     const title = document.createElement("div");
     title.className = "wall-card-title";
     title.textContent = item.video_filename;
+    const groupSize = Math.max(0, Number(item.group_size || 0));
+    if (groupSize > 1) {
+      const groupBadge = document.createElement("span");
+      groupBadge.className = "wall-group-badge";
+      groupBadge.textContent = `x${groupSize}`;
+      titleRow.appendChild(title);
+      titleRow.appendChild(groupBadge);
+    } else {
+      titleRow.appendChild(title);
+    }
     const sub = document.createElement("div");
     sub.className = "wall-card-sub";
     const scoreText = Number.isFinite(Number(item.similarity_score))
       ? ` | score ${Number(item.similarity_score).toFixed(4)}`
       : "";
-    sub.textContent = `${formatTime(item.timestamp_seconds)}${scoreText}`;
+    const groupStart = Number(item.group_start_seconds);
+    const groupEnd = Number(item.group_end_seconds);
+    const hasGroupRange = groupSize > 1
+      && Number.isFinite(groupStart)
+      && Number.isFinite(groupEnd);
+    if (hasGroupRange) {
+      sub.textContent = `${formatTime(item.timestamp_seconds)}${scoreText} | ${formatTime(groupStart)} -> ${formatTime(groupEnd)}`;
+    } else {
+      sub.textContent = `${formatTime(item.timestamp_seconds)}${scoreText}`;
+    }
 
-    info.appendChild(title);
+    info.appendChild(titleRow);
     info.appendChild(sub);
     card.appendChild(thumbWrap);
     card.appendChild(info);
@@ -7767,7 +9347,9 @@ async function fetchAnalysisGallery(category, query = "", filenames = null) {
 
 async function refreshFacePeopleWall(options = {}) {
   const requireSelection = Boolean(options && options.requireSelection);
+  syncFaceWallDisplayModeControls();
   if (!state.activeCaseId) {
+    setFacePeopleGalleryPayload(null);
     renderWall(faceWall, [], "Select a case first.", facePeoplePlayer, facePeoplePlayerMeta);
     renderWall(peopleWall, [], "Select a case first.", facePeoplePlayer, facePeoplePlayerMeta);
     return;
@@ -7777,6 +9359,7 @@ async function refreshFacePeopleWall(options = {}) {
     const scopedFilenames = getSelectedSearchScopeFilenames("face_people");
     if (!scopedFilenames.length) {
       const emptyMessage = "No ready selected videos in Face & People Search Scope.";
+      setFacePeopleGalleryPayload(null);
       renderWall(faceWall, [], emptyMessage, facePeoplePlayer, facePeoplePlayerMeta);
       renderWall(peopleWall, [], emptyMessage, facePeoplePlayer, facePeoplePlayerMeta);
       if (requireSelection) {
@@ -7788,22 +9371,8 @@ async function refreshFacePeopleWall(options = {}) {
       return;
     }
     const payload = await fetchAnalysisGallery("face_people", query, scopedFilenames);
-    const faces = Array.isArray(payload.faces) ? payload.faces : [];
-    const people = Array.isArray(payload.people) ? payload.people : [];
-    renderWall(
-      faceWall,
-      faces,
-      query ? "No matching face crops." : "No face detections yet. Run Face & People analysis.",
-      facePeoplePlayer,
-      facePeoplePlayerMeta,
-    );
-    renderWall(
-      peopleWall,
-      people,
-      query ? "No matching people crops." : "No people detections yet. Run Face & People analysis.",
-      facePeoplePlayer,
-      facePeoplePlayerMeta,
-    );
+    setFacePeopleGalleryPayload(payload, state.activeCaseId);
+    renderFacePeopleWallsFromPayload(payload, query);
   } catch (error) {
     setAnalysisStatus(`Face & People wall failed: ${formatError(error)}`, "error");
   }
@@ -7831,7 +9400,7 @@ async function refreshVehicleWall(options = {}) {
     renderWall(
       vehicleWall,
       vehicles,
-      query ? "No matching vehicle crops." : "No vehicle detections yet. Run Vehicle analysis.",
+      query ? "No matching vehicle crops." : "No vehicle detections yet. Run Vehicle indexing.",
       vehiclePlayer,
       vehiclePlayerMeta,
     );
@@ -8258,29 +9827,6 @@ function isVideoReadyForSearchScope(video, category) {
   return Boolean(normalized.face_people.processed);
 }
 
-function searchScopeStatusText(video, category, ready) {
-  const safeCategory = normalizeSearchScopeCategory(category);
-  if (safeCategory === "semantic") {
-    const indexedFrames = Math.max(0, Number(video?.indexed_frames || 0));
-    const indexedWindows = Math.max(0, Number(video?.indexed_windows || 0));
-    if (!ready) {
-      return `${formatBytes(video?.size_bytes)} | not indexed`;
-    }
-    return `${formatBytes(video?.size_bytes)} | indexed frames ${indexedFrames} | indexed windows ${indexedWindows}`;
-  }
-  const normalized = normalizedVideoAnalysis(video);
-  if (safeCategory === "vehicles") {
-    if (!ready) {
-      return "Vehicle analysis not run";
-    }
-    return `Ready | vehicles ${normalized.vehicles.vehicle_count} | first ${formatFirstHit(normalized.vehicles.first_hit_seconds)}`;
-  }
-  if (!ready) {
-    return "FACE-01 not run";
-  }
-  return `Ready | faces ${normalized.face_people.face_count} | people ${normalized.face_people.people_count}`;
-}
-
 function renderSearchScopeList(category) {
   const safeCategory = normalizeSearchScopeCategory(category);
   const container = getSearchScopeRoot(safeCategory);
@@ -8315,10 +9861,16 @@ function renderSearchScopeList(category) {
   }
 
   const sortedVideos = [...videos].sort((a, b) => String(a.filename).localeCompare(String(b.filename)));
+  const activeQueuedOrRunning = safeCategory === "face_people"
+    ? getActiveQueuedOrRunningAnalysisFilenames(activeCaseId, "face_people")
+    : new Set();
   const allowedReadyFilenames = [];
   sortedVideos.forEach((video) => {
     const safeFilename = String(video?.filename || "").trim();
     const ready = Boolean(safeFilename) && isVideoReadyForSearchScope(video, safeCategory);
+    const queuedOrRunning = safeCategory === "face_people"
+      ? Boolean(safeFilename) && activeQueuedOrRunning.has(safeFilename)
+      : false;
     const row = document.createElement("div");
     row.className = "analysis-video-item";
 
@@ -8350,7 +9902,33 @@ function renderSearchScopeList(category) {
 
     const status = document.createElement("div");
     status.className = "analysis-video-status";
-    status.textContent = searchScopeStatusText(video, safeCategory, ready);
+    if (safeCategory === "semantic") {
+      status.classList.add("analysis-video-status-chips");
+      appendSemanticStatusChips(status, video, { indexed: ready });
+    } else if (safeCategory === "vehicles") {
+      status.classList.add("analysis-video-status-chips");
+      appendVehicleStatusChips(status, video, { ready });
+    } else if (safeCategory === "face_people") {
+      status.classList.add("analysis-video-status-face");
+      const face01 = document.createElement("span");
+      face01.className = "analysis-status-chip chip-face01";
+      face01.textContent = formatFace01SelectionStatus(video);
+
+      const face02 = document.createElement("span");
+      face02.className = "analysis-status-chip chip-face02";
+      face02.textContent = formatFace02SelectionStatus(video);
+
+      status.appendChild(face01);
+      status.appendChild(face02);
+      if (queuedOrRunning) {
+        const queued = document.createElement("span");
+        queued.className = "analysis-status-chip chip-face02";
+        queued.textContent = "Queued/running";
+        status.appendChild(queued);
+      }
+    } else {
+      status.textContent = "";
+    }
 
     row.appendChild(label);
     row.appendChild(status);
@@ -8420,6 +9998,10 @@ function playVideoAt(filename, videoUrl, timestampSeconds, options = {}) {
   if (!videoPlayer || !playerMeta) {
     return;
   }
+  const shouldAutoOpenPanel = options.autoOpenPanel === true;
+  if (shouldAutoOpenPanel) {
+    ensureInlinePlayerVisibleForPlayer(videoPlayer);
+  }
   const requestedAutoPlay = options.autoPlay !== false;
   const autoPlay = requestedAutoPlay && state.activeMainTab === "semantic";
   const targetTime = Math.max(0, Number(timestampSeconds) || 0);
@@ -8478,7 +10060,7 @@ function renderResults(results) {
         result.video_filename,
         result.video_url,
         result.timestamp_seconds,
-        { autoPlay: false },
+        { autoPlay: false, autoOpenPanel: true },
       );
     });
     thumbButton.appendChild(thumb);
@@ -8528,6 +10110,19 @@ async function selectCase(caseId) {
   if (nextCaseId === state.activeCaseId) {
     return;
   }
+  const previousCaseId = String(state.activeCaseId || "").trim();
+  const activeUploadCaseId = String(uploadFlowCaseId || "").trim();
+  const switchingAwayFromUploadCase = Boolean(
+    uploadFlowActive
+    && activeUploadCaseId
+    && previousCaseId === activeUploadCaseId
+    && nextCaseId !== activeUploadCaseId,
+  );
+  const switchingToUploadCase = Boolean(
+    uploadFlowActive
+    && activeUploadCaseId
+    && nextCaseId === activeUploadCaseId,
+  );
 
   saveActiveCasePlaybackSnapshot();
   stopBackgroundIndexPolling();
@@ -8542,10 +10137,21 @@ async function selectCase(caseId) {
   setCaseUrl(nextCaseId);
   renderCaseList();
   syncWorkspaceVisibility();
+  syncFaceWallDisplayModeControls();
+  if (switchingAwayFromUploadCase) {
+    hideTaskProgressUi();
+  }
+  if (switchingToUploadCase) {
+    restoreUploadUiIfVisible();
+  }
   const switchVersion = ++caseSwitchVersion;
 
   try {
-    setStatus(`Loading videos for ${nextCaseId}...`, "working");
+    if (!switchingToUploadCase) {
+      setStatus(`Loading videos for ${nextCaseId}...`, "working");
+    } else {
+      restoreUploadUiIfVisible();
+    }
     const videos = await refreshVideos(nextCaseId, switchVersion);
     if (switchVersion !== caseSwitchVersion || state.activeCaseId !== nextCaseId) {
       return;
@@ -8560,7 +10166,7 @@ async function selectCase(caseId) {
     if (state.activeMainTab === "triage") {
       setTriageStatus(`Case ${nextCaseId}: triage timelines ready.`, "ok");
     }
-    if (!backgroundRunning) {
+    if (!backgroundRunning && !switchingToUploadCase) {
       setStatus(`Case ${nextCaseId} ready.`, "ok");
     }
   } catch (error) {
@@ -8733,7 +10339,9 @@ async function renameCase(caseId) {
       body: JSON.stringify({ name: newName }),
     });
 
-    const payloadCases = normalizeCases(Array.isArray(payload?.cases) ? payload.cases : []);
+    const payloadCases = filterPendingCaseDeletions(
+      normalizeCases(Array.isArray(payload?.cases) ? payload.cases : []),
+    );
     if (payloadCases.length > 0) {
       state.cases = payloadCases;
     } else {
@@ -8762,6 +10370,10 @@ async function deleteCase(caseId) {
   if (!targetCaseId) {
     return;
   }
+  if (isCasePendingDeletion(targetCaseId)) {
+    setStatus(`Delete already in progress for ${targetCaseId}.`, "working");
+    return;
+  }
 
   const caseEntry = state.cases.find((item) => item.case_id === targetCaseId);
   const caseName = caseEntry?.name || targetCaseId;
@@ -8772,15 +10384,25 @@ async function deleteCase(caseId) {
     return;
   }
 
+  const previousCases = [...state.cases];
+  const deletingActiveCase = state.activeCaseId === targetCaseId;
+  pendingCaseDeletionIds.add(targetCaseId);
+  state.cases = state.cases.filter((item) => item.case_id !== targetCaseId);
+  markCaseStateChanged();
+  renderCaseList();
+  syncWorkspaceVisibility();
+
   try {
     setStatus(`Deleting case ${targetCaseId}...`, "working");
-    const deletingActiveCase = state.activeCaseId === targetCaseId;
     saveActiveCasePlaybackSnapshot();
     const payload = await fetchJson(`/cases/${encodeURIComponent(targetCaseId)}`, {
       method: "DELETE",
     });
+    pendingCaseDeletionIds.delete(targetCaseId);
 
-    const payloadCases = normalizeCases(Array.isArray(payload?.cases) ? payload.cases : []);
+    const payloadCases = filterPendingCaseDeletions(
+      normalizeCases(Array.isArray(payload?.cases) ? payload.cases : []),
+    );
     if (Array.isArray(payload?.cases)) {
       state.cases = payloadCases;
     } else {
@@ -8789,6 +10411,8 @@ async function deleteCase(caseId) {
 
     playbackCache.delete(targetCaseId);
     searchCache.delete(targetCaseId);
+    facePeopleGalleryPayloadByCase.delete(targetCaseId);
+    faceWallDisplayModeByCase.delete(targetCaseId);
     state.caseVideos.delete(targetCaseId);
     videoSelectionByCase.delete(targetCaseId);
     for (const category of ANALYSIS_CATEGORIES) {
@@ -8828,6 +10452,11 @@ async function deleteCase(caseId) {
     syncWorkspaceVisibility();
     setStatus(`Deleted case ${targetCaseId}.`, "ok");
   } catch (error) {
+    pendingCaseDeletionIds.delete(targetCaseId);
+    state.cases = previousCases;
+    markCaseStateChanged();
+    renderCaseList();
+    syncWorkspaceVisibility();
     setStatus(`Delete case failed: ${formatError(error)}`, "error");
   }
 }
@@ -8840,14 +10469,23 @@ async function uploadAndIndex() {
     return;
   }
 
+  let caseId = "";
   try {
+    caseId = ensureActiveCaseId();
+    const normalizedCaseId = String(caseId || "").trim();
+    uploadFlowCaseId = normalizedCaseId;
+    uploadUiSnapshot = {
+      caseId: normalizedCaseId,
+      statusMessage: "",
+      statusKind: "",
+      progress: null,
+    };
     uploadFlowActive = true;
     stopBackgroundIndexPolling();
-    const caseId = ensureActiveCaseId();
     let files = allFiles;
     let duplicateSkippedCount = 0;
 
-    setStatus("Checking selected files for duplicates...", "working");
+    setUploadStatusScoped(caseId, "Checking selected files for duplicates...", "working");
     const duplicateCandidates = await detectDuplicateUploadCandidatesWithHash(allFiles, caseId);
     if (duplicateCandidates.length > 0) {
       const duplicateIndexSet = reviewDuplicateUploadCandidates(duplicateCandidates, allFiles);
@@ -8864,7 +10502,8 @@ async function uploadAndIndex() {
 
         if (!files.length) {
           hideTaskProgressUi();
-          setStatus(
+          setUploadStatusScoped(
+            caseId,
             "All selected files are duplicates of videos already in this case. No upload started.",
             "ok",
           );
@@ -8876,13 +10515,15 @@ async function uploadAndIndex() {
     const engineLabel = getLoadedEmbeddingEngineLabel();
     const totalUploadBytes = files.reduce((sum, file) => sum + Number(file.size || 0), 0);
     const uploadStartedAt = Date.now();
-    setStatus(
+    setUploadStatusScoped(
+      caseId,
       `Transferring videos to ${caseId} (engine: ${engineLabel}).`,
       "working",
     );
     const STEP1_LABEL = "Step 1/2: Upload ingest to server";
     const STEP2_LABEL = "Step 2/2: Server convert/finalize";
-    setTaskProgressUi(
+    setUploadProgressScoped(
+      caseId,
       STEP1_LABEL,
       0,
       `${files.length} file(s) | ${formatBytes(totalUploadBytes)}`,
@@ -8906,7 +10547,8 @@ async function uploadAndIndex() {
     ) || totalUploadBytes;
     let transferredBytesForEta = sessionReceivedBytes;
     const resumedLabel = uploadSession?.resumed ? "resuming" : "starting";
-    setStatus(
+    setUploadStatusScoped(
+      caseId,
       `Transferring videos to ${caseId} (engine: ${engineLabel}) | ${resumedLabel} resumable upload.`,
       "working",
     );
@@ -8929,7 +10571,8 @@ async function uploadAndIndex() {
         `${formatBytes(speedBytesPerSecond)}/s`,
         formatEtaLabel(etaSeconds),
       ].join(" | ");
-      setTaskProgressUi(
+      setUploadProgressScoped(
+        caseId,
         STEP1_LABEL,
         clampPercent(transferFraction * 100),
         meta,
@@ -8979,12 +10622,14 @@ async function uploadAndIndex() {
       }
     }
 
-    setTaskProgressUi(
+    setUploadProgressScoped(
+      caseId,
       "Step 1/2 complete: Upload ingest to server",
       100,
       "Browser transfer is complete. Starting server convert/finalize...",
     );
-    setTaskProgressUi(
+    setUploadProgressScoped(
+      caseId,
       STEP2_LABEL,
       0,
       `${files.length} file(s) queued for server convert/finalize`,
@@ -9111,7 +10756,8 @@ async function uploadAndIndex() {
               detailParts.push(`${pendingCount} pending`);
             }
             detailParts.push("videos appear as each file finalizes");
-            setTaskProgressUi(
+            setUploadProgressScoped(
+              caseId,
               STEP2_LABEL,
               clampPercent(finalizeFraction * 100),
               detailParts.join(" | "),
@@ -9157,7 +10803,8 @@ async function uploadAndIndex() {
         // no-op
       }
     }
-    setTaskProgressUi(
+    setUploadProgressScoped(
+      caseId,
       "Step 2/2 complete: Server convert/finalize",
       100,
       "Finalizing upload summary...",
@@ -9187,25 +10834,39 @@ async function uploadAndIndex() {
       ? ` Skipped duplicate uploads: ${duplicateSkippedCount}.`
       : "";
     const errorNote = allErrors.length ? ` Errors: ${allErrors.join(" | ")}` : "";
-    setStatus(`${summary}${duplicateNote}${errorNote}`, allErrors.length ? "error" : "ok");
+    setUploadStatusScoped(
+      caseId,
+      `${summary}${duplicateNote}${errorNote}`,
+      allErrors.length ? "error" : "ok",
+    );
     const progressMeta = uploaded.length > 0
       ? backgroundMessage
       : "No new videos were uploaded. You can continue triage immediately.";
-    completeTaskProgressUi(
+    completeUploadProgressScoped(
+      caseId,
       allErrors.length ? "Upload completed with warnings" : "Upload completed",
       progressMeta,
     );
-    uploadFlowActive = false;
     await syncBackgroundIndexStatus(caseId);
+    if (state.workspaceView === "queue" && String(state.activeCaseId || "").trim() === String(caseId || "").trim()) {
+      try {
+        await refreshReportQueue({ silent: true });
+      } catch {
+        // Queue polling will recover on the next tick.
+      }
+    }
   } catch (error) {
-    setStatus(`Upload failed: ${formatError(error)}`, "error");
-    setTaskProgressUi(
-      "Upload failed",
-      100,
-      formatError(error),
-    );
+    const errorText = formatError(error);
+    if (caseId) {
+      setUploadStatusScoped(caseId, `Upload failed: ${errorText}`, "error");
+      setUploadProgressScoped(caseId, "Upload failed", 100, errorText);
+    } else {
+      setStatus(`Upload failed: ${errorText}`, "error");
+      setTaskProgressUi("Upload failed", 100, errorText);
+    }
   } finally {
     uploadFlowActive = false;
+    clearUploadUiContext();
   }
 }
 
@@ -9289,7 +10950,7 @@ async function runSelectedAnalysisForCategory(category, options = {}) {
   const isFaceIdentityTopup = normalizedMode === "face_identity_topup";
   const actionLabel = isFaceIdentityTopup
     ? "FACE-02 top-up"
-    : `${analysisCategoryLabel(normalizedCategory)} analysis`;
+    : `${analysisCategoryLabel(normalizedCategory)} indexing`;
   const setCategoryStatus = (message, kind = "") => {
     setCategoryAnalysisStatus(normalizedCategory, message, kind);
   };
@@ -9784,6 +11445,42 @@ function setupListeners() {
   vehicleScopeSelectAll?.addEventListener("change", () => {
     setAllSearchScopeSelection("vehicles", Boolean(vehicleScopeSelectAll.checked));
   });
+  semanticPlayerToggleBtn?.addEventListener("click", () => {
+    toggleInlinePlayerPanel("semantic");
+  });
+  facePeoplePlayerToggleBtn?.addEventListener("click", () => {
+    toggleInlinePlayerPanel("face_people");
+  });
+  vehiclePlayerToggleBtn?.addEventListener("click", () => {
+    toggleInlinePlayerPanel("vehicles");
+  });
+  triageSettingsModeMountainBtn?.addEventListener("click", () => {
+    setTriageCheckpointMode(TRIAGE_CHECKPOINT_MODE_MOUNTAIN, { rerender: true });
+    if (hasPendingTriageSettingsChange()) {
+      setTriageSettingsStatus("Mountain mode selected. Unsaved change.", "working");
+      return;
+    }
+    setTriageSettingsStatus("Mountain mode selected (already saved).", "ok");
+  });
+  triageSettingsModePeaksBtn?.addEventListener("click", () => {
+    setTriageCheckpointMode(TRIAGE_CHECKPOINT_MODE_PEAKS, { rerender: true });
+    if (hasPendingTriageSettingsChange()) {
+      setTriageSettingsStatus("Peaks mode selected. Unsaved change.", "working");
+      return;
+    }
+    setTriageSettingsStatus("Peaks mode selected (already saved).", "ok");
+  });
+  triageSettingsModeChangePointBtn?.addEventListener("click", () => {
+    setTriageCheckpointMode(TRIAGE_CHECKPOINT_MODE_CHANGE_POINT, { rerender: true });
+    if (hasPendingTriageSettingsChange()) {
+      setTriageSettingsStatus("Change Point mode selected. Unsaved change.", "working");
+      return;
+    }
+    setTriageSettingsStatus("Change Point mode selected (already saved).", "ok");
+  });
+  saveTriageSettingsBtn?.addEventListener("click", () => {
+    void saveTriageSettings();
+  });
   mainTabTriageBtn?.addEventListener("click", async () => {
     setActiveMainTab("triage");
     await refreshTriageList(false);
@@ -9852,6 +11549,14 @@ function setupListeners() {
 
   facePeopleSearchBtn?.addEventListener("click", () => {
     runFacePeopleCropSearch();
+  });
+  faceWallModeGroupedBtn?.addEventListener("click", () => {
+    setFaceWallDisplayMode("grouped");
+    rerenderFacePeopleWallsFromCacheOrRefresh();
+  });
+  faceWallModeRawBtn?.addEventListener("click", () => {
+    setFaceWallDisplayMode("raw");
+    rerenderFacePeopleWallsFromCacheOrRefresh();
   });
   suspectSearchBtn?.addEventListener("click", () => {
     void runSuspectPhotoSearch();
@@ -9939,6 +11644,8 @@ function setupListeners() {
   }
 
   renderMainTabs();
+  applyAllInlinePlayerPanelVisibility();
+  applyTriageCheckpointModeControls();
   renderAnalysisSelectionLists();
   renderSearchScopeLists();
   setTaskProgressStopCase("");
@@ -9957,6 +11664,7 @@ async function init() {
   await loadEmbeddingSettings();
   await loadAnalysisSettings();
   await loadSearchSettings();
+  await loadTriageSettings();
 
   clearResults();
   resetSuspectSearchView();

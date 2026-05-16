@@ -23,7 +23,7 @@
       ></div>
       <aside class="panel workspace-utility-sidebar" aria-label="Workspace actions">
         <button id="workspaceBackBtn" type="button" class="ghost">Back</button>
-        <button id="workspaceAnalysisBtn" type="button" class="ghost active">Analysis</button>
+        <button id="workspaceAnalysisBtn" type="button" class="ghost active">Indexing</button>
         <button id="workspaceReportBtn" type="button" class="ghost">Report</button>
         <button id="workspaceQueueBtn" type="button" class="ghost">Queue</button>
         <button id="workspaceSettingsBtn" type="button" class="ghost">Settings</button>
@@ -105,6 +105,53 @@
             </p>
             <p id="searchSettingsMeta" class="status"></p>
           </section>
+          <section class="embedding-settings-panel triage-settings-panel">
+            <h2>Video Triage</h2>
+            <p class="analysis-note">
+              Configure Activity checkpoint extraction behavior for triage timelines.
+            </p>
+            <div class="triage-settings-controls">
+              <span class="triage-settings-label">Checkpoint mode</span>
+              <div class="triage-settings-mode-toggle" role="group" aria-label="Video triage checkpoint mode">
+                <button
+                  id="triageSettingsModeMountainBtn"
+                  type="button"
+                  class="ghost active"
+                  aria-pressed="true"
+                >
+                  Mountain
+                </button>
+                <button
+                  id="triageSettingsModePeaksBtn"
+                  type="button"
+                  class="ghost"
+                  aria-pressed="false"
+                >
+                  Peaks
+                </button>
+                <button
+                  id="triageSettingsModeChangePointBtn"
+                  type="button"
+                  class="ghost"
+                  aria-pressed="false"
+                >
+                  Change Point
+                </button>
+              </div>
+              <button id="saveTriageSettingsBtn" type="button" class="ghost">
+                Save Triage Setting
+              </button>
+              <span id="triageSettingsPendingBadge" class="triage-settings-pending" hidden>Unsaved change</span>
+            </div>
+            <p class="analysis-note">
+              <strong>Mountain:</strong> sustained unusual activity windows versus recent baseline.
+              <br />
+              <strong>Peaks:</strong> high-activity point peaks with stronger spacing.
+              <br />
+              <strong>Change Point:</strong> sharp behavior transitions in visual activity.
+            </p>
+            <p id="triageSettingsMeta" class="status"></p>
+          </section>
           <section class="embedding-settings-panel face-identity-panel">
             <h2>FACE-02 Identity (ArcFace)</h2>
             <p class="analysis-note">
@@ -114,7 +161,7 @@
             <div class="face-identity-controls">
               <label class="analysis-toggle" for="faceIdentityEnabledToggle">
                 <input id="faceIdentityEnabledToggle" type="checkbox" />
-                Enable FACE-02 during Face &amp; People analysis
+                Enable FACE-02 during Face &amp; People indexing
               </label>
               <button id="saveFaceIdentitySettingsBtn" type="button" class="ghost">
                 Save FACE-02 Setting
@@ -177,7 +224,9 @@
           <section class="panel triage-panel">
             <div class="triage-head">
               <h2>Video Triage</h2>
-              <button id="refreshTriageBtn" type="button" class="ghost">Refresh Timelines</button>
+              <div class="triage-head-actions">
+                <button id="refreshTriageBtn" type="button" class="ghost">Refresh Timelines</button>
+              </div>
             </div>
             <p class="analysis-note">
               Timelines are 1-second buckets. Click timeline to jump to that timestamp (paused).
@@ -219,19 +268,17 @@
                 <label for="intervalInput">Frame Interval (s)</label>
                 <input id="intervalInput" type="number" min="0.25" step="0.25" value="1" />
               </div>
-              <section id="existingIndexPanel" class="preupload-index-panel" hidden>
-                <div class="preupload-index-head">
-                  <h3>Index Existing Uploaded Videos</h3>
-                  <label class="preupload-select-all">
-                    <input id="existingIndexSelectAll" type="checkbox" />
-                    Select All
-                  </label>
-                </div>
+              <section id="existingIndexPanel" hidden>
                 <div id="existingIndexList" class="analysis-video-list"></div>
                 <div class="analysis-select-actions">
+                  <label class="analysis-select-all">
+                    <input id="existingIndexSelectAll" type="checkbox" />
+                    Select All Eligible
+                  </label>
                   <button id="runExistingIndexBtn" type="button" class="ghost">
                     Run Semantic Index For Selected
                   </button>
+                  <span id="existingIndexSelectionMeta" class="analysis-select-meta">0 selected</span>
                 </div>
               </section>
             </section>
@@ -268,7 +315,11 @@
             <p id="semanticSearchMeta" class="status">Search type will appear here after querying.</p>
           </section>
 
-          <section class="panel player-panel">
+          <section id="semanticPlayerPanel" class="panel player-panel">
+            <div class="player-panel-head">
+              <h3 class="player-panel-title">Semantic Player</h3>
+              <button id="semanticPlayerToggleBtn" type="button" class="ghost">Hide Player</button>
+            </div>
             <video id="videoPlayer" controls preload="metadata"></video>
             <p id="playerMeta" class="player-meta">Select a result to play.</p>
           </section>
@@ -279,29 +330,29 @@
         <section id="tabFacePeople" class="tab-pane">
           <section class="analysis-split-grid">
             <section class="panel analysis-select-panel analysis-split-panel">
-              <h2>Run Face &amp; People Analysis</h2>
-              <p class="analysis-note">Select ingested videos, then run analysis.</p>
+              <h2>Face &amp; People Index</h2>
+              <p class="analysis-note">Select ingested videos, then run indexing.</p>
               <div id="facePeopleVideoSelectList" class="analysis-video-list"></div>
               <div class="analysis-select-actions">
                 <label class="analysis-select-all">
                   <input id="facePeopleAnalysisSelectAll" type="checkbox" />
                   Select All
                 </label>
-                <button id="runFacePeopleSelectedBtn" type="button" class="ghost">Run Face &amp; People For Selected</button>
+                <button id="runFacePeopleSelectedBtn" type="button" class="ghost">Run Face &amp; People Index For Selected</button>
                 <button id="runFaceIdentityTopupSelectedBtn" type="button" class="ghost">Run FACE-02 Top-up For Selected</button>
                 <span id="facePeopleAnalysisSelectionMeta" class="analysis-select-meta">0 selected</span>
               </div>
               <p id="analysisStatus" class="status"></p>
               <div class="queue-summary-row">
                 <button id="facePeopleQueueSummaryBtn" type="button" class="ghost queue-summary-btn" hidden>
-                  0 files queued for analysis
+                  0 files queued for indexing
                 </button>
               </div>
             </section>
             <section class="panel search-panel analysis-split-panel">
               <h2>Face &amp; People Search Scope</h2>
               <p class="analysis-note">
-                Choose which ready FACE-01 analyzed videos Face &amp; People search should query.
+                Choose which ready FACE-01 indexed videos Face &amp; People search should query.
               </p>
               <div id="facePeopleSearchScopeList" class="analysis-video-list"></div>
               <div class="analysis-select-actions">
@@ -344,7 +395,11 @@
             </p>
           </section>
 
-          <section class="panel player-panel">
+          <section id="facePeoplePlayerPanel" class="panel player-panel">
+            <div class="player-panel-head">
+              <h3 class="player-panel-title">Face &amp; People Player</h3>
+              <button id="facePeoplePlayerToggleBtn" type="button" class="ghost">Hide Player</button>
+            </div>
             <video id="facePeoplePlayer" controls preload="metadata"></video>
             <p id="facePeoplePlayerMeta" class="player-meta">Select a face or person result to preview.</p>
           </section>
@@ -355,7 +410,13 @@
           </section>
 
           <section class="panel wall-panel">
-            <h2>Face Wall</h2>
+            <div class="wall-panel-head">
+              <h2>Face Wall</h2>
+              <div class="face-wall-mode-toggle" role="group" aria-label="Face wall display mode">
+                <button id="faceWallModeGroupedBtn" type="button" class="ghost active">Grouped</button>
+                <button id="faceWallModeRawBtn" type="button" class="ghost">Raw</button>
+              </div>
+            </div>
             <section id="faceWall" class="wall-grid"></section>
           </section>
 
@@ -368,28 +429,28 @@
         <section id="tabVehicles" class="tab-pane">
           <section class="analysis-split-grid">
             <section class="panel analysis-select-panel analysis-split-panel">
-              <h2>Run Vehicle Analysis</h2>
-              <p class="analysis-note">Select ingested videos, then run analysis.</p>
+              <h2>Vehicle Index</h2>
+              <p class="analysis-note">Select ingested videos, then run indexing.</p>
               <div id="vehicleVideoSelectList" class="analysis-video-list"></div>
               <div class="analysis-select-actions">
                 <label class="analysis-select-all">
                   <input id="vehicleAnalysisSelectAll" type="checkbox" />
                   Select All
                 </label>
-                <button id="runVehiclesSelectedBtn" type="button" class="ghost">Run Vehicle Analysis For Selected</button>
+                <button id="runVehiclesSelectedBtn" type="button" class="ghost">Run Vehicle Index For Selected</button>
                 <span id="vehicleAnalysisSelectionMeta" class="analysis-select-meta">0 selected</span>
               </div>
               <p id="vehicleStatus" class="status"></p>
               <div class="queue-summary-row">
                 <button id="vehicleQueueSummaryBtn" type="button" class="ghost queue-summary-btn" hidden>
-                  0 files queued for analysis
+                  0 files queued for indexing
                 </button>
               </div>
             </section>
             <section class="panel search-panel analysis-split-panel">
               <h2>Vehicle Search Scope</h2>
               <p class="analysis-note">
-                Choose which ready vehicle-analyzed videos Vehicle search should query.
+                Choose which ready vehicle-indexed videos Vehicle search should query.
               </p>
               <div id="vehicleSearchScopeList" class="analysis-video-list"></div>
               <div class="analysis-select-actions">
@@ -415,7 +476,11 @@
             </div>
           </section>
 
-          <section class="panel player-panel">
+          <section id="vehiclePlayerPanel" class="panel player-panel">
+            <div class="player-panel-head">
+              <h3 class="player-panel-title">Vehicle Player</h3>
+              <button id="vehiclePlayerToggleBtn" type="button" class="ghost">Hide Player</button>
+            </div>
             <video id="vehiclePlayer" controls preload="metadata"></video>
             <p id="vehiclePlayerMeta" class="player-meta">Select a vehicle result to preview.</p>
           </section>
